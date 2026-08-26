@@ -1,5 +1,5 @@
 [package]
-name = "resplice-macro"
+name = "resplice-macros"
 version = "0.0.1"
 description = "Rewrite it in Rust"
 edition = "2024"

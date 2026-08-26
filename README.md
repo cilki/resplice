@@ -20,7 +20,7 @@ Now let's reimplement it in Rust (probably with the help of a decompiler, in
 practice):
 
 ```rust
-use resplice::Splice;
+use resplice_macros::Splice;
 
 #[Splice(begin = 0x1670, end = 0x1680)]
 fn add_one_plus_one() -> i32 {
@@ -42,8 +42,10 @@ trampolines).
 
 ## Usage
 
+Write your replacements in a library crate that depends on `resplice-macros`:
+
 ```rust
-use resplice::Splice;
+use resplice_macros::Splice;
 
 #[Splice(begin = 0x1000, end = 0x1020)]
 fn my_replacement_function() -> i32 {
@@ -51,3 +53,12 @@ fn my_replacement_function() -> i32 {
     42
 }
 ```
+
+Build it to an rlib and apply it to the target binary:
+
+```sh
+cargo build --release              # produces target/release/libyourcrate.rlib
+resplice ./original-binary target/release/libyourcrate.rlib ./patched-binary
+```
+
+See `examples/adder` for a complete crate.

@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+
+## End-to-end: reimplement a target function in Rust and verify the patched
+## binary produces the new result.
+##
+## Precondition: run `cargo build --release` before invoking attest so the
+## `resplice` binary and `resplice-macros` artifacts already exist.
+testSpliceReplacesFunction() {
+	# 1. Build a target program. `compute` is hand-written asm padded with
+	#    `.zero` so its symbol size comfortably fits the Rust replacement, and
+	#    -fcf-protection=none avoids CET landing-pad faults after patching.
+	#    Files are written with printf to avoid heredoc parsing quirks.
+	printf '%s\n' '.text' '.globl compute' '.type compute,@function' \
+		'compute:' 'mov $41, %eax' 'ret' '.zero 32' \
+		'.size compute, .-compute' > compute.s
+	printf '%s\n' '#include <stdio.h>' 'int compute(void);' \
+		'int main(void){ printf("%d\n", compute()); return 0; }' > prog.c
+	# Note: the output binary must not be named `target` (that is cargo's build
+	# directory in this working tree).
+	cc -fcf-protection=none -no-pie -O2 -o prog prog.c compute.s
+
+	# Original behaviour.
+	[ "$(./prog)" = "41" ]
+
+	# 2. Discover compute's file offset (objdump -F) and symbol size (readelf).
+	off=$(objdump -Fd prog | awk 'match($0, /^[0-9a-f]+ <compute> \(File Offset: (0x[0-9a-f]+)\)/, m){ print strtonum(m[1]); exit }')
+	size=$(readelf -sW prog | awk '$8=="compute"{ print $3; exit }')
+	[ -n "$off" ]
+	[ -n "$size" ]
+	end=$((off + size))
+
+	# 3. Generate the reimpl crate with the discovered range and build the rlib.
+	printf 'use resplice_macros::Splice;\n#[Splice(begin = %d, end = %d)]\npub extern "C" fn compute() -> i32 { 42 }\n' \
+		"$off" "$end" > examples/adder/src/lib.rs
+	cargo build --release -p adder
+	[ -f target/release/libadder.rlib ]
+
+	# 4. Splice and run.
+	target/release/resplice ./prog target/release/libadder.rlib ./prog.patched
+	chmod +x ./prog.patched
+	[ "$(./prog.patched)" = "42" ]
+}

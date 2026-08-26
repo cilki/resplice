@@ -1,0 +1,12 @@
+[package]
+name = "adder"
+version = "0.0.1"
+edition = "2024"
+license = "Unlicense"
+publish = false
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+resplice-macros = { path = "../../resplice-macros" }

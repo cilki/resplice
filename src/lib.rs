@@ -1,23 +1,20 @@
 pub use anyhow::Result;
-pub use inventory;
-pub use resplice_macro::Splice;
 
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
 use std::fs;
 use std::path::Path;
 
-/// Re-export inventory for use in the macro
-pub use inventory::collect;
-
-/// Metadata for a splice point
+/// A single replacement extracted from an rlib.
+///
+/// `code` is the machine code emitted for the spliced function; `begin` and
+/// `end` are the target address range it should overwrite in the original
+/// binary.
 #[derive(Debug, Clone)]
-pub struct SpliceMetadata {
-    pub function_name: &'static str,
-    pub begin_addr: u64,
-    pub end_addr: u64,
+pub struct Splice {
+    pub begin: u64,
+    pub end: u64,
+    pub code: Vec<u8>,
 }
-
-inventory::collect!(SpliceMetadata);
 
 /// Represents a binary file that can be patched
 pub struct Binary {
@@ -109,7 +106,8 @@ impl Binary {
         }
     }
 
-    /// Detect just the binary format (deprecated, use detect_format_and_arch)
+    /// Detect just the binary format.
+    #[allow(dead_code)]
     fn detect_format(data: &[u8]) -> Result<BinaryFormat> {
         let (format, _) = Self::detect_format_and_arch(data)?;
         Ok(format)
@@ -268,57 +266,86 @@ impl Binary {
     }
 }
 
-/// Extract machine code from a function in the current binary
-pub fn extract_function_code(function_name: &str) -> Result<Vec<u8>> {
-    // This would typically involve:
-    // 1. Getting the current executable path
-    // 2. Parsing it to find the function
-    // 3. Extracting its machine code
-    // For now, this is a placeholder
-
-    use std::env;
-
-    let exe_path = env::current_exe().context("Failed to get current executable path")?;
-    let data = fs::read(&exe_path)?;
-
-    match goblin::Object::parse(&data)? {
-        goblin::Object::Elf(elf) => {
-            // Find the symbol
-            for sym in elf.syms.iter() {
-                if let Some(name) = elf.strtab.get_at(sym.st_name) {
-                    if name == function_name {
-                        let start = sym.st_value as usize;
-                        let size = sym.st_size as usize;
-                        return Ok(data[start..start + size].to_vec());
-                    }
-                }
-            }
-            Err(anyhow!("Function not found: {}", function_name))
-        }
-        _ => Err(anyhow!("Unsupported binary format")),
-    }
+/// Parse a `.rspl.<begin>.<end>` section name into its address range.
+///
+/// Returns `None` for any section that is not a splice section.
+fn parse_splice_section(name: &str) -> Option<Result<(u64, u64)>> {
+    let rest = name.strip_prefix(".rspl.")?;
+    Some((|| {
+        let (begin, end) = rest
+            .split_once('.')
+            .ok_or_else(|| anyhow!("malformed splice section name: {name:?}"))?;
+        let begin = u64::from_str_radix(begin, 16)
+            .with_context(|| format!("invalid begin address in section {name:?}"))?;
+        let end = u64::from_str_radix(end, 16)
+            .with_context(|| format!("invalid end address in section {name:?}"))?;
+        Ok((begin, end))
+    })())
 }
 
-/// Apply all registered splices to a target binary
-pub fn apply_all_splices<P: AsRef<Path>>(target_path: P, output_path: P) -> Result<()> {
-    let mut binary = Binary::load(&target_path)?;
+/// Read all splices from an rlib.
+///
+/// An rlib is an `ar` archive of relocatable object files. Each `#[Splice]`
+/// function lives in its own `.rspl.<begin>.<end>` section, so we walk every
+/// object member's sections, decode the range from the section name, and take
+/// the section bytes as the replacement code.
+pub fn read_splices_from_rlib<P: AsRef<Path>>(path: P) -> Result<Vec<Splice>> {
+    use object::read::archive::ArchiveFile;
+    use object::{Object, ObjectSection};
 
-    for splice in inventory::iter::<SpliceMetadata> {
-        // Extract the code for this function
-        match extract_function_code(splice.function_name) {
-            Ok(code) => {
-                binary.apply_direct_patch(splice.begin_addr, splice.end_addr, &code)?;
-            }
-            Err(e) => {
-                eprintln!(
-                    "Warning: Failed to extract code for {}: {}",
-                    splice.function_name, e
-                );
-            }
+    let data = fs::read(&path)
+        .with_context(|| format!("failed to read rlib {:?}", path.as_ref()))?;
+
+    let archive = ArchiveFile::parse(&*data).context("failed to parse rlib archive")?;
+
+    let mut splices = Vec::new();
+    for member in archive.members() {
+        let member = member.context("failed to read archive member")?;
+        let member_data = member.data(&*data).context("failed to read member data")?;
+
+        // Members may be non-object files (e.g. the rmeta blob); skip anything
+        // that does not parse as an object file.
+        let obj = match object::File::parse(member_data) {
+            Ok(obj) => obj,
+            Err(_) => continue,
+        };
+
+        for section in obj.sections() {
+            let name = match section.name() {
+                Ok(name) => name,
+                Err(_) => continue,
+            };
+            let Some(parsed) = parse_splice_section(name) else {
+                continue;
+            };
+            let (begin, end) = parsed?;
+            let code = section
+                .data()
+                .with_context(|| format!("failed to read data of section {name:?}"))?
+                .to_vec();
+            splices.push(Splice { begin, end, code });
         }
     }
 
-    binary.save(output_path)?;
+    Ok(splices)
+}
+
+/// Apply every splice to a loaded binary via direct patching.
+pub fn apply_splices(binary: &mut Binary, splices: &[Splice]) -> Result<()> {
+    for splice in splices {
+        let range = (splice.end - splice.begin) as usize;
+        if splice.code.len() > range {
+            return Err(anyhow!(
+                "replacement code ({} bytes) is larger than target range \
+                 {:#x}..{:#x} ({} bytes); trampolines are not yet implemented",
+                splice.code.len(),
+                splice.begin,
+                splice.end,
+                range,
+            ));
+        }
+        binary.apply_direct_patch(splice.begin, splice.end, &splice.code)?;
+    }
     Ok(())
 }
 
@@ -336,6 +363,7 @@ mod tests {
         data[4] = 2; // 64-bit
         data[5] = 1; // Little endian
         data[6] = 1; // ELF version
+        data[18] = 0x3e; // e_machine = EM_X86_64 (little endian)
         data
     }
 
@@ -351,6 +379,9 @@ mod tests {
         data[0x81] = b'E';
         data[0x82] = 0;
         data[0x83] = 0;
+        // COFF header machine field = IMAGE_FILE_MACHINE_AMD64 (0x8664)
+        data[0x84] = 0x64;
+        data[0x85] = 0x86;
         data
     }
 
@@ -608,8 +639,76 @@ mod tests {
         // Overlapping patch - this should succeed and overwrite
         binary.apply_direct_patch(15, 25, &[0xBB; 5]).unwrap();
 
-        assert_eq!(binary.data[14], 0x90); // NOP from first patch
+        assert_eq!(binary.data[14], 0xAA); // last code byte of first patch, untouched
         assert_eq!(binary.data[15], 0xBB); // Overwritten by second patch
         assert_eq!(binary.data[19], 0xBB);
+    }
+
+    #[test]
+    fn test_parse_splice_section_valid() {
+        let (begin, end) = parse_splice_section(".rspl.1670.1680").unwrap().unwrap();
+        assert_eq!(begin, 0x1670);
+        assert_eq!(end, 0x1680);
+    }
+
+    #[test]
+    fn test_parse_splice_section_not_a_splice() {
+        assert!(parse_splice_section(".text").is_none());
+        assert!(parse_splice_section(".rodata").is_none());
+    }
+
+    #[test]
+    fn test_parse_splice_section_malformed() {
+        // Missing the second address.
+        assert!(parse_splice_section(".rspl.1670").unwrap().is_err());
+        // Non-hex address.
+        assert!(parse_splice_section(".rspl.zz.10").unwrap().is_err());
+    }
+
+    // Wrap object bytes in a minimal GNU `ar` archive so we can exercise the
+    // rlib reader without invoking a compiler.
+    fn ar_wrap(member_name: &str, data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"!<arch>\n");
+
+        let mut header = format!("{:<16}", format!("{member_name}/"));
+        header.push_str(&format!("{:<12}", 0)); // mtime
+        header.push_str(&format!("{:<6}", 0)); // owner
+        header.push_str(&format!("{:<6}", 0)); // group
+        header.push_str(&format!("{:<8}", "644")); // mode
+        header.push_str(&format!("{:<10}", data.len())); // size
+        header.push_str("`\n");
+        assert_eq!(header.len(), 60);
+
+        out.extend_from_slice(header.as_bytes());
+        out.extend_from_slice(data);
+        if data.len() % 2 == 1 {
+            out.push(b'\n');
+        }
+        out
+    }
+
+    #[test]
+    fn test_read_splices_from_rlib() {
+        use object::write::{Object, SectionKind};
+        use object::{Architecture, BinaryFormat, Endianness};
+
+        let mut obj = Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+        let code = [0xb8, 0x2a, 0x00, 0x00, 0x00, 0xc3]; // mov eax, 42; ret
+        let sec = obj.add_section(Vec::new(), b".rspl.a.b".to_vec(), SectionKind::Text);
+        obj.append_section_data(sec, &code, 1);
+        let obj_bytes = obj.write().unwrap();
+
+        let archive = ar_wrap("splice.o", &obj_bytes);
+        let path = std::env::temp_dir().join(format!("resplice_rlib_test_{}.a", std::process::id()));
+        fs::write(&path, &archive).unwrap();
+
+        let splices = read_splices_from_rlib(&path).unwrap();
+        fs::remove_file(&path).ok();
+
+        assert_eq!(splices.len(), 1);
+        assert_eq!(splices[0].begin, 0xa);
+        assert_eq!(splices[0].end, 0xb);
+        assert_eq!(splices[0].code, code);
     }
 }
