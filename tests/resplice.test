@@ -5,38 +5,116 @@
 ##
 ## Precondition: run `cargo build --release` before invoking attest so the
 ## `resplice` binary and `resplice-macros` artifacts already exist.
-testSpliceReplacesFunction() {
-	# 1. Build a target program. `compute` is hand-written asm padded with
-	#    `.zero` so its symbol size comfortably fits the Rust replacement, and
-	#    -fcf-protection=none avoids CET landing-pad faults after patching.
-	#    Files are written with printf to avoid heredoc parsing quirks.
+
+## A self-contained splice (no relocations): the Rust body is a constant, so its
+## machine code is patched directly into the target with nothing to resolve.
+testSpliceSelfContained() {
 	printf '%s\n' '.text' '.globl compute' '.type compute,@function' \
 		'compute:' 'mov $41, %eax' 'ret' '.zero 32' \
 		'.size compute, .-compute' > compute.s
 	printf '%s\n' '#include <stdio.h>' 'int compute(void);' \
 		'int main(void){ printf("%d\n", compute()); return 0; }' > prog.c
-	# Note: the output binary must not be named `target` (that is cargo's build
-	# directory in this working tree).
+	# The output binary must not be named `target` (cargo's build directory).
 	cc -fcf-protection=none -no-pie -O2 -o prog prog.c compute.s
 
-	# Original behaviour.
 	[ "$(./prog)" = "41" ]
 
-	# 2. Discover compute's file offset (objdump -F) and symbol size (readelf).
-	off=$(objdump -Fd prog | awk 'match($0, /^[0-9a-f]+ <compute> \(File Offset: (0x[0-9a-f]+)\)/, m){ print strtonum(m[1]); exit }')
+	# begin/end are virtual addresses: use the symbol's Value (not file offset).
+	va=$(readelf -sW prog | awk '$8=="compute"{ print strtonum("0x" $2); exit }')
 	size=$(readelf -sW prog | awk '$8=="compute"{ print $3; exit }')
-	[ -n "$off" ]
+	[ -n "$va" ]
 	[ -n "$size" ]
-	end=$((off + size))
+	end=$((va + size))
 
-	# 3. Generate the reimpl crate with the discovered range and build the rlib.
 	printf 'use resplice_macros::Splice;\n#[Splice(begin = %d, end = %d)]\npub extern "C" fn compute() -> i32 { 42 }\n' \
-		"$off" "$end" > examples/adder/src/lib.rs
+		"$va" "$end" > examples/adder/src/lib.rs
 	cargo build --release -p adder
 	[ -f target/release/libadder.rlib ]
 
-	# 4. Splice and run.
 	target/release/resplice ./prog target/release/libadder.rlib ./prog.patched
 	chmod +x ./prog.patched
 	[ "$(./prog.patched)" = "42" ]
+}
+
+## A splice with relocations: the Rust body calls a function the target already
+## defines (`helper_c`, bound via the target's symbol table) and reads a Rust
+## `static` (its `.rodata` is pulled in by the relocation closure and injected as
+## a new segment). Exercises symbol binding + section injection + reloc fixups.
+testSpliceResolvesRelocations() {
+	# `helper_c` stays a real, out-of-line symbol the splice can bind to; give
+	# `compute` generous padding so the larger replacement fits.
+	printf '%s\n' '.text' '.globl compute' '.type compute,@function' \
+		'compute:' 'mov $41, %eax' 'ret' '.zero 96' \
+		'.size compute, .-compute' > compute.s
+	printf '%s\n' '#include <stdio.h>' 'int compute(void);' \
+		'int helper_c(int x){ return x + 100; }' \
+		'int main(void){ printf("%d\n", compute()); return helper_c(0) * 0; }' > prog.c
+	cc -fcf-protection=none -no-pie -O2 -o prog prog.c compute.s
+
+	[ "$(./prog)" = "41" ]
+
+	va=$(readelf -sW prog | awk '$8=="compute"{ print strtonum("0x" $2); exit }')
+	size=$(readelf -sW prog | awk '$8=="compute"{ print $3; exit }')
+	end=$((va + size))
+
+	# helper_c(1)=101; 101&3=1 -> TABLE[1]=2000; helper_c(7)=107 -> 2107.
+	{
+		printf 'use resplice_macros::Splice;\n'
+		printf 'unsafe extern "C" { fn helper_c(x: i32) -> i32; }\n'
+		printf 'static TABLE: [i32; 4] = [1000, 2000, 3000, 4000];\n'
+		printf '#[Splice(begin = %d, end = %d)]\n' "$va" "$end"
+		printf 'pub extern "C" fn compute() -> i32 {\n'
+		printf '    let i = (unsafe { helper_c(1) } & 3) as usize;\n'
+		printf '    let a = unsafe { *TABLE.get_unchecked(i) };\n'
+		printf '    let b = unsafe { helper_c(7) };\n'
+		printf '    a + b\n'
+		printf '}\n'
+	} > examples/adder/src/lib.rs
+	cargo build --release -p adder
+	[ -f target/release/libadder.rlib ]
+
+	target/release/resplice ./prog target/release/libadder.rlib ./prog.patched
+	chmod +x ./prog.patched
+	[ "$(./prog.patched)" = "2107" ]
+}
+
+## An oversized splice: the same relocation-heavy replacement, but the target's
+## `compute` is only a few bytes — too small to hold it. The full function is
+## relocated into the injected segment and a jump (trampoline) is written at the
+## original site. The patched binary must still produce the new result.
+testSpliceTrampolinesWhenOversized() {
+	# `compute` gets only tiny padding, so its region cannot hold the ~50-byte
+	# replacement (but is still big enough for the 5-byte jump).
+	printf '%s\n' '.text' '.globl compute' '.type compute,@function' \
+		'compute:' 'mov $41, %eax' 'ret' '.zero 4' \
+		'.size compute, .-compute' > compute.s
+	printf '%s\n' '#include <stdio.h>' 'int compute(void);' \
+		'int helper_c(int x){ return x + 100; }' \
+		'int main(void){ printf("%d\n", compute()); return helper_c(0) * 0; }' > prog.c
+	cc -fcf-protection=none -no-pie -O2 -o prog prog.c compute.s
+
+	[ "$(./prog)" = "41" ]
+
+	va=$(readelf -sW prog | awk '$8=="compute"{ print strtonum("0x" $2); exit }')
+	size=$(readelf -sW prog | awk '$8=="compute"{ print $3; exit }')
+	end=$((va + size))
+
+	{
+		printf 'use resplice_macros::Splice;\n'
+		printf 'unsafe extern "C" { fn helper_c(x: i32) -> i32; }\n'
+		printf 'static TABLE: [i32; 4] = [1000, 2000, 3000, 4000];\n'
+		printf '#[Splice(begin = %d, end = %d)]\n' "$va" "$end"
+		printf 'pub extern "C" fn compute() -> i32 {\n'
+		printf '    let i = (unsafe { helper_c(1) } & 3) as usize;\n'
+		printf '    let a = unsafe { *TABLE.get_unchecked(i) };\n'
+		printf '    let b = unsafe { helper_c(7) };\n'
+		printf '    a + b\n'
+		printf '}\n'
+	} > examples/adder/src/lib.rs
+	cargo build --release -p adder
+	[ -f target/release/libadder.rlib ]
+
+	target/release/resplice ./prog target/release/libadder.rlib ./prog.patched
+	chmod +x ./prog.patched
+	[ "$(./prog.patched)" = "2107" ]
 }

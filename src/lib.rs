@@ -4,6 +4,17 @@ use anyhow::{anyhow, Context};
 use std::fs;
 use std::path::Path;
 
+mod link;
+pub use link::{link_rlib, Applied};
+
+/// Page size used for laying out the injected segment.
+const PAGE: u64 = 0x1000;
+
+/// Round `x` up to the next multiple of `align` (a power of two).
+fn align_up(x: u64, align: u64) -> u64 {
+    (x + align - 1) & !(align - 1)
+}
+
 /// A single replacement extracted from an rlib.
 ///
 /// `code` is the machine code emitted for the spliced function; `begin` and
@@ -113,35 +124,51 @@ impl Binary {
         Ok(format)
     }
 
-    /// Apply a splice by directly patching the binary
+    /// Apply a splice by directly patching the binary.
+    ///
+    /// `begin`/`end` are **file offsets** into the raw binary image; this is the
+    /// low-level primitive. Callers working in virtual-address space translate
+    /// via [`Binary::va_to_offset`] first (see [`link`]).
     pub fn apply_direct_patch(&mut self, begin: u64, end: u64, code: &[u8]) -> Result<()> {
         let size = (end - begin) as usize;
-
         if code.len() > size {
             return Err(anyhow!("Invalid address range: {:#x} to {:#x}", begin, end));
         }
+        self.patch_bytes(begin as usize, size, code)
+    }
 
-        // Direct substitution: replace bytes at the target address
-        let start = begin as usize;
-        let end_pos = start + code.len();
-
-        if end_pos > self.data.len() {
-            return Err(anyhow!("Invalid address range: {:#x} to {:#x}", begin, end));
+    /// Write `code` at file offset `offset`, filling any trailing space up to
+    /// `region_len` with NOP instructions. `code` must not be longer than
+    /// `region_len`.
+    pub fn patch_bytes(&mut self, offset: usize, region_len: usize, code: &[u8]) -> Result<()> {
+        if code.len() > region_len {
+            return Err(anyhow!(
+                "replacement ({} bytes) larger than region ({} bytes)",
+                code.len(),
+                region_len
+            ));
         }
 
-        self.data[start..end_pos].copy_from_slice(code);
+        let end_pos = offset + code.len();
+        if offset + region_len > self.data.len() {
+            return Err(anyhow!(
+                "patch region {:#x}..{:#x} is outside the binary",
+                offset,
+                offset + region_len
+            ));
+        }
 
-        // If the new code is smaller, fill the rest with NOPs
-        if code.len() < size {
+        self.data[offset..end_pos].copy_from_slice(code);
+
+        // If the new code is smaller than the region, fill the rest with NOPs.
+        if code.len() < region_len {
             let nop_insn = self.get_nop_instruction();
-            let remaining = start + size - end_pos;
-            let mut offset = 0;
-
-            while offset < remaining {
-                let bytes_to_copy = std::cmp::min(nop_insn.len(), remaining - offset);
-                self.data[end_pos + offset..end_pos + offset + bytes_to_copy]
-                    .copy_from_slice(&nop_insn[..bytes_to_copy]);
-                offset += bytes_to_copy;
+            let remaining = offset + region_len - end_pos;
+            let mut written = 0;
+            while written < remaining {
+                let n = std::cmp::min(nop_insn.len(), remaining - written);
+                self.data[end_pos + written..end_pos + written + n].copy_from_slice(&nop_insn[..n]);
+                written += n;
             }
         }
 
@@ -167,6 +194,12 @@ impl Binary {
                 &[0x00, 0x00, 0x00, 0x00]
             }
         }
+    }
+
+    /// Machine code for an unconditional jump from `from_va` to `to_va`, for the
+    /// current architecture. Used to build trampolines for oversized splices.
+    pub fn jump_bytes(&self, from_va: u64, to_va: u64) -> Result<Vec<u8>> {
+        self.generate_jump_instruction(from_va, to_va)
     }
 
     /// Apply a splice using an unconditional jump
@@ -208,7 +241,7 @@ impl Binary {
                 let pc = from + 8; // ARM PC is 2 instructions ahead
                 let offset = ((to as i64 - pc as i64) / 4) as i32;
 
-                if offset < -0x800000 || offset > 0x7FFFFF {
+                if !(-0x800000..=0x7FFFFF).contains(&offset) {
                     return Err(anyhow!("Invalid address range: {:#x} to {:#x}", from, to));
                 }
 
@@ -220,7 +253,7 @@ impl Binary {
                 // Encoding: 0x14000000 | ((offset >> 2) & 0x03FFFFFF)
                 let offset = ((to as i64 - from as i64) / 4) as i32;
 
-                if offset < -0x2000000 || offset > 0x1FFFFFF {
+                if !(-0x2000000..=0x1FFFFFF).contains(&offset) {
                     return Err(anyhow!("Invalid address range: {:#x} to {:#x}", from, to));
                 }
 
@@ -263,6 +296,158 @@ impl Binary {
     /// Get the architecture
     pub fn architecture(&self) -> Architecture {
         self.arch
+    }
+
+    /// Parse this binary as an ELF image (errors for non-ELF targets).
+    fn elf(&self) -> Result<goblin::elf::Elf<'_>> {
+        match goblin::Object::parse(&self.data)? {
+            goblin::Object::Elf(elf) => Ok(elf),
+            _ => Err(anyhow!(
+                "relocation-aware splicing is only supported for ELF targets"
+            )),
+        }
+    }
+
+    /// Translate a virtual address to a file offset using the program headers.
+    pub fn va_to_offset(&self, va: u64) -> Result<usize> {
+        use goblin::elf::program_header::PT_LOAD;
+        let elf = self.elf()?;
+        for ph in &elf.program_headers {
+            if ph.p_type == PT_LOAD && va >= ph.p_vaddr && va < ph.p_vaddr + ph.p_filesz {
+                return Ok((ph.p_offset + (va - ph.p_vaddr)) as usize);
+            }
+        }
+        Err(anyhow!("virtual address {va:#x} is not mapped by any PT_LOAD segment"))
+    }
+
+    /// The highest virtual address occupied by any loadable segment.
+    fn max_vaddr(&self) -> Result<u64> {
+        use goblin::elf::program_header::PT_LOAD;
+        let elf = self.elf()?;
+        Ok(elf
+            .program_headers
+            .iter()
+            .filter(|ph| ph.p_type == PT_LOAD)
+            .map(|ph| ph.p_vaddr + ph.p_memsz)
+            .max()
+            .unwrap_or(0))
+    }
+
+    /// The base virtual address the injected segment will be mapped at:
+    /// one page above the target's current image, page-aligned.
+    pub fn injected_base(&self) -> Result<u64> {
+        Ok(align_up(self.max_vaddr()?, PAGE) + PAGE)
+    }
+
+    /// Resolve a symbol name against the target binary's own symbols.
+    ///
+    /// Tries, in order: a defined symbol in `.symtab`, a defined symbol in
+    /// `.dynsym`, then a function the target imports through its PLT (the stub's
+    /// address). Returns `None` if the target provides no such symbol.
+    pub fn resolve_target_symbol(&self, name: &str) -> Result<Option<u64>> {
+        use goblin::elf::section_header::SHN_UNDEF;
+        let elf = self.elf()?;
+
+        // 1 & 2: a symbol the target defines itself.
+        for (syms, strtab) in [(&elf.syms, &elf.strtab), (&elf.dynsyms, &elf.dynstrtab)] {
+            for sym in syms.iter() {
+                if sym.st_shndx as u32 == SHN_UNDEF || sym.st_value == 0 {
+                    continue;
+                }
+                if strtab.get_at(sym.st_name) == Some(name) {
+                    return Ok(Some(sym.st_value));
+                }
+            }
+        }
+
+        // 3: a function the target imports through the PLT. The i-th `.rela.plt`
+        // entry corresponds to `.plt` stub `plt_base + (i + 1) * PLT_ENTRY`
+        // (entry 0 is the resolver header) on x86-64.
+        const PLT_ENTRY: u64 = 16;
+        let plt_addr = elf
+            .section_headers
+            .iter()
+            .find(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(".plt"))
+            .map(|sh| sh.sh_addr);
+        if let Some(plt_addr) = plt_addr {
+            for (i, reloc) in elf.pltrelocs.iter().enumerate() {
+                if let Some(sym) = elf.dynsyms.get(reloc.r_sym) {
+                    if elf.dynstrtab.get_at(sym.st_name) == Some(name) {
+                        return Ok(Some(plt_addr + (i as u64 + 1) * PLT_ENTRY));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Inject `blob` as a new read+execute segment mapped at virtual address
+    /// `base`, by converting an existing `PT_NOTE` program header into a
+    /// `PT_LOAD` (so the program-header table itself need not be relocated).
+    ///
+    /// `base` must be page-aligned; the file is padded to a page boundary before
+    /// the blob is appended so the loader's `p_vaddr ≡ p_offset (mod p_align)`
+    /// requirement holds.
+    pub fn inject_segment(&mut self, base: u64, blob: &[u8]) -> Result<()> {
+        use goblin::elf::program_header::{PF_R, PF_X, PT_LOAD, PT_NOTE};
+
+        if base % PAGE != 0 {
+            return Err(anyhow!("injected base {base:#x} is not page-aligned"));
+        }
+        if self.data.len() < 64
+            || self.data[..4] != [0x7f, b'E', b'L', b'F']
+            || self.data[4] != 2 // ELFCLASS64
+            || self.data[5] != 1
+        // ELFDATA2LSB
+        {
+            return Err(anyhow!("segment injection requires a little-endian ELF64 target"));
+        }
+
+        let phoff = u64::from_le_bytes(self.data[0x20..0x28].try_into().unwrap()) as usize;
+        let phentsize = u16::from_le_bytes(self.data[0x36..0x38].try_into().unwrap()) as usize;
+        let phnum = u16::from_le_bytes(self.data[0x38..0x3a].try_into().unwrap()) as usize;
+        if phentsize != 56 {
+            return Err(anyhow!("unexpected program-header entry size {phentsize}"));
+        }
+
+        // Find a PT_NOTE entry to repurpose.
+        let mut note_off = None;
+        for i in 0..phnum {
+            let off = phoff + i * phentsize;
+            let p_type = u32::from_le_bytes(self.data[off..off + 4].try_into().unwrap());
+            if p_type == PT_NOTE {
+                note_off = Some(off);
+                break;
+            }
+        }
+        let note_off = note_off.ok_or_else(|| {
+            anyhow!("no PT_NOTE segment to convert; program-header relocation is not implemented")
+        })?;
+
+        // Append the blob at a page-aligned file offset.
+        let file_off = align_up(self.data.len() as u64, PAGE);
+        self.data.resize(file_off as usize, 0);
+        self.data.extend_from_slice(blob);
+        let len = blob.len() as u64;
+
+        // Rewrite the note phdr in place as a PT_LOAD covering the appended blob.
+        let write_u32 = |data: &mut [u8], at: usize, v: u32| {
+            data[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        };
+        let write_u64 = |data: &mut [u8], at: usize, v: u64| {
+            data[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        };
+        write_u32(&mut self.data, note_off, PT_LOAD);
+        write_u32(&mut self.data, note_off + 4, PF_R | PF_X);
+        write_u64(&mut self.data, note_off + 8, file_off);
+        write_u64(&mut self.data, note_off + 16, base);
+        write_u64(&mut self.data, note_off + 24, base);
+        write_u64(&mut self.data, note_off + 32, len);
+        write_u64(&mut self.data, note_off + 40, len);
+        write_u64(&mut self.data, note_off + 48, PAGE);
+
+        Ok(())
     }
 }
 
@@ -330,25 +515,6 @@ pub fn read_splices_from_rlib<P: AsRef<Path>>(path: P) -> Result<Vec<Splice>> {
     Ok(splices)
 }
 
-/// Apply every splice to a loaded binary via direct patching.
-pub fn apply_splices(binary: &mut Binary, splices: &[Splice]) -> Result<()> {
-    for splice in splices {
-        let range = (splice.end - splice.begin) as usize;
-        if splice.code.len() > range {
-            return Err(anyhow!(
-                "replacement code ({} bytes) is larger than target range \
-                 {:#x}..{:#x} ({} bytes); trampolines are not yet implemented",
-                splice.code.len(),
-                splice.begin,
-                splice.end,
-                range,
-            ));
-        }
-        binary.apply_direct_patch(splice.begin, splice.end, &splice.code)?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,10 +554,7 @@ mod tests {
     #[test]
     fn test_binary_format_detection_incomplete() {
         let elf_header = vec![0x7f, 0x45, 0x4c, 0x46]; // Too short
-        assert!(matches!(
-            Binary::detect_format(&elf_header),
-            Err(_) // Will fail to parse incomplete header
-        ));
+        assert!(Binary::detect_format(&elf_header).is_err());
     }
 
     #[test]
@@ -562,7 +725,7 @@ mod tests {
         assert_eq!(binary.data[0x200], 0xE9);
 
         // Offset will be negative
-        let offset = (0x100 as i64 - (0x200 + 5) as i64) as i32;
+        let offset = (0x100_i64 - (0x200 + 5) as i64) as i32;
         assert_eq!(binary.data[0x201], (offset & 0xFF) as u8);
     }
 

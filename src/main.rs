@@ -1,6 +1,7 @@
 use anyhow::Result;
-use resplice::{apply_splices, read_splices_from_rlib, Binary};
+use resplice::{link_rlib, Binary};
 use std::env;
+use std::path::Path;
 use std::process::ExitCode;
 
 fn run() -> Result<()> {
@@ -17,22 +18,23 @@ fn run() -> Result<()> {
     let rlib = &args[2];
     let output = &args[3];
 
-    let splices = read_splices_from_rlib(rlib)?;
-    if splices.is_empty() {
+    let mut binary = Binary::load(original)?;
+    let applied = link_rlib(&mut binary, Path::new(rlib))?;
+    if applied.is_empty() {
         eprintln!("warning: no splices found in {rlib}");
     }
-
-    let mut binary = Binary::load(original)?;
-    apply_splices(&mut binary, &splices)?;
     binary.save(output)?;
 
-    println!("applied {} splice(s) to {output}:", splices.len());
-    for splice in &splices {
+    println!("applied {} splice(s) to {output}:", applied.len());
+    for splice in &applied {
+        let how = if splice.trampoline {
+            " (trampoline to injected segment)"
+        } else {
+            ""
+        };
         println!(
-            "  {:#x}..{:#x} <- {} bytes",
-            splice.begin,
-            splice.end,
-            splice.code.len()
+            "  {:#x}..{:#x} <- {} bytes{how}",
+            splice.begin, splice.end, splice.code_len
         );
     }
 

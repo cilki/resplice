@@ -44,18 +44,16 @@ pub fn Splice(args: TokenStream, input: TokenStream) -> TokenStream {
 
             match name.as_deref() {
                 Some("begin") => {
-                    if let Expr::Lit(expr_lit) = nv.value {
-                        if let Lit::Int(lit_int) = expr_lit.lit {
+                    if let Expr::Lit(expr_lit) = nv.value
+                        && let Lit::Int(lit_int) = expr_lit.lit {
                             begin_addr = lit_int.base10_parse().ok();
                         }
-                    }
                 }
                 Some("end") => {
-                    if let Expr::Lit(expr_lit) = nv.value {
-                        if let Lit::Int(lit_int) = expr_lit.lit {
+                    if let Expr::Lit(expr_lit) = nv.value
+                        && let Lit::Int(lit_int) = expr_lit.lit {
                             end_addr = lit_int.base10_parse().ok();
                         }
-                    }
                 }
                 _ => {}
             }
@@ -117,18 +115,16 @@ mod tests {
 
                 match name.as_deref() {
                     Some("begin") => {
-                        if let Expr::Lit(expr_lit) = nv.value {
-                            if let Lit::Int(lit_int) = expr_lit.lit {
+                        if let Expr::Lit(expr_lit) = nv.value
+                            && let Lit::Int(lit_int) = expr_lit.lit {
                                 begin_addr = lit_int.base10_parse().ok();
                             }
-                        }
                     }
                     Some("end") => {
-                        if let Expr::Lit(expr_lit) = nv.value {
-                            if let Lit::Int(lit_int) = expr_lit.lit {
+                        if let Expr::Lit(expr_lit) = nv.value
+                            && let Lit::Int(lit_int) = expr_lit.lit {
                                 end_addr = lit_int.base10_parse().ok();
                             }
-                        }
                     }
                     _ => {}
                 }

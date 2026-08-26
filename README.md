@@ -36,9 +36,28 @@ But, most likely, we only care about reversing a few specific sections.
 
 ## How it works
 
-As you may have guessed by the name, `Splice` forcibly inserts the machine code
-for Rust functions into a target binary (either via direct substitution or via
-trampolines).
+`Splice` compiles each annotated function into its own object-file section named
+`.rspl.<begin>.<end>` (the `begin`/`end` **virtual addresses** encoded in hex).
+The `resplice` tool reads those sections back out of the compiled rlib and
+patches each function's machine code over `[begin, end)` in the target.
+
+Real replacements are rarely self-contained — they call helpers, read `static`
+data, or call libc. `resplice` resolves those relocations recursively:
+
+- Referenced Rust code and read-only data are collected (transitively) and
+  **injected into the target as a new segment** (an unused `PT_NOTE` program
+  header is converted into a `PT_LOAD`), then the references are fixed up to
+  point at their injected addresses.
+- Calls to symbols the target already **defines or imports** (e.g. a libc
+  function reachable through the PLT) bind to the target's own addresses.
+
+When a replacement is **larger than `[begin, end)`**, it does not have to fit:
+the full function is relocated into the injected segment and a jump (trampoline)
+is written at `begin` to reach it, so `[begin, end)` only needs room for the
+jump.
+
+Relocation resolution and injection currently target x86-64 ELF. Mutable
+`static`s (writable injected data) are not yet handled.
 
 ## Usage
 
