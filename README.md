@@ -56,9 +56,6 @@ the full function is relocated into the injected segment and a jump (trampoline)
 is written at `begin` to reach it, so `[begin, end)` only needs room for the
 jump.
 
-Relocation resolution and injection currently target x86-64 ELF. Mutable
-`static`s (writable injected data) are not yet handled.
-
 ## Usage
 
 Write your replacements in a library crate that depends on `resplice-macros`:
@@ -81,3 +78,20 @@ resplice ./original-binary target/release/libyourcrate.rlib ./patched-binary
 ```
 
 See `examples/adder` for a complete crate.
+
+### Cross-compiling for another architecture
+
+The replacement crate must be compiled for the **same** architecture as the
+target binary. [`cross`](https://github.com/cross-rs/cross) makes this a
+one-liner — it runs the Rust toolchain for the chosen target inside a container,
+so no local cross toolchain is required:
+
+```sh
+cargo install cross
+cross build --release --target aarch64-unknown-linux-gnu
+# -> target/aarch64-unknown-linux-gnu/release/libyourcrate.rlib
+resplice ./aarch64-binary \
+    target/aarch64-unknown-linux-gnu/release/libyourcrate.rlib \
+    ./patched
+```
+

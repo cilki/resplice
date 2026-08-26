@@ -19,11 +19,7 @@
 //! 5. Inject the collected bytes as a new segment and patch each splice's
 //!    resolved code into its `[begin, end)` range.
 
-use anyhow::{anyhow, Context, Result};
-use object::elf::{
-    R_X86_64_32, R_X86_64_32S, R_X86_64_64, R_X86_64_GOTPCREL, R_X86_64_GOTPCRELX, R_X86_64_PC32,
-    R_X86_64_PC64, R_X86_64_PLT32, R_X86_64_REX_GOTPCRELX,
-};
+use anyhow::{anyhow, bail, Context, Result};
 use object::read::archive::ArchiveFile;
 use object::{
     Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget, SectionKind,
@@ -32,9 +28,11 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use crate::Binary;
+use crate::arch::{self, Endian};
+use crate::{Architecture, Binary};
 
 /// A splice that has been applied to the target, for reporting.
+#[derive(Debug)]
 pub struct Applied {
     pub begin: u64,
     pub end: u64,
@@ -120,6 +118,9 @@ struct Rel {
     r_type: u32,
     sym: usize,
     addend: i64,
+    /// True for REL relocations (ARM, MIPS o32) whose addend is stored in the
+    /// instruction field rather than carried explicitly.
+    has_implicit: bool,
 }
 
 /// Owned copy of the parts of a symbol we need to resolve a relocation.
@@ -143,11 +144,46 @@ fn splice_range(name: &str) -> Option<(u64, u64)> {
     Some((u64::from_str_radix(b, 16).ok()?, u64::from_str_radix(e, 16).ok()?))
 }
 
-fn is_gotpcrel(r_type: u32) -> bool {
-    matches!(
-        r_type,
-        R_X86_64_GOTPCREL | R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX
-    )
+/// Verify that an rlib object member targets the same architecture, byte order,
+/// and pointer width as the binary being patched. Splicing wrong-arch machine
+/// code in would silently corrupt the target, so this is a hard gate.
+fn verify_arch(obj: &object::File, target: &Binary) -> Result<()> {
+    use object::Architecture as OA;
+    let obj_arch = match obj.architecture() {
+        OA::I386 => Architecture::X86,
+        OA::X86_64 => Architecture::X86_64,
+        OA::Arm => Architecture::Arm,
+        OA::Aarch64 => Architecture::Arm64,
+        OA::Mips => Architecture::Mips,
+        OA::Mips64 => Architecture::Mips64,
+        other => bail!("rlib has unsupported architecture {other:?}"),
+    };
+    let obj_endian = match obj.endianness() {
+        object::Endianness::Little => Endian::Little,
+        object::Endianness::Big => Endian::Big,
+    };
+    let obj_is_64 = obj.is_64();
+
+    if obj_arch != target.architecture()
+        || obj_endian != target.endian()
+        || obj_is_64 != target.is_64()
+    {
+        bail!(
+            "rlib is {} but target is {}",
+            arch::describe(obj_arch, obj_endian, obj_is_64),
+            arch::describe(target.architecture(), target.endian(), target.is_64()),
+        );
+    }
+    Ok(())
+}
+
+/// The paired `R_MIPS_LO16` addend for an `R_MIPS_HI16`, read from the original
+/// section bytes (the low half of the first matching-symbol LO16 instruction).
+fn find_pair_lo(arch: Architecture, sec: &Sec, sym: usize, endian: Endian) -> Option<i64> {
+    sec.relocs
+        .iter()
+        .find(|r| arch::is_mips_lo16(arch, r.r_type) && r.sym == sym)
+        .map(|r| arch::mips_lo16_addend(endian, &sec.bytes, r.offset as usize))
 }
 
 /// Link one object member into the shared injected blob + patch list.
@@ -158,6 +194,11 @@ fn link_object(
     blob: &mut Vec<u8>,
     patches: &mut Vec<Patch>,
 ) -> Result<()> {
+    verify_arch(obj, target)?;
+    let arch = target.architecture();
+    let endian = target.endian();
+    let is_64 = target.is_64();
+
     // Extract everything we need into owned structures so the borrow of `obj`
     // does not outlive this block.
     let mut secs: HashMap<usize, Sec> = HashMap::new();
@@ -183,6 +224,7 @@ fn link_object(
                 r_type,
                 sym,
                 addend: reloc.addend(),
+                has_implicit: reloc.has_implicit_addend(),
             });
 
             // Record the referenced symbol.
@@ -272,16 +314,17 @@ fn link_object(
         blob.extend_from_slice(&sec.bytes);
     }
 
-    // Synthesize an 8-byte GOT slot per symbol referenced by a GOTPCREL-style
-    // relocation, so indirect `call *sym@GOTPCREL(%rip)` loads a real pointer.
+    // Synthesize a pointer-sized GOT slot per symbol referenced by a GOT-style
+    // relocation, so an indirect load through the GOT reaches a real pointer.
+    let got_width = arch::got_slot_width(is_64);
     let mut got: HashMap<usize, (u64, usize)> = HashMap::new();
     for &si in &included {
         for r in &secs[&si].relocs {
-            if is_gotpcrel(r.r_type) && !got.contains_key(&r.sym) {
-                pad_to(blob, 8);
+            if arch::needs_got(arch, r.r_type) && !got.contains_key(&r.sym) {
+                pad_to(blob, got_width as u64);
                 let va = base + blob.len() as u64;
                 got.insert(r.sym, (va, blob.len()));
-                blob.extend_from_slice(&[0u8; 8]);
+                blob.resize(blob.len() + got_width, 0);
             }
         }
     }
@@ -306,67 +349,70 @@ fn link_object(
         }
     };
 
-    // Apply relocations for every included section. Splice sections write into
-    // their own output buffer (patched into `[begin, end)` later); injected
-    // sections write in place inside `blob`.
+    // Fill each synthesized GOT slot with its resolved symbol address (done in
+    // its own pass so the field-writing loop below can borrow `blob` freely).
+    for (&sym, &(_, goff)) in &got {
+        let s = resolve(sym)?;
+        endian.write_uint(&mut blob[..], goff, got_width, s);
+    }
+
+    // Apply relocations for every included section. A splice that fits is
+    // relocated into a private buffer and patched into `[begin, end)` later;
+    // everything else (referenced sections, oversized splices) is relocated in
+    // place inside the injected blob.
     for &si in &included {
         let sec = &secs[&si];
         let site_base = sec_va[&si];
+        let is_fit_splice = sec.splice.is_some() && !oversized.contains(&si);
 
-        // Collect (offset, width, value) writes first to avoid aliasing `blob`.
-        let mut writes: Vec<(usize, Write)> = Vec::new();
+        let mut out = if is_fit_splice { sec.bytes.clone() } else { Vec::new() };
+        let bo = if is_fit_splice { 0 } else { inj_blob_off[&si] };
+
         for r in &sec.relocs {
             let s = resolve(r.sym)?;
-            let a = r.addend;
             let p = site_base + r.offset;
-            let off = r.offset as usize;
-
-            let w = match r.r_type {
-                R_X86_64_64 => Write::U64(s.wrapping_add(a as u64)),
-                R_X86_64_PC64 => Write::U64((s as i64 + a - p as i64) as u64),
-                R_X86_64_PC32 | R_X86_64_PLT32 => {
-                    Write::U32((s as i64 + a - p as i64) as i32 as u32)
-                }
-                R_X86_64_32 => Write::U32(s.wrapping_add(a as u64) as u32),
-                R_X86_64_32S => Write::U32(s.wrapping_add(a as u64) as i32 as u32),
-                t if is_gotpcrel(t) => {
-                    let (gva, goff) = got[&r.sym];
-                    // The slot holds the resolved symbol pointer.
-                    blob[goff..goff + 8].copy_from_slice(&s.to_le_bytes());
-                    Write::U32((gva as i64 + a - p as i64) as i32 as u32)
-                }
-                other => {
-                    return Err(anyhow!(
-                        "unsupported relocation type {other} against {:?} in {:?}",
-                        syms[&r.sym].name,
-                        sec.name
-                    ))
-                }
+            let a = if r.has_implicit { 0 } else { r.addend };
+            let got_va = got.get(&r.sym).map(|&(gva, _)| gva);
+            let pair_lo = if arch::is_mips_hi16(arch, r.r_type) && r.has_implicit {
+                find_pair_lo(arch, sec, r.sym, endian)
+            } else {
+                None
             };
-            writes.push((off, w));
+
+            let buf: &mut [u8] = if is_fit_splice {
+                &mut out
+            } else {
+                &mut blob[bo..]
+            };
+            arch::apply(
+                arch,
+                endian,
+                r.r_type,
+                buf,
+                r.offset as usize,
+                s,
+                a,
+                p,
+                got_va,
+                r.has_implicit,
+                pair_lo,
+            )
+            .with_context(|| {
+                format!(
+                    "relocation against {:?} in {:?}",
+                    syms[&r.sym].name, sec.name
+                )
+            })?;
         }
 
-        match sec.splice {
-            // A splice that fits is patched directly into its region.
-            Some((begin, end)) if !oversized.contains(&si) => {
-                let mut out = sec.bytes.clone();
-                for (off, w) in writes {
-                    w.apply(&mut out, off);
-                }
+        if let Some((begin, end)) = sec.splice {
+            if is_fit_splice {
                 patches.push(Patch {
                     begin,
                     end,
                     code: out,
                     trampoline: false,
                 });
-            }
-            // Everything else (referenced sections, oversized splices) is
-            // relocated in place inside the injected blob.
-            _ => {
-                let bo = inj_blob_off[&si];
-                for (off, w) in writes {
-                    w.apply(&mut blob[bo..], off);
-                }
             }
         }
     }
@@ -392,21 +438,6 @@ fn link_object(
     }
 
     Ok(())
-}
-
-/// A pending little-endian write of a resolved relocation value.
-enum Write {
-    U32(u32),
-    U64(u64),
-}
-
-impl Write {
-    fn apply(&self, buf: &mut [u8], off: usize) {
-        match self {
-            Write::U32(v) => buf[off..off + 4].copy_from_slice(&v.to_le_bytes()),
-            Write::U64(v) => buf[off..off + 8].copy_from_slice(&v.to_le_bytes()),
-        }
-    }
 }
 
 /// Pad `blob` with zeroes so its length is a multiple of `align`.
@@ -666,5 +697,127 @@ mod tests {
         // The relocated splice's own references are resolved at its new home.
         let code_off = bin.va_to_offset(dest).unwrap();
         assert_refs_resolved(&bin, code_off, dest);
+    }
+
+    /// The crafted x86-64 target with its `e_machine` field changed to
+    /// `EM_AARCH64` (183), so `Binary::load` classifies it as aarch64.
+    fn crafted_target_aarch64() -> Vec<u8> {
+        let mut d = crafted_target();
+        d[0x12] = 183;
+        d[0x13] = 0;
+        d
+    }
+
+    /// AArch64 helper (`movz w0,#42; ret`) and splice
+    /// (`bl helper; adrp x0,TABLE; add x0,x0,:lo12:TABLE; ret`).
+    const A64_HELPER: [u8; 8] = [0x40, 0x05, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6];
+    const A64_SPLICE: [u8; 16] = [
+        0x00, 0x00, 0x00, 0x94, // bl   helper
+        0x00, 0x00, 0x00, 0x90, // adrp x0, TABLE page
+        0x00, 0x00, 0x00, 0x91, // add  x0, x0, :lo12:TABLE
+        0xc0, 0x03, 0x5f, 0xd6, // ret
+    ];
+
+    fn build_rlib_aarch64(splice_end: u64) -> Vec<u8> {
+        use object::write::{Object, Relocation, Symbol, SymbolSection as WSection};
+        use object::{
+            Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolFlags,
+            SymbolKind, SymbolScope,
+        };
+
+        let mut obj = Object::new(BinaryFormat::Elf, Architecture::Aarch64, Endianness::Little);
+
+        let helper_sec = obj.add_section(vec![], b".text.helper".to_vec(), SectionKind::Text);
+        obj.append_section_data(helper_sec, &A64_HELPER, 4);
+        let helper_sym = obj.section_symbol(helper_sec);
+
+        let table = table_data();
+        let rodata = obj.add_section(vec![], b".rodata.table".to_vec(), SectionKind::ReadOnlyData);
+        obj.append_section_data(rodata, &table, 4);
+        let table_sym = obj.add_symbol(Symbol {
+            name: b"TABLE".to_vec(),
+            value: 0,
+            size: table.len() as u64,
+            kind: SymbolKind::Data,
+            scope: SymbolScope::Compilation,
+            weak: false,
+            section: WSection::Section(rodata),
+            flags: SymbolFlags::None,
+        });
+
+        let name = format!(".rspl.{SPLICE_VA:x}.{splice_end:x}").into_bytes();
+        let rspl = obj.add_section(vec![], name, SectionKind::Text);
+        obj.append_section_data(rspl, &A64_SPLICE, 16);
+        for (offset, symbol, r_type) in [
+            (0, helper_sym, object::elf::R_AARCH64_CALL26),
+            (4, table_sym, object::elf::R_AARCH64_ADR_PREL_PG_HI21),
+            (8, table_sym, object::elf::R_AARCH64_ADD_ABS_LO12_NC),
+        ] {
+            obj.add_relocation(
+                rspl,
+                Relocation {
+                    offset,
+                    symbol,
+                    addend: 0,
+                    flags: RelocationFlags::Elf { r_type },
+                },
+            )
+            .unwrap();
+        }
+        ar_wrap("splice.o", &obj.write().unwrap())
+    }
+
+    #[test]
+    fn test_link_rlib_aarch64_resolves_refs() {
+        let rlib_path = temp_path("rlib_a64");
+        fs::write(&rlib_path, build_rlib_aarch64(SPLICE_VA + 0x20)).unwrap();
+        let mut bin = load(&crafted_target_aarch64());
+        let applied = link_rlib(&mut bin, &rlib_path).unwrap();
+        fs::remove_file(&rlib_path).ok();
+
+        assert_eq!(applied.len(), 1);
+        assert!(!applied[0].trampoline);
+
+        let d = bin.data();
+        let off = 0x1000; // SPLICE_VA
+
+        // BL: sign-extended imm26 * 4 gives the helper's displacement.
+        let bl = u32::from_le_bytes(d[off..off + 4].try_into().unwrap());
+        assert_eq!(bl & 0xfc00_0000, 0x9400_0000, "BL opcode");
+        let imm26 = (((bl & 0x03ff_ffff) as i32) << 6) >> 6;
+        let helper_va = (SPLICE_VA as i64 + imm26 as i64 * 4) as u64;
+        assert!(helper_va >= INJECT_BASE, "helper not injected");
+        let hoff = bin.va_to_offset(helper_va).unwrap();
+        assert_eq!(&bin.data()[hoff..hoff + A64_HELPER.len()], &A64_HELPER);
+
+        // ADRP page + ADD lo12 reconstruct the TABLE address.
+        let adrp = u32::from_le_bytes(d[off + 4..off + 8].try_into().unwrap());
+        let immlo = ((adrp >> 29) & 0x3) as i64;
+        let immhi = ((adrp >> 5) & 0x7ffff) as i64;
+        let mut pageimm = (immhi << 2) | immlo;
+        if pageimm & (1 << 20) != 0 {
+            pageimm -= 1 << 21;
+        }
+        let page = ((SPLICE_VA + 4) & !0xfff) as i64 + pageimm * 0x1000;
+        let add = u32::from_le_bytes(d[off + 8..off + 12].try_into().unwrap());
+        let lo12 = ((add >> 10) & 0xfff) as i64;
+        let table_va = (page + lo12) as u64;
+        assert!(table_va >= INJECT_BASE, "table not injected");
+        let toff = bin.va_to_offset(table_va).unwrap();
+        assert_eq!(&bin.data()[toff..toff + table_data().len()], &table_data());
+    }
+
+    #[test]
+    fn test_link_rlib_arch_mismatch_errors() {
+        // An aarch64 rlib spliced into an x86-64 target must be rejected.
+        let rlib_path = temp_path("rlib_mismatch");
+        fs::write(&rlib_path, build_rlib_aarch64(SPLICE_VA + 0x20)).unwrap();
+        let mut bin = load(&crafted_target()); // x86-64
+        let err = link_rlib(&mut bin, &rlib_path).unwrap_err();
+        fs::remove_file(&rlib_path).ok();
+
+        let msg = err.to_string();
+        assert!(msg.contains("aarch64"), "message was {msg:?}");
+        assert!(msg.contains("x86-64"), "message was {msg:?}");
     }
 }

@@ -4,7 +4,9 @@ use anyhow::{anyhow, Context};
 use std::fs;
 use std::path::Path;
 
+mod arch;
 mod link;
+pub use arch::Endian;
 pub use link::{link_rlib, Applied};
 
 /// Page size used for laying out the injected segment.
@@ -32,6 +34,8 @@ pub struct Binary {
     data: Vec<u8>,
     format: BinaryFormat,
     arch: Architecture,
+    is_64: bool,
+    endian: Endian,
 }
 
 /// Supported binary formats
@@ -53,17 +57,35 @@ pub enum Architecture {
     Mips64,
 }
 
+impl Architecture {
+    /// Whether this architecture uses 64-bit pointers.
+    fn is_64(self) -> bool {
+        matches!(
+            self,
+            Architecture::X86_64 | Architecture::Arm64 | Architecture::Mips64
+        )
+    }
+}
+
 impl Binary {
     /// Load a binary file from disk
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let data = fs::read(path)?;
-        let (format, arch) = Self::detect_format_and_arch(&data)?;
+        let (format, arch, is_64, endian) = Self::detect_format_and_arch(&data)?;
 
-        Ok(Binary { data, format, arch })
+        Ok(Binary {
+            data,
+            format,
+            arch,
+            is_64,
+            endian,
+        })
     }
 
-    /// Detect the binary format and architecture
-    fn detect_format_and_arch(data: &[u8]) -> Result<(BinaryFormat, Architecture)> {
+    /// Detect the binary format, architecture, pointer width, and byte order.
+    fn detect_format_and_arch(
+        data: &[u8],
+    ) -> Result<(BinaryFormat, Architecture, bool, Endian)> {
         match goblin::Object::parse(data)? {
             goblin::Object::Elf(elf) => {
                 let format = BinaryFormat::Elf;
@@ -82,7 +104,12 @@ impl Binary {
                     }
                     _ => return Err(anyhow!("Unsupported binary format")),
                 };
-                Ok((format, arch))
+                let endian = if elf.little_endian {
+                    Endian::Little
+                } else {
+                    Endian::Big
+                };
+                Ok((format, arch, elf.is_64, endian))
             }
             goblin::Object::PE(pe) => {
                 let format = BinaryFormat::Pe;
@@ -93,7 +120,7 @@ impl Binary {
                     goblin::pe::header::COFF_MACHINE_ARM64 => Architecture::Arm64,
                     _ => return Err(anyhow!("Unsupported binary format")),
                 };
-                Ok((format, arch))
+                Ok((format, arch, arch.is_64(), Endian::Little))
             }
             goblin::Object::Mach(mach) => {
                 use goblin::mach::Mach;
@@ -111,7 +138,7 @@ impl Binary {
                         Architecture::X86_64
                     }
                 };
-                Ok((format, arch))
+                Ok((format, arch, arch.is_64(), Endian::Little))
             }
             _ => Err(anyhow!("Unsupported binary format")),
         }
@@ -120,7 +147,7 @@ impl Binary {
     /// Detect just the binary format.
     #[allow(dead_code)]
     fn detect_format(data: &[u8]) -> Result<BinaryFormat> {
-        let (format, _) = Self::detect_format_and_arch(data)?;
+        let (format, ..) = Self::detect_format_and_arch(data)?;
         Ok(format)
     }
 
@@ -175,25 +202,22 @@ impl Binary {
         Ok(())
     }
 
-    /// Get the NOP instruction bytes for the current architecture
-    fn get_nop_instruction(&self) -> &'static [u8] {
+    /// Get the NOP instruction bytes for the current architecture, encoded in
+    /// the target's byte order.
+    fn get_nop_instruction(&self) -> Vec<u8> {
         match self.arch {
-            Architecture::X86 | Architecture::X86_64 => {
-                &[0x90] // NOP
-            }
-            Architecture::Arm => {
-                // MOV r0, r0 (little-endian)
-                &[0x00, 0x00, 0xa0, 0xe1]
-            }
-            Architecture::Arm64 => {
-                // NOP instruction for ARM64
-                &[0x1f, 0x20, 0x03, 0xd5]
-            }
-            Architecture::Mips | Architecture::Mips64 => {
-                // NOP instruction for MIPS
-                &[0x00, 0x00, 0x00, 0x00]
-            }
+            Architecture::X86 | Architecture::X86_64 => vec![0x90],
+            Architecture::Arm => self.encode_insn(0xe1a0_0000), // mov r0, r0
+            Architecture::Arm64 => self.encode_insn(0xd503_201f), // nop
+            Architecture::Mips | Architecture::Mips64 => vec![0, 0, 0, 0],
         }
+    }
+
+    /// Encode a 32-bit instruction word in the target's byte order.
+    fn encode_insn(&self, insn: u32) -> Vec<u8> {
+        let mut b = vec![0u8; 4];
+        self.endian.write_uint(&mut b, 0, 4, insn as u64);
+        b
     }
 
     /// Machine code for an unconditional jump from `from_va` to `to_va`, for the
@@ -246,7 +270,7 @@ impl Binary {
                 }
 
                 let insn = 0xEA000000u32 | ((offset as u32) & 0x00FFFFFF);
-                Ok(insn.to_le_bytes().to_vec())
+                Ok(self.encode_insn(insn))
             }
             Architecture::Arm64 => {
                 // ARM64 branch instruction: B <offset>
@@ -258,21 +282,17 @@ impl Binary {
                 }
 
                 let insn = 0x14000000u32 | ((offset as u32) & 0x03FFFFFF);
-                Ok(insn.to_le_bytes().to_vec())
+                Ok(self.encode_insn(insn))
             }
-            Architecture::Mips => {
+            Architecture::Mips | Architecture::Mips64 => {
                 // MIPS J instruction: J <address>
                 // Encoding: 0x08000000 | ((address >> 2) & 0x03FFFFFF)
-                // Note: Target address must be in same 256MB region
+                // Note: the target must lie in the same 256MB region as the delay
+                // slot; encoded in the target's byte order (BE for mips, LE for
+                // mipsel).
                 let addr_bits = ((to >> 2) & 0x03FFFFFF) as u32;
                 let insn = 0x08000000u32 | addr_bits;
-                Ok(insn.to_be_bytes().to_vec()) // MIPS is typically big-endian
-            }
-            Architecture::Mips64 => {
-                // MIPS64 uses same J instruction format as MIPS32
-                let addr_bits = ((to >> 2) & 0x03FFFFFF) as u32;
-                let insn = 0x08000000u32 | addr_bits;
-                Ok(insn.to_be_bytes().to_vec())
+                Ok(self.encode_insn(insn))
             }
         }
     }
@@ -296,6 +316,16 @@ impl Binary {
     /// Get the architecture
     pub fn architecture(&self) -> Architecture {
         self.arch
+    }
+
+    /// Whether the target uses 64-bit pointers.
+    pub fn is_64(&self) -> bool {
+        self.is_64
+    }
+
+    /// The target's byte order.
+    pub fn endian(&self) -> Endian {
+        self.endian
     }
 
     /// Parse this binary as an ELF image (errors for non-ELF targets).
@@ -361,9 +391,16 @@ impl Binary {
         }
 
         // 3: a function the target imports through the PLT. The i-th `.rela.plt`
-        // entry corresponds to `.plt` stub `plt_base + (i + 1) * PLT_ENTRY`
-        // (entry 0 is the resolver header) on x86-64.
-        const PLT_ENTRY: u64 = 16;
+        // entry maps to the `.plt` stub at `plt_base + header + i * entry`, whose
+        // sizes are architecture-specific. (MIPS classically uses `.MIPS.stubs`
+        // rather than a `.plt` of this shape; its import binding is best-effort
+        // and target-*defined* symbols above are the reliable path there.)
+        let (plt_header, plt_entry) = match self.arch {
+            Architecture::X86 | Architecture::X86_64 => (16, 16),
+            Architecture::Arm64 => (32, 16),
+            Architecture::Arm => (20, 12),
+            Architecture::Mips | Architecture::Mips64 => (32, 16),
+        };
         let plt_addr = elf
             .section_headers
             .iter()
@@ -373,7 +410,7 @@ impl Binary {
             for (i, reloc) in elf.pltrelocs.iter().enumerate() {
                 if let Some(sym) = elf.dynsyms.get(reloc.r_sym) {
                     if elf.dynstrtab.get_at(sym.st_name) == Some(name) {
-                        return Ok(Some(plt_addr + (i as u64 + 1) * PLT_ENTRY));
+                        return Ok(Some(plt_addr + plt_header + i as u64 * plt_entry));
                     }
                 }
             }
@@ -395,28 +432,42 @@ impl Binary {
         if base % PAGE != 0 {
             return Err(anyhow!("injected base {base:#x} is not page-aligned"));
         }
-        if self.data.len() < 64
+        let expected_class = if self.is_64 { 2 } else { 1 };
+        let expected_data = match self.endian {
+            Endian::Little => 1,
+            Endian::Big => 2,
+        };
+        if self.format != BinaryFormat::Elf
+            || self.data.len() < 64
             || self.data[..4] != [0x7f, b'E', b'L', b'F']
-            || self.data[4] != 2 // ELFCLASS64
-            || self.data[5] != 1
-        // ELFDATA2LSB
+            || self.data[4] != expected_class
+            || self.data[5] != expected_data
         {
-            return Err(anyhow!("segment injection requires a little-endian ELF64 target"));
+            return Err(anyhow!("segment injection requires an ELF target"));
+        }
+        let endian = self.endian;
+
+        // Program-header table location and entry size, at class-dependent
+        // offsets in the ELF header.
+        let (phoff_off, phentsize_off, phnum_off, phentsize) = if self.is_64 {
+            (0x20, 0x36, 0x38, 56usize)
+        } else {
+            (0x1c, 0x2a, 0x2c, 32usize)
+        };
+        let word = if self.is_64 { 8 } else { 4 };
+        let phoff = endian.read_uint(&self.data, phoff_off, word) as usize;
+        let got_phentsize = endian.read_uint(&self.data, phentsize_off, 2) as usize;
+        let phnum = endian.read_uint(&self.data, phnum_off, 2) as usize;
+        if got_phentsize != phentsize {
+            return Err(anyhow!("unexpected program-header entry size {got_phentsize}"));
         }
 
-        let phoff = u64::from_le_bytes(self.data[0x20..0x28].try_into().unwrap()) as usize;
-        let phentsize = u16::from_le_bytes(self.data[0x36..0x38].try_into().unwrap()) as usize;
-        let phnum = u16::from_le_bytes(self.data[0x38..0x3a].try_into().unwrap()) as usize;
-        if phentsize != 56 {
-            return Err(anyhow!("unexpected program-header entry size {phentsize}"));
-        }
-
-        // Find a PT_NOTE entry to repurpose.
+        // Find a PT_NOTE entry to repurpose (p_type is the first word of every
+        // program header, in both ELF classes).
         let mut note_off = None;
         for i in 0..phnum {
             let off = phoff + i * phentsize;
-            let p_type = u32::from_le_bytes(self.data[off..off + 4].try_into().unwrap());
-            if p_type == PT_NOTE {
+            if endian.read_uint(&self.data, off, 4) as u32 == PT_NOTE {
                 note_off = Some(off);
                 break;
             }
@@ -432,20 +483,28 @@ impl Binary {
         let len = blob.len() as u64;
 
         // Rewrite the note phdr in place as a PT_LOAD covering the appended blob.
-        let write_u32 = |data: &mut [u8], at: usize, v: u32| {
-            data[at..at + 4].copy_from_slice(&v.to_le_bytes());
-        };
-        let write_u64 = |data: &mut [u8], at: usize, v: u64| {
-            data[at..at + 8].copy_from_slice(&v.to_le_bytes());
-        };
-        write_u32(&mut self.data, note_off, PT_LOAD);
-        write_u32(&mut self.data, note_off + 4, PF_R | PF_X);
-        write_u64(&mut self.data, note_off + 8, file_off);
-        write_u64(&mut self.data, note_off + 16, base);
-        write_u64(&mut self.data, note_off + 24, base);
-        write_u64(&mut self.data, note_off + 32, len);
-        write_u64(&mut self.data, note_off + 40, len);
-        write_u64(&mut self.data, note_off + 48, PAGE);
+        // The 32- and 64-bit program-header layouts differ in field order and
+        // width (notably `p_flags` moves from offset 4 to offset 24 in ELF32).
+        let flags = (PF_R | PF_X) as u64;
+        let d = &mut self.data;
+        endian.write_uint(d, note_off, 4, PT_LOAD as u64);
+        if self.is_64 {
+            endian.write_uint(d, note_off + 4, 4, flags);
+            endian.write_uint(d, note_off + 8, 8, file_off);
+            endian.write_uint(d, note_off + 16, 8, base);
+            endian.write_uint(d, note_off + 24, 8, base);
+            endian.write_uint(d, note_off + 32, 8, len);
+            endian.write_uint(d, note_off + 40, 8, len);
+            endian.write_uint(d, note_off + 48, 8, PAGE);
+        } else {
+            endian.write_uint(d, note_off + 4, 4, file_off);
+            endian.write_uint(d, note_off + 8, 4, base);
+            endian.write_uint(d, note_off + 12, 4, base);
+            endian.write_uint(d, note_off + 16, 4, len);
+            endian.write_uint(d, note_off + 20, 4, len);
+            endian.write_uint(d, note_off + 24, 4, flags);
+            endian.write_uint(d, note_off + 28, 4, PAGE);
+        }
 
         Ok(())
     }
@@ -583,6 +642,8 @@ mod tests {
             data: vec![0; 100],
             format: BinaryFormat::Elf,
             arch: Architecture::X86_64,
+            is_64: true,
+            endian: Endian::Little,
         };
 
         let code = vec![0x90, 0x90, 0x90];
@@ -599,6 +660,8 @@ mod tests {
             data: vec![0; 100],
             format: BinaryFormat::Elf,
             arch: Architecture::X86_64,
+            is_64: true,
+            endian: Endian::Little,
         };
 
         let code = vec![0xAA, 0xBB];
@@ -618,6 +681,8 @@ mod tests {
             data: vec![0; 100],
             format: BinaryFormat::Elf,
             arch: Architecture::X86_64,
+            is_64: true,
+            endian: Endian::Little,
         };
 
         let code = vec![0xAA; 10]; // Exactly 10 bytes
@@ -634,6 +699,8 @@ mod tests {
             data: vec![0; 100],
             format: BinaryFormat::Elf,
             arch: Architecture::X86_64,
+            is_64: true,
+            endian: Endian::Little,
         };
 
         let code = vec![0x90; 15]; // Too large for range 10-20
@@ -651,6 +718,8 @@ mod tests {
             data: vec![0; 100],
             format: BinaryFormat::Elf,
             arch: Architecture::X86_64,
+            is_64: true,
+            endian: Endian::Little,
         };
 
         let code = vec![0x90; 5];
@@ -665,6 +734,8 @@ mod tests {
             data: vec![0; 100],
             format: BinaryFormat::Elf,
             arch: Architecture::X86_64,
+            is_64: true,
+            endian: Endian::Little,
         };
 
         let code = vec![0xFF, 0xEE];
@@ -680,6 +751,8 @@ mod tests {
             data: vec![0; 100],
             format: BinaryFormat::Elf,
             arch: Architecture::X86_64,
+            is_64: true,
+            endian: Endian::Little,
         };
 
         let code = vec![0xFF, 0xEE];
@@ -695,6 +768,8 @@ mod tests {
             data: vec![0; 1000],
             format: BinaryFormat::Elf,
             arch: Architecture::X86_64,
+            is_64: true,
+            endian: Endian::Little,
         };
 
         // Jump from 0x100 to 0x200
@@ -716,6 +791,8 @@ mod tests {
             data: vec![0; 1000],
             format: BinaryFormat::Elf,
             arch: Architecture::X86_64,
+            is_64: true,
+            endian: Endian::Little,
         };
 
         // Jump from 0x200 to 0x100
@@ -735,6 +812,8 @@ mod tests {
             data: vec![0; 100],
             format: BinaryFormat::Elf,
             arch: Architecture::X86_64,
+            is_64: true,
+            endian: Endian::Little,
         };
 
         let result = binary.apply_jump_patch(98, 100, 0x200);
@@ -747,6 +826,8 @@ mod tests {
             data: vec![0; 100],
             format: BinaryFormat::Elf,
             arch: Architecture::X86_64,
+            is_64: true,
+            endian: Endian::Little,
         };
 
         // Apply first patch
@@ -766,6 +847,8 @@ mod tests {
             data: vec![0; 100],
             format: BinaryFormat::Elf,
             arch: Architecture::X86_64,
+            is_64: true,
+            endian: Endian::Little,
         };
 
         let code = vec![];
@@ -782,6 +865,8 @@ mod tests {
             data: vec![0; 100000],
             format: BinaryFormat::Elf,
             arch: Architecture::X86_64,
+            is_64: true,
+            endian: Endian::Little,
         };
 
         // Large forward jump
@@ -795,6 +880,8 @@ mod tests {
             data: vec![0; 100],
             format: BinaryFormat::Elf,
             arch: Architecture::X86_64,
+            is_64: true,
+            endian: Endian::Little,
         };
 
         // First patch
@@ -849,6 +936,123 @@ mod tests {
             out.push(b'\n');
         }
         out
+    }
+
+    /// Write a program header at `po` in the class-appropriate layout.
+    #[allow(clippy::too_many_arguments)]
+    fn write_phdr(
+        d: &mut [u8],
+        po: usize,
+        is_64: bool,
+        endian: Endian,
+        p_type: u64,
+        p_off: u64,
+        p_vaddr: u64,
+        p_filesz: u64,
+        p_flags: u64,
+    ) {
+        endian.write_uint(d, po, 4, p_type);
+        if is_64 {
+            endian.write_uint(d, po + 4, 4, p_flags);
+            endian.write_uint(d, po + 8, 8, p_off);
+            endian.write_uint(d, po + 16, 8, p_vaddr);
+            endian.write_uint(d, po + 24, 8, p_vaddr);
+            endian.write_uint(d, po + 32, 8, p_filesz);
+            endian.write_uint(d, po + 40, 8, p_filesz);
+            endian.write_uint(d, po + 48, 8, 0x1000);
+        } else {
+            endian.write_uint(d, po + 4, 4, p_off);
+            endian.write_uint(d, po + 8, 4, p_vaddr);
+            endian.write_uint(d, po + 12, 4, p_vaddr);
+            endian.write_uint(d, po + 16, 4, p_filesz);
+            endian.write_uint(d, po + 20, 4, p_filesz);
+            endian.write_uint(d, po + 24, 4, p_flags);
+            endian.write_uint(d, po + 28, 4, 0x1000);
+        }
+    }
+
+    /// A `Binary` whose bytes carry an ELF header of the given class/endianness
+    /// plus a PT_LOAD and a PT_NOTE, ready for `inject_segment`.
+    fn craft_injectable(is_64: bool, endian: Endian, arch: Architecture) -> Binary {
+        let mut d = vec![0u8; 0x400];
+        d[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        d[4] = if is_64 { 2 } else { 1 };
+        d[5] = match endian {
+            Endian::Little => 1,
+            Endian::Big => 2,
+        };
+        d[6] = 1;
+        let (phoff_off, phentsize_off, phnum_off, phentsize, phoff) = if is_64 {
+            (0x20usize, 0x36, 0x38, 56usize, 0x40u64)
+        } else {
+            (0x1c, 0x2a, 0x2c, 32, 0x34)
+        };
+        let word = if is_64 { 8 } else { 4 };
+        endian.write_uint(&mut d, phoff_off, word, phoff);
+        endian.write_uint(&mut d, phentsize_off, 2, phentsize as u64);
+        endian.write_uint(&mut d, phnum_off, 2, 2);
+        let po = phoff as usize;
+        write_phdr(&mut d, po, is_64, endian, 1, 0, 0x400000, 0x400, 5);
+        write_phdr(&mut d, po + phentsize, is_64, endian, 4, 0x100, 0x400100, 0x20, 4);
+        Binary {
+            data: d,
+            format: BinaryFormat::Elf,
+            arch,
+            is_64,
+            endian,
+        }
+    }
+
+    #[test]
+    fn test_inject_segment_all_classes_and_endians() {
+        let cases = [
+            (true, Endian::Little, Architecture::X86_64),
+            (true, Endian::Big, Architecture::Mips64),
+            (false, Endian::Little, Architecture::Arm),
+            (false, Endian::Big, Architecture::Mips),
+        ];
+        for (is_64, endian, arch) in cases {
+            let mut bin = craft_injectable(is_64, endian, arch);
+            let base = 0x600000u64;
+            let payload = [0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03];
+            bin.inject_segment(base, &payload).unwrap();
+
+            let (phoff_off, phentsize, phnum_off) = if is_64 {
+                (0x20usize, 56usize, 0x38usize)
+            } else {
+                (0x1c, 32, 0x2c)
+            };
+            let word = if is_64 { 8 } else { 4 };
+            let (voff, ooff, szoff, floff) = if is_64 {
+                (16usize, 8usize, 32usize, 4usize)
+            } else {
+                (8, 4, 16, 24)
+            };
+            let phoff = endian.read_uint(bin.data(), phoff_off, word) as usize;
+            let phnum = endian.read_uint(bin.data(), phnum_off, 2) as usize;
+
+            let mut found = false;
+            let mut has_note = false;
+            for i in 0..phnum {
+                let po = phoff + i * phentsize;
+                let ptype = endian.read_uint(bin.data(), po, 4);
+                if ptype == 4 {
+                    has_note = true;
+                }
+                let pvaddr = endian.read_uint(bin.data(), po + voff, word);
+                if ptype == 1 && pvaddr == base {
+                    found = true;
+                    let poff = endian.read_uint(bin.data(), po + ooff, word) as usize;
+                    let filesz = endian.read_uint(bin.data(), po + szoff, word) as usize;
+                    let flags = endian.read_uint(bin.data(), po + floff, 4);
+                    assert_eq!(filesz, payload.len(), "{arch:?}");
+                    assert_eq!(flags, 5, "R|X flags for {arch:?}");
+                    assert_eq!(&bin.data()[poff..poff + payload.len()], &payload, "{arch:?}");
+                }
+            }
+            assert!(found, "no injected PT_LOAD for {arch:?}");
+            assert!(!has_note, "PT_NOTE should be consumed for {arch:?}");
+        }
     }
 
     #[test]
