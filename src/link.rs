@@ -21,6 +21,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use object::read::archive::ArchiveFile;
+use object::elf::RelocationType;
 use object::{
     Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget, SectionKind,
 };
@@ -115,7 +116,7 @@ struct Sec {
 /// Owned copy of a relocation.
 struct Rel {
     offset: u64,
-    r_type: u32,
+    r_type: RelocationType,
     sym: usize,
     addend: i64,
     /// True for REL relocations (ARM, MIPS o32) whose addend is stored in the

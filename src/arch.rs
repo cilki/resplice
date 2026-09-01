@@ -20,9 +20,10 @@ use object::elf::{
     R_X86_64_32, R_X86_64_32S, R_X86_64_64, R_X86_64_GOTPCREL, R_X86_64_GOTPCRELX, R_X86_64_PC32,
     R_X86_64_PC64, R_X86_64_PLT32, R_X86_64_REX_GOTPCRELX,
 };
+use object::elf::RelocationType;
 
-/// `R_MIPS_PC32` is absent from `object` 0.36's constant list.
-const R_MIPS_PC32: u32 = 248;
+/// `R_MIPS_PC32` is absent from `object` 0.40's constant list.
+const R_MIPS_PC32: RelocationType = RelocationType(248);
 
 /// Byte order of a target binary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,7 +76,7 @@ pub fn got_slot_width(is_64: bool) -> usize {
 
 /// Whether a relocation of this type is resolved through a synthesized GOT slot
 /// holding the symbol's address (so the driver knows to allocate one).
-pub fn needs_got(arch: Architecture, r_type: u32) -> bool {
+pub fn needs_got(arch: Architecture, r_type: RelocationType) -> bool {
     match arch {
         Architecture::X86 | Architecture::X86_64 => matches!(
             r_type,
@@ -92,12 +93,12 @@ pub fn needs_got(arch: Architecture, r_type: u32) -> bool {
 /// True for `R_MIPS_HI16`, whose resolved value depends on the low half from a
 /// paired `R_MIPS_LO16` (only under the REL scheme, where the addend is stored
 /// in the instruction rather than carried explicitly).
-pub fn is_mips_hi16(arch: Architecture, r_type: u32) -> bool {
+pub fn is_mips_hi16(arch: Architecture, r_type: RelocationType) -> bool {
     matches!(arch, Architecture::Mips | Architecture::Mips64) && r_type == R_MIPS_HI16
 }
 
 /// True for `R_MIPS_LO16`, the partner of an `R_MIPS_HI16`.
-pub fn is_mips_lo16(arch: Architecture, r_type: u32) -> bool {
+pub fn is_mips_lo16(arch: Architecture, r_type: RelocationType) -> bool {
     matches!(arch, Architecture::Mips | Architecture::Mips64) && r_type == R_MIPS_LO16
 }
 
@@ -121,7 +122,7 @@ pub fn mips_lo16_addend(endian: Endian, buf: &[u8], off: usize) -> i64 {
 pub fn apply(
     arch: Architecture,
     endian: Endian,
-    r_type: u32,
+    r_type: RelocationType,
     buf: &mut [u8],
     off: usize,
     s: u64,
@@ -143,14 +144,14 @@ pub fn apply(
     }
 }
 
-fn unsupported(arch: &str, r_type: u32) -> anyhow::Error {
-    anyhow!("unsupported {arch} relocation type {r_type}")
+fn unsupported(arch: &str, r_type: RelocationType) -> anyhow::Error {
+    anyhow!("unsupported {arch} relocation type {}", r_type.0)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn apply_x86_64(
     endian: Endian,
-    r_type: u32,
+    r_type: RelocationType,
     buf: &mut [u8],
     off: usize,
     s: u64,
@@ -187,7 +188,7 @@ fn patch_insn(endian: Endian, buf: &mut [u8], off: usize, mask: u32, value: u32)
 #[allow(clippy::too_many_arguments)]
 fn apply_aarch64(
     endian: Endian,
-    r_type: u32,
+    r_type: RelocationType,
     buf: &mut [u8],
     off: usize,
     s: u64,
@@ -266,7 +267,7 @@ fn adrp(endian: Endian, buf: &mut [u8], off: usize, x: i64) -> Result<()> {
 
 fn apply_arm(
     endian: Endian,
-    r_type: u32,
+    r_type: RelocationType,
     buf: &mut [u8],
     off: usize,
     s: u64,
@@ -317,7 +318,7 @@ fn apply_arm(
 #[allow(clippy::too_many_arguments)]
 fn apply_mips(
     endian: Endian,
-    r_type: u32,
+    r_type: RelocationType,
     buf: &mut [u8],
     off: usize,
     s: u64,
@@ -420,7 +421,7 @@ mod tests {
     fn insn(
         arch: Architecture,
         endian: Endian,
-        r_type: u32,
+        r_type: RelocationType,
         base: u32,
         s: u64,
         a: i64,

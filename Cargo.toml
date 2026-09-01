@@ -14,9 +14,9 @@ rust-version = "1.85"
 version = "0.0.1"
 
 [dependencies]
-object = "0.36"
-goblin = "0.8"
+object = "0.40"
+goblin = "0.10"
 anyhow = "1.0"
 
 [dev-dependencies]
-object = { version = "0.36", features = ["write"] }
+object = { version = "0.40", features = ["write"] }
