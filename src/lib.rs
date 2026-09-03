@@ -472,9 +472,62 @@ impl Binary {
                 break;
             }
         }
-        let note_off = note_off.ok_or_else(|| {
-            anyhow!("no PT_NOTE segment to convert; program-header relocation is not implemented")
-        })?;
+
+        // Many statically-linked targets carry no PT_NOTE at all,
+        // just REGINFO + a couple of PT_LOADs. Rather than give up, grow the
+        // program-header table by one entry into the padding gap between the
+        // table itself and whatever comes first after it in the file (the
+        // start of file content any existing segment or the section-header
+        // table claims) — the same trick linkers use to leave slack for
+        // PT_NOTE in the first place. This never touches bytes any parser
+        // needs, since it strictly stays inside currently-unclaimed padding.
+        let note_off = match note_off {
+            Some(off) => off,
+            None => {
+                let (poff_field, poff_w) = if self.is_64 { (8, 8) } else { (4, 4) };
+                let mut first_claimed = u64::MAX;
+                for i in 0..phnum {
+                    let off = phoff + i * phentsize;
+                    let p_off = endian.read_uint(&self.data, off + poff_field, poff_w);
+                    if p_off > 0 {
+                        first_claimed = first_claimed.min(p_off);
+                    }
+                }
+                let (eshoff_off, eshoff_w, eshentsize_off, eshnum_off) = if self.is_64 {
+                    (0x28, 8, 0x3a, 0x3c)
+                } else {
+                    (0x20, 4, 0x2e, 0x30)
+                };
+                let e_shoff = endian.read_uint(&self.data, eshoff_off, eshoff_w);
+                if e_shoff > 0 {
+                    first_claimed = first_claimed.min(e_shoff);
+                }
+                let _ = (eshentsize_off, eshnum_off); // only the start of the shdr table matters here
+
+                let table_end = (phoff + phnum * phentsize) as u64;
+                if first_claimed == u64::MAX || first_claimed < table_end {
+                    return Err(anyhow!(
+                        "no PT_NOTE segment to convert, and no room to grow the \
+                         program-header table (next file content starts at \
+                         {first_claimed:#x}, table ends at {table_end:#x})"
+                    ));
+                }
+                let gap = first_claimed - table_end;
+                if gap < phentsize as u64 {
+                    return Err(anyhow!(
+                        "no PT_NOTE segment to convert, and insufficient padding to add \
+                         a new program header ({gap} bytes available, {phentsize} needed)"
+                    ));
+                }
+
+                let new_phnum = phnum + 1;
+                if new_phnum > u16::MAX as usize {
+                    return Err(anyhow!("program header count overflow"));
+                }
+                endian.write_uint(&mut self.data, phnum_off, 2, new_phnum as u64);
+                table_end as usize
+            }
+        };
 
         // Append the blob at a page-aligned file offset.
         let file_off = align_up(self.data.len() as u64, PAGE);
@@ -1053,6 +1106,126 @@ mod tests {
             assert!(found, "no injected PT_LOAD for {arch:?}");
             assert!(!has_note, "PT_NOTE should be consumed for {arch:?}");
         }
+    }
+
+    /// A `Binary` like `craft_injectable`, but with no PT_NOTE — the shape of a
+    /// ELF whose linker never emitted one. There is deliberately a large gap between the end of the
+    /// program-header table and the first PT_LOAD's file offset, mirroring
+    /// the padding real toolchains leave before the first page-aligned
+    /// segment.
+    fn craft_injectable_no_note(is_64: bool, endian: Endian, arch: Architecture) -> Binary {
+        let mut d = vec![0u8; 0x2000];
+        d[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        d[4] = if is_64 { 2 } else { 1 };
+        d[5] = match endian {
+            Endian::Little => 1,
+            Endian::Big => 2,
+        };
+        d[6] = 1;
+        let (phoff_off, phentsize_off, phnum_off, phentsize, phoff) = if is_64 {
+            (0x20usize, 0x36, 0x38, 56usize, 0x40u64)
+        } else {
+            (0x1c, 0x2a, 0x2c, 32, 0x34)
+        };
+        let word = if is_64 { 8 } else { 4 };
+        endian.write_uint(&mut d, phoff_off, word, phoff);
+        endian.write_uint(&mut d, phentsize_off, 2, phentsize as u64);
+        endian.write_uint(&mut d, phnum_off, 2, 2);
+        let po = phoff as usize;
+        // Two PT_LOADs, first content starting well past the phdr table —
+        // plenty of unclaimed padding to grow into.
+        write_phdr(&mut d, po, is_64, endian, 1, 0x1000, 0x400000, 0x400, 5);
+        write_phdr(&mut d, po + phentsize, is_64, endian, 1, 0x1400, 0x500000, 0x400, 6);
+        Binary {
+            data: d,
+            format: BinaryFormat::Elf,
+            arch,
+            is_64,
+            endian,
+        }
+    }
+
+    #[test]
+    fn test_inject_segment_grows_phdr_table_without_note() {
+        // Regression test: targets with no PT_NOTE must still be injectable
+        // by growing the program-header table into its own padding, rather
+        // than failing outright.
+        let cases = [
+            (true, Endian::Little, Architecture::X86_64),
+            (false, Endian::Big, Architecture::Mips),
+        ];
+        for (is_64, endian, arch) in cases {
+            let mut bin = craft_injectable_no_note(is_64, endian, arch);
+            let base = 0x600000u64;
+            let payload = [0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03];
+            bin.inject_segment(base, &payload).unwrap();
+
+            let (phoff_off, phentsize, phnum_off) = if is_64 {
+                (0x20usize, 56usize, 0x38usize)
+            } else {
+                (0x1c, 32, 0x2c)
+            };
+            let word = if is_64 { 8 } else { 4 };
+            let (voff, ooff, szoff, floff) = if is_64 {
+                (16usize, 8usize, 32usize, 4usize)
+            } else {
+                (8, 4, 16, 24)
+            };
+            let phoff = endian.read_uint(bin.data(), phoff_off, word) as usize;
+            let phnum = endian.read_uint(bin.data(), phnum_off, 2) as usize;
+            assert_eq!(phnum, 3, "table should have grown by one entry for {arch:?}");
+
+            let mut found = false;
+            for i in 0..phnum {
+                let po = phoff + i * phentsize;
+                let ptype = endian.read_uint(bin.data(), po, 4);
+                let pvaddr = endian.read_uint(bin.data(), po + voff, word);
+                if ptype == 1 && pvaddr == base {
+                    found = true;
+                    let poff = endian.read_uint(bin.data(), po + ooff, word) as usize;
+                    let filesz = endian.read_uint(bin.data(), po + szoff, word) as usize;
+                    let flags = endian.read_uint(bin.data(), po + floff, 4);
+                    assert_eq!(filesz, payload.len(), "{arch:?}");
+                    assert_eq!(flags, 5, "R|X flags for {arch:?}");
+                    assert_eq!(&bin.data()[poff..poff + payload.len()], &payload, "{arch:?}");
+                }
+            }
+            assert!(found, "no injected PT_LOAD for {arch:?}");
+        }
+    }
+
+    #[test]
+    fn test_inject_segment_no_note_no_room_errors() {
+        // When there's no PT_NOTE *and* no padding to grow into, injection
+        // must fail with a clear error instead of corrupting the file.
+        let endian = Endian::Little;
+        let mut d = vec![0u8; 0x100];
+        d[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        d[4] = 2;
+        d[5] = 1;
+        d[6] = 1;
+        let (phoff_off, phentsize_off, phnum_off, phentsize, phoff) =
+            (0x20usize, 0x36, 0x38, 56usize, 0x40u64);
+        endian.write_uint(&mut d, phoff_off, 8, phoff);
+        endian.write_uint(&mut d, phentsize_off, 2, phentsize as u64);
+        endian.write_uint(&mut d, phnum_off, 2, 1);
+        // A single PT_LOAD whose file offset sits immediately after the
+        // table's one entry — zero padding available.
+        let po = phoff as usize;
+        write_phdr(&mut d, po, true, endian, 1, po as u64 + phentsize as u64, 0x400000, 0x40, 5);
+        let mut bin = Binary {
+            data: d,
+            format: BinaryFormat::Elf,
+            arch: Architecture::X86_64,
+            is_64: true,
+            endian,
+        };
+        let err = bin.inject_segment(0x600000, &[0xde, 0xad]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no PT_NOTE") && msg.contains("padding"),
+            "{msg}"
+        );
     }
 
     #[test]
