@@ -265,7 +265,7 @@ dependencies = [
 
 [[package]]
 name = "resplice"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -275,7 +275,7 @@ dependencies = [
 
 [[package]]
 name = "resplice-macros"
-version = "0.0.1"
+version = "0.0.3"
 dependencies = [
  "proc-macro2",
  "quote",

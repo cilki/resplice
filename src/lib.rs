@@ -36,6 +36,9 @@ pub struct Binary {
     arch: Architecture,
     is_64: bool,
     endian: Endian,
+    /// Operator-supplied virtual address for the injected segment, overriding
+    /// [`Binary::injected_base`]'s default. See [`Binary::set_injected_base`].
+    inject_base: Option<u64>,
 }
 
 /// Supported binary formats
@@ -79,7 +82,21 @@ impl Binary {
             arch,
             is_64,
             endian,
+            inject_base: None,
         })
+    }
+
+    /// Pin the injected segment to `base` instead of the default.
+    ///
+    /// The default places the segment one page past the end of the image, which
+    /// is only safe when nothing else claims that address. It often is not: a
+    /// game console binary typically has its allocator hand out memory starting
+    /// at the end of `.bss`, so the default lands one page into the heap and the
+    /// injected code and data are live only until the first big allocation.
+    /// There is no portable way to detect that, so the operator supplies a known
+    /// free address instead. `base` must be page-aligned.
+    pub fn set_injected_base(&mut self, base: Option<u64>) {
+        self.inject_base = base;
     }
 
     /// Detect the binary format, architecture, pointer width, and byte order.
@@ -287,12 +304,30 @@ impl Binary {
             Architecture::Mips | Architecture::Mips64 => {
                 // MIPS J instruction: J <address>
                 // Encoding: 0x08000000 | ((address >> 2) & 0x03FFFFFF)
-                // Note: the target must lie in the same 256MB region as the delay
-                // slot; encoded in the target's byte order (BE for mips, LE for
-                // mipsel).
+                //
+                // `j` has a branch delay slot: the instruction *after* it
+                // executes before the jump takes effect. A bare `j` would
+                // therefore leave whatever the replaced function had at
+                // `from + 4` to run as the delay slot, so the trampoline must
+                // carry its own `nop`.
+                //
+                // `j` also only encodes the low 28 bits of the target; the top
+                // four come from the delay slot's own PC, so the two must share
+                // a 256MB region. Truncating silently would jump into hyperspace.
+                if to & 3 != 0 {
+                    return Err(anyhow!("mips jump target {to:#x} is not 4-byte aligned"));
+                }
+                let delay_pc = from + 4;
+                if (delay_pc & !0x0fff_ffff) != (to & !0x0fff_ffff) {
+                    return Err(anyhow!(
+                        "mips jump from {from:#x} to {to:#x} crosses a 256MB region \
+                         boundary and cannot be encoded as `j`"
+                    ));
+                }
                 let addr_bits = ((to >> 2) & 0x03FFFFFF) as u32;
-                let insn = 0x08000000u32 | addr_bits;
-                Ok(self.encode_insn(insn))
+                let mut out = self.encode_insn(0x08000000u32 | addr_bits);
+                out.extend_from_slice(&self.encode_insn(0)); // delay slot: nop
+                Ok(out)
             }
         }
     }
@@ -366,6 +401,12 @@ impl Binary {
     /// The base virtual address the injected segment will be mapped at:
     /// one page above the target's current image, page-aligned.
     pub fn injected_base(&self) -> Result<u64> {
+        if let Some(base) = self.inject_base {
+            if base % PAGE != 0 {
+                return Err(anyhow!("injected base {base:#x} is not page-aligned"));
+            }
+            return Ok(base);
+        }
         Ok(align_up(self.max_vaddr()?, PAGE) + PAGE)
     }
 
@@ -697,6 +738,7 @@ mod tests {
             arch: Architecture::X86_64,
             is_64: true,
             endian: Endian::Little,
+            inject_base: None,
         };
 
         let code = vec![0x90, 0x90, 0x90];
@@ -715,6 +757,7 @@ mod tests {
             arch: Architecture::X86_64,
             is_64: true,
             endian: Endian::Little,
+            inject_base: None,
         };
 
         let code = vec![0xAA, 0xBB];
@@ -736,6 +779,7 @@ mod tests {
             arch: Architecture::X86_64,
             is_64: true,
             endian: Endian::Little,
+            inject_base: None,
         };
 
         let code = vec![0xAA; 10]; // Exactly 10 bytes
@@ -754,6 +798,7 @@ mod tests {
             arch: Architecture::X86_64,
             is_64: true,
             endian: Endian::Little,
+            inject_base: None,
         };
 
         let code = vec![0x90; 15]; // Too large for range 10-20
@@ -773,6 +818,7 @@ mod tests {
             arch: Architecture::X86_64,
             is_64: true,
             endian: Endian::Little,
+            inject_base: None,
         };
 
         let code = vec![0x90; 5];
@@ -789,6 +835,7 @@ mod tests {
             arch: Architecture::X86_64,
             is_64: true,
             endian: Endian::Little,
+            inject_base: None,
         };
 
         let code = vec![0xFF, 0xEE];
@@ -806,6 +853,7 @@ mod tests {
             arch: Architecture::X86_64,
             is_64: true,
             endian: Endian::Little,
+            inject_base: None,
         };
 
         let code = vec![0xFF, 0xEE];
@@ -823,6 +871,7 @@ mod tests {
             arch: Architecture::X86_64,
             is_64: true,
             endian: Endian::Little,
+            inject_base: None,
         };
 
         // Jump from 0x100 to 0x200
@@ -846,6 +895,7 @@ mod tests {
             arch: Architecture::X86_64,
             is_64: true,
             endian: Endian::Little,
+            inject_base: None,
         };
 
         // Jump from 0x200 to 0x100
@@ -867,6 +917,7 @@ mod tests {
             arch: Architecture::X86_64,
             is_64: true,
             endian: Endian::Little,
+            inject_base: None,
         };
 
         let result = binary.apply_jump_patch(98, 100, 0x200);
@@ -881,6 +932,7 @@ mod tests {
             arch: Architecture::X86_64,
             is_64: true,
             endian: Endian::Little,
+            inject_base: None,
         };
 
         // Apply first patch
@@ -902,6 +954,7 @@ mod tests {
             arch: Architecture::X86_64,
             is_64: true,
             endian: Endian::Little,
+            inject_base: None,
         };
 
         let code = vec![];
@@ -912,6 +965,65 @@ mod tests {
         assert_eq!(binary.data[19], 0x90);
     }
 
+    /// The injected base must be overridable: the default (one page past the
+    /// image) lands in the heap on a console binary that allocates from the end
+    /// of `.bss`, which silently corrupts the injected code during play.
+    #[test]
+    fn injected_base_can_be_pinned() {
+        let mut binary = Binary {
+            data: vec![0; 0x1000],
+            format: BinaryFormat::Elf,
+            arch: Architecture::Mips,
+            is_64: false,
+            endian: Endian::Little,
+            inject_base: None,
+        };
+
+        binary.set_injected_base(Some(0x001c_0000));
+        assert_eq!(binary.injected_base().unwrap(), 0x001c_0000);
+
+        binary.set_injected_base(Some(0x001c_0001));
+        assert!(binary.injected_base().unwrap_err().to_string().contains("page-aligned"));
+    }
+
+    /// A MIPS trampoline must carry its own delay-slot `nop`: `j` executes the
+    /// following instruction before branching, and at a splice site that
+    /// instruction is leftover code from the function being replaced.
+    #[test]
+    fn mips_trampoline_fills_its_delay_slot() {
+        let binary = Binary {
+            data: vec![0; 0x1000],
+            format: BinaryFormat::Elf,
+            arch: Architecture::Mips,
+            is_64: false,
+            endian: Endian::Little,
+            inject_base: None,
+        };
+
+        let jump = binary.jump_bytes(0x0022_9fd8, 0x0034_0000).unwrap();
+        assert_eq!(jump.len(), 8, "trampoline must be j + nop");
+        assert_eq!(&jump[..4], &(0x0800_0000u32 | (0x0034_0000 >> 2)).to_le_bytes());
+        assert_eq!(&jump[4..], &0u32.to_le_bytes(), "delay slot must be a nop");
+    }
+
+    /// `j` only encodes the low 28 bits, so a target in another 256MB region is
+    /// unencodable and must be reported rather than silently truncated.
+    #[test]
+    fn mips_trampoline_rejects_region_crossing_jump() {
+        let binary = Binary {
+            data: vec![0; 0x1000],
+            format: BinaryFormat::Elf,
+            arch: Architecture::Mips,
+            is_64: false,
+            endian: Endian::Little,
+            inject_base: None,
+        };
+
+        let err = binary.jump_bytes(0x0022_9fd8, 0x1234_5678).unwrap_err();
+        assert!(err.to_string().contains("256MB"), "got: {err}");
+        assert!(binary.jump_bytes(0x0022_9fd8, 0x0034_0002).is_err());
+    }
+
     #[test]
     fn test_large_jump_offset() {
         let mut binary = Binary {
@@ -920,6 +1032,7 @@ mod tests {
             arch: Architecture::X86_64,
             is_64: true,
             endian: Endian::Little,
+            inject_base: None,
         };
 
         // Large forward jump
@@ -935,6 +1048,7 @@ mod tests {
             arch: Architecture::X86_64,
             is_64: true,
             endian: Endian::Little,
+            inject_base: None,
         };
 
         // First patch
@@ -1053,7 +1167,8 @@ mod tests {
             arch,
             is_64,
             endian,
-        }
+            inject_base: None,
+}
     }
 
     #[test]
@@ -1142,7 +1257,8 @@ mod tests {
             arch,
             is_64,
             endian,
-        }
+            inject_base: None,
+}
     }
 
     #[test]
@@ -1219,7 +1335,8 @@ mod tests {
             arch: Architecture::X86_64,
             is_64: true,
             endian,
-        };
+            inject_base: None,
+};
         let err = bin.inject_segment(0x600000, &[0xde, 0xad]).unwrap_err();
         let msg = err.to_string();
         assert!(
