@@ -1,14 +1,14 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, Expr, ItemFn, Lit, Meta};
+use syn::{parse_macro_input, Expr, Item, Lit, Meta};
 
-/// Marks a function as a replacement for a section of binary code.
+/// Marks a function or static as a replacement for a section of the binary.
 ///
-/// The function's machine code is emitted into a dedicated section named
-/// `.rspl.<begin>.<end>` (addresses in lowercase hex). The `resplice` tool
-/// reads this section back out of the compiled rlib, using the section name to
-/// recover the target address range and the section's bytes as the replacement
-/// code.
+/// The item's machine code (or, for a `static`, its bytes) is emitted into a
+/// dedicated section named `.rspl.<begin>.<end>` (addresses in lowercase hex).
+/// The `resplice` tool reads this section back out of the compiled rlib, using
+/// the section name to recover the target address range and the section's
+/// bytes as the replacement code.
 ///
 /// # Arguments
 ///
@@ -28,10 +28,20 @@ use syn::{parse_macro_input, Expr, ItemFn, Lit, Meta};
 ///     1 + 1
 /// }
 /// ```
+///
+/// A `static` works the same way, replacing a data range byte-for-byte with
+/// the static's initializer (its type should be `repr(C)` so the layout is
+/// exact). It is exported like a function is, so the bytes survive as a
+/// distinct section in the rlib:
+///
+/// ```ignore
+/// #[Splice(begin = 0x2ec70, end = 0x2ec78)]
+/// static PRICES: [u32; 2] = [100, 200];
+/// ```
 #[proc_macro_attribute]
 #[allow(non_snake_case)]
 pub fn Splice(args: TokenStream, input: TokenStream) -> TokenStream {
-    let mut input_fn = parse_macro_input!(input as ItemFn);
+    let item = parse_macro_input!(input as Item);
 
     let meta_list = parse_macro_input!(args with syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated);
 
@@ -65,24 +75,48 @@ pub fn Splice(args: TokenStream, input: TokenStream) -> TokenStream {
 
     let section = format!(".rspl.{:x}.{:x}", begin, end);
 
-    // Export the function and give it the C ABI unless the author already
-    // specified them, so the spliced code matches the target's calling
-    // convention and is emitted as an external symbol.
-    if matches!(input_fn.vis, syn::Visibility::Inherited) {
-        input_fn.vis = syn::parse_quote!(pub);
-    }
-    if input_fn.sig.abi.is_none() {
-        input_fn.sig.abi = Some(syn::parse_quote!(extern "C"));
-    }
+    let expanded = match item {
+        // Export the function and give it the C ABI unless the author already
+        // specified them, so the spliced code matches the target's calling
+        // convention and is emitted as an external symbol.
+        Item::Fn(mut input_fn) => {
+            if matches!(input_fn.vis, syn::Visibility::Inherited) {
+                input_fn.vis = syn::parse_quote!(pub);
+            }
+            if input_fn.sig.abi.is_none() {
+                input_fn.sig.abi = Some(syn::parse_quote!(extern "C"));
+            }
 
-    let vis = &input_fn.vis;
-    let sig = &input_fn.sig;
-    let block = &input_fn.block;
+            let vis = &input_fn.vis;
+            let sig = &input_fn.sig;
+            let block = &input_fn.block;
 
-    let expanded = quote! {
-        #[unsafe(no_mangle)]
-        #[unsafe(link_section = #section)]
-        #vis #sig #block
+            quote! {
+                #[unsafe(no_mangle)]
+                #[unsafe(link_section = #section)]
+                #vis #sig #block
+            }
+        }
+        // A static is exported the same way so its initializer bytes land in
+        // the splice section as an external symbol the linker keeps.
+        Item::Static(mut input_static) => {
+            if matches!(input_static.vis, syn::Visibility::Inherited) {
+                input_static.vis = syn::parse_quote!(pub);
+            }
+            quote! {
+                #[unsafe(no_mangle)]
+                #[unsafe(link_section = #section)]
+                #input_static
+            }
+        }
+        other => {
+            return syn::Error::new_spanned(
+                other,
+                "#[Splice] supports only `fn` and `static` items",
+            )
+            .to_compile_error()
+            .into();
+        }
     };
 
     TokenStream::from(expanded)
