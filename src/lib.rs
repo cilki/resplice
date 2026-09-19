@@ -1,6 +1,6 @@
 pub use anyhow::Result;
 
-use anyhow::{anyhow, Context};
+use anyhow::anyhow;
 use std::fs;
 use std::path::Path;
 
@@ -15,18 +15,6 @@ const PAGE: u64 = 0x1000;
 /// Round `x` up to the next multiple of `align` (a power of two).
 fn align_up(x: u64, align: u64) -> u64 {
     (x + align - 1) & !(align - 1)
-}
-
-/// A single replacement extracted from an rlib.
-///
-/// `code` is the machine code emitted for the spliced function; `begin` and
-/// `end` are the target address range it should overwrite in the original
-/// binary.
-#[derive(Debug, Clone)]
-pub struct Splice {
-    pub begin: u64,
-    pub end: u64,
-    pub code: Vec<u8>,
 }
 
 /// Represents a binary file that can be patched
@@ -161,26 +149,6 @@ impl Binary {
         }
     }
 
-    /// Detect just the binary format.
-    #[allow(dead_code)]
-    fn detect_format(data: &[u8]) -> Result<BinaryFormat> {
-        let (format, ..) = Self::detect_format_and_arch(data)?;
-        Ok(format)
-    }
-
-    /// Apply a splice by directly patching the binary.
-    ///
-    /// `begin`/`end` are **file offsets** into the raw binary image; this is the
-    /// low-level primitive. Callers working in virtual-address space translate
-    /// via [`Binary::va_to_offset`] first (see [`link`]).
-    pub fn apply_direct_patch(&mut self, begin: u64, end: u64, code: &[u8]) -> Result<()> {
-        let size = (end - begin) as usize;
-        if code.len() > size {
-            return Err(anyhow!("Invalid address range: {:#x} to {:#x}", begin, end));
-        }
-        self.patch_bytes(begin as usize, size, code)
-    }
-
     /// Write `code` at file offset `offset`, filling any trailing space up to
     /// `region_len` with NOP instructions. `code` must not be longer than
     /// `region_len`.
@@ -237,32 +205,9 @@ impl Binary {
         b
     }
 
-    /// Machine code for an unconditional jump from `from_va` to `to_va`, for the
+    /// Machine code for an unconditional jump from `from` to `to`, for the
     /// current architecture. Used to build trampolines for oversized splices.
-    pub fn jump_bytes(&self, from_va: u64, to_va: u64) -> Result<Vec<u8>> {
-        self.generate_jump_instruction(from_va, to_va)
-    }
-
-    /// Apply a splice using an unconditional jump
-    pub fn apply_jump_patch(&mut self, begin: u64, _end: u64, target: u64) -> Result<()> {
-        let jump_code = self.generate_jump_instruction(begin, target)?;
-        let start = begin as usize;
-
-        if start + jump_code.len() > self.data.len() {
-            return Err(anyhow!(
-                "Invalid address range: {:#x} to {:#x}",
-                begin,
-                begin + jump_code.len() as u64
-            ));
-        }
-
-        self.data[start..start + jump_code.len()].copy_from_slice(&jump_code);
-
-        Ok(())
-    }
-
-    /// Generate an unconditional jump instruction for the current architecture
-    fn generate_jump_instruction(&self, from: u64, to: u64) -> Result<Vec<u8>> {
+    pub fn jump_bytes(&self, from: u64, to: u64) -> Result<Vec<u8>> {
         match self.arch {
             Architecture::X86 | Architecture::X86_64 => {
                 // JMP rel32 (E9 XX XX XX XX)
@@ -604,70 +549,6 @@ impl Binary {
     }
 }
 
-/// Parse a `.rspl.<begin>.<end>` section name into its address range.
-///
-/// Returns `None` for any section that is not a splice section.
-fn parse_splice_section(name: &str) -> Option<Result<(u64, u64)>> {
-    let rest = name.strip_prefix(".rspl.")?;
-    Some((|| {
-        let (begin, end) = rest
-            .split_once('.')
-            .ok_or_else(|| anyhow!("malformed splice section name: {name:?}"))?;
-        let begin = u64::from_str_radix(begin, 16)
-            .with_context(|| format!("invalid begin address in section {name:?}"))?;
-        let end = u64::from_str_radix(end, 16)
-            .with_context(|| format!("invalid end address in section {name:?}"))?;
-        Ok((begin, end))
-    })())
-}
-
-/// Read all splices from an rlib.
-///
-/// An rlib is an `ar` archive of relocatable object files. Each `#[Splice]`
-/// function lives in its own `.rspl.<begin>.<end>` section, so we walk every
-/// object member's sections, decode the range from the section name, and take
-/// the section bytes as the replacement code.
-pub fn read_splices_from_rlib<P: AsRef<Path>>(path: P) -> Result<Vec<Splice>> {
-    use object::read::archive::ArchiveFile;
-    use object::{Object, ObjectSection};
-
-    let data = fs::read(&path)
-        .with_context(|| format!("failed to read rlib {:?}", path.as_ref()))?;
-
-    let archive = ArchiveFile::parse(&*data).context("failed to parse rlib archive")?;
-
-    let mut splices = Vec::new();
-    for member in archive.members() {
-        let member = member.context("failed to read archive member")?;
-        let member_data = member.data(&*data).context("failed to read member data")?;
-
-        // Members may be non-object files (e.g. the rmeta blob); skip anything
-        // that does not parse as an object file.
-        let obj = match object::File::parse(member_data) {
-            Ok(obj) => obj,
-            Err(_) => continue,
-        };
-
-        for section in obj.sections() {
-            let name = match section.name() {
-                Ok(name) => name,
-                Err(_) => continue,
-            };
-            let Some(parsed) = parse_splice_section(name) else {
-                continue;
-            };
-            let (begin, end) = parsed?;
-            let code = section
-                .data()
-                .with_context(|| format!("failed to read data of section {name:?}"))?
-                .to_vec();
-            splices.push(Splice { begin, end, code });
-        }
-    }
-
-    Ok(splices)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -707,31 +588,31 @@ mod tests {
     #[test]
     fn test_binary_format_detection_incomplete() {
         let elf_header = vec![0x7f, 0x45, 0x4c, 0x46]; // Too short
-        assert!(Binary::detect_format(&elf_header).is_err());
+        assert!(Binary::detect_format_and_arch(&elf_header).is_err());
     }
 
     #[test]
     fn test_binary_format_detection_elf() {
         let elf = create_minimal_elf();
-        let format = Binary::detect_format(&elf).unwrap();
+        let (format, ..) = Binary::detect_format_and_arch(&elf).unwrap();
         assert_eq!(format, BinaryFormat::Elf);
     }
 
     #[test]
     fn test_binary_format_detection_pe() {
         let pe = create_minimal_pe();
-        let format = Binary::detect_format(&pe).unwrap();
+        let (format, ..) = Binary::detect_format_and_arch(&pe).unwrap();
         assert_eq!(format, BinaryFormat::Pe);
     }
 
     #[test]
     fn test_binary_format_detection_invalid() {
         let invalid = vec![0; 100];
-        assert!(Binary::detect_format(&invalid).is_err());
+        assert!(Binary::detect_format_and_arch(&invalid).is_err());
     }
 
     #[test]
-    fn test_direct_patch_basic() {
+    fn test_patch_bytes_writes_code_and_nop_fills_the_rest() {
         let mut binary = Binary {
             data: vec![0; 100],
             format: BinaryFormat::Elf,
@@ -741,38 +622,18 @@ mod tests {
             inject_base: None,
         };
 
-        let code = vec![0x90, 0x90, 0x90];
-        binary.apply_direct_patch(10, 20, &code).unwrap();
+        binary.patch_bytes(10, 10, &[0xAA, 0xBB]).unwrap();
 
-        assert_eq!(binary.data[10], 0x90);
-        assert_eq!(binary.data[11], 0x90);
-        assert_eq!(binary.data[12], 0x90);
-    }
-
-    #[test]
-    fn test_direct_patch_with_nop_padding() {
-        let mut binary = Binary {
-            data: vec![0; 100],
-            format: BinaryFormat::Elf,
-            arch: Architecture::X86_64,
-            is_64: true,
-            endian: Endian::Little,
-            inject_base: None,
-        };
-
-        let code = vec![0xAA, 0xBB];
-        binary.apply_direct_patch(10, 20, &code).unwrap();
-
-        // Check code is written
         assert_eq!(binary.data[10], 0xAA);
         assert_eq!(binary.data[11], 0xBB);
-        // Check NOPs are filled
-        assert_eq!(binary.data[12], 0x90); // NOP for x86
+        // The remainder of the region is filled with x86 NOPs.
+        assert_eq!(binary.data[12], 0x90);
         assert_eq!(binary.data[19], 0x90);
+        assert_eq!(binary.data[20], 0x00); // just past the region, untouched
     }
 
     #[test]
-    fn test_direct_patch_exact_fit() {
+    fn test_patch_bytes_exact_fit_leaves_no_padding() {
         let mut binary = Binary {
             data: vec![0; 100],
             format: BinaryFormat::Elf,
@@ -782,16 +643,15 @@ mod tests {
             inject_base: None,
         };
 
-        let code = vec![0xAA; 10]; // Exactly 10 bytes
-        binary.apply_direct_patch(10, 20, &code).unwrap();
+        binary.patch_bytes(10, 10, &[0xAA; 10]).unwrap();
 
         assert_eq!(binary.data[10], 0xAA);
         assert_eq!(binary.data[19], 0xAA);
-        assert_eq!(binary.data[20], 0x00); // Untouched
+        assert_eq!(binary.data[20], 0x00); // untouched
     }
 
     #[test]
-    fn test_direct_patch_code_too_large() {
+    fn test_patch_bytes_empty_code_fills_region_with_nops() {
         let mut binary = Binary {
             data: vec![0; 100],
             format: BinaryFormat::Elf,
@@ -801,168 +661,62 @@ mod tests {
             inject_base: None,
         };
 
-        let code = vec![0x90; 15]; // Too large for range 10-20
-        let result = binary.apply_direct_patch(10, 20, &code);
+        binary.patch_bytes(10, 10, &[]).unwrap();
 
-        assert!(result.is_err());
-        // With anyhow, we just check that it's an error
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("Invalid address range"));
-    }
-
-    #[test]
-    fn test_direct_patch_out_of_bounds() {
-        let mut binary = Binary {
-            data: vec![0; 100],
-            format: BinaryFormat::Elf,
-            arch: Architecture::X86_64,
-            is_64: true,
-            endian: Endian::Little,
-            inject_base: None,
-        };
-
-        let code = vec![0x90; 5];
-        let result = binary.apply_direct_patch(96, 110, &code);
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_direct_patch_at_start() {
-        let mut binary = Binary {
-            data: vec![0; 100],
-            format: BinaryFormat::Elf,
-            arch: Architecture::X86_64,
-            is_64: true,
-            endian: Endian::Little,
-            inject_base: None,
-        };
-
-        let code = vec![0xFF, 0xEE];
-        binary.apply_direct_patch(0, 10, &code).unwrap();
-
-        assert_eq!(binary.data[0], 0xFF);
-        assert_eq!(binary.data[1], 0xEE);
-    }
-
-    #[test]
-    fn test_direct_patch_at_end() {
-        let mut binary = Binary {
-            data: vec![0; 100],
-            format: BinaryFormat::Elf,
-            arch: Architecture::X86_64,
-            is_64: true,
-            endian: Endian::Little,
-            inject_base: None,
-        };
-
-        let code = vec![0xFF, 0xEE];
-        binary.apply_direct_patch(98, 100, &code).unwrap();
-
-        assert_eq!(binary.data[98], 0xFF);
-        assert_eq!(binary.data[99], 0xEE);
-    }
-
-    #[test]
-    fn test_jump_patch_forward() {
-        let mut binary = Binary {
-            data: vec![0; 1000],
-            format: BinaryFormat::Elf,
-            arch: Architecture::X86_64,
-            is_64: true,
-            endian: Endian::Little,
-            inject_base: None,
-        };
-
-        // Jump from 0x100 to 0x200
-        binary.apply_jump_patch(0x100, 0x110, 0x200).unwrap();
-
-        // Check JMP instruction (E9)
-        assert_eq!(binary.data[0x100], 0xE9);
-
-        // Calculate expected offset: target - (begin + 5)
-        // 0x200 - (0x100 + 5) = 0xFB
-        let offset = 0x200 - (0x100 + 5);
-        assert_eq!(binary.data[0x101], (offset & 0xFF) as u8);
-        assert_eq!(binary.data[0x102], ((offset >> 8) & 0xFF) as u8);
-    }
-
-    #[test]
-    fn test_jump_patch_backward() {
-        let mut binary = Binary {
-            data: vec![0; 1000],
-            format: BinaryFormat::Elf,
-            arch: Architecture::X86_64,
-            is_64: true,
-            endian: Endian::Little,
-            inject_base: None,
-        };
-
-        // Jump from 0x200 to 0x100
-        binary.apply_jump_patch(0x200, 0x210, 0x100).unwrap();
-
-        // Check JMP instruction
-        assert_eq!(binary.data[0x200], 0xE9);
-
-        // Offset will be negative
-        let offset = (0x100_i64 - (0x200 + 5) as i64) as i32;
-        assert_eq!(binary.data[0x201], (offset & 0xFF) as u8);
-    }
-
-    #[test]
-    fn test_jump_patch_out_of_bounds() {
-        let mut binary = Binary {
-            data: vec![0; 100],
-            format: BinaryFormat::Elf,
-            arch: Architecture::X86_64,
-            is_64: true,
-            endian: Endian::Little,
-            inject_base: None,
-        };
-
-        let result = binary.apply_jump_patch(98, 100, 0x200);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_multiple_patches() {
-        let mut binary = Binary {
-            data: vec![0; 100],
-            format: BinaryFormat::Elf,
-            arch: Architecture::X86_64,
-            is_64: true,
-            endian: Endian::Little,
-            inject_base: None,
-        };
-
-        // Apply first patch
-        binary.apply_direct_patch(10, 15, &[0xAA, 0xBB]).unwrap();
-        // Apply second patch
-        binary.apply_direct_patch(20, 25, &[0xCC, 0xDD]).unwrap();
-
-        assert_eq!(binary.data[10], 0xAA);
-        assert_eq!(binary.data[11], 0xBB);
-        assert_eq!(binary.data[20], 0xCC);
-        assert_eq!(binary.data[21], 0xDD);
-    }
-
-    #[test]
-    fn test_patch_with_empty_code() {
-        let mut binary = Binary {
-            data: vec![0; 100],
-            format: BinaryFormat::Elf,
-            arch: Architecture::X86_64,
-            is_64: true,
-            endian: Endian::Little,
-            inject_base: None,
-        };
-
-        let code = vec![];
-        binary.apply_direct_patch(10, 20, &code).unwrap();
-
-        // Should fill with NOPs
         assert_eq!(binary.data[10], 0x90);
         assert_eq!(binary.data[19], 0x90);
+    }
+
+    #[test]
+    fn test_patch_bytes_code_too_large_errors() {
+        let mut binary = Binary {
+            data: vec![0; 100],
+            format: BinaryFormat::Elf,
+            arch: Architecture::X86_64,
+            is_64: true,
+            endian: Endian::Little,
+            inject_base: None,
+        };
+
+        let err = binary.patch_bytes(10, 10, &[0x90; 15]).unwrap_err();
+        assert!(err.to_string().contains("larger than region"));
+    }
+
+    #[test]
+    fn test_patch_bytes_region_out_of_bounds_errors() {
+        let mut binary = Binary {
+            data: vec![0; 100],
+            format: BinaryFormat::Elf,
+            arch: Architecture::X86_64,
+            is_64: true,
+            endian: Endian::Little,
+            inject_base: None,
+        };
+
+        assert!(binary.patch_bytes(96, 14, &[0x90; 5]).is_err());
+    }
+
+    #[test]
+    fn test_jump_bytes_x86_encodes_relative_offset() {
+        let binary = Binary {
+            data: vec![0; 1000],
+            format: BinaryFormat::Elf,
+            arch: Architecture::X86_64,
+            is_64: true,
+            endian: Endian::Little,
+            inject_base: None,
+        };
+
+        // Forward jump: E9 followed by rel32 = target - (from + 5).
+        let jump = binary.jump_bytes(0x100, 0x200).unwrap();
+        assert_eq!(jump[0], 0xE9);
+        let fwd = (0x200_i64 - (0x100 + 5)) as i32;
+        assert_eq!(&jump[1..5], &fwd.to_le_bytes());
+
+        // Backward jump encodes a negative rel32.
+        let jump = binary.jump_bytes(0x200, 0x100).unwrap();
+        let back = (0x100_i64 - (0x200 + 5)) as i32;
+        assert_eq!(&jump[1..5], &back.to_le_bytes());
     }
 
     /// The injected base must be overridable: the default (one page past the
@@ -1022,87 +776,6 @@ mod tests {
         let err = binary.jump_bytes(0x0022_9fd8, 0x1234_5678).unwrap_err();
         assert!(err.to_string().contains("256MB"), "got: {err}");
         assert!(binary.jump_bytes(0x0022_9fd8, 0x0034_0002).is_err());
-    }
-
-    #[test]
-    fn test_large_jump_offset() {
-        let mut binary = Binary {
-            data: vec![0; 100000],
-            format: BinaryFormat::Elf,
-            arch: Architecture::X86_64,
-            is_64: true,
-            endian: Endian::Little,
-            inject_base: None,
-        };
-
-        // Large forward jump
-        binary.apply_jump_patch(0x1000, 0x1010, 0x10000).unwrap();
-        assert_eq!(binary.data[0x1000], 0xE9);
-    }
-
-    #[test]
-    fn test_direct_patch_overlapping_ranges() {
-        let mut binary = Binary {
-            data: vec![0; 100],
-            format: BinaryFormat::Elf,
-            arch: Architecture::X86_64,
-            is_64: true,
-            endian: Endian::Little,
-            inject_base: None,
-        };
-
-        // First patch
-        binary.apply_direct_patch(10, 20, &[0xAA; 5]).unwrap();
-        // Overlapping patch - this should succeed and overwrite
-        binary.apply_direct_patch(15, 25, &[0xBB; 5]).unwrap();
-
-        assert_eq!(binary.data[14], 0xAA); // last code byte of first patch, untouched
-        assert_eq!(binary.data[15], 0xBB); // Overwritten by second patch
-        assert_eq!(binary.data[19], 0xBB);
-    }
-
-    #[test]
-    fn test_parse_splice_section_valid() {
-        let (begin, end) = parse_splice_section(".rspl.1670.1680").unwrap().unwrap();
-        assert_eq!(begin, 0x1670);
-        assert_eq!(end, 0x1680);
-    }
-
-    #[test]
-    fn test_parse_splice_section_not_a_splice() {
-        assert!(parse_splice_section(".text").is_none());
-        assert!(parse_splice_section(".rodata").is_none());
-    }
-
-    #[test]
-    fn test_parse_splice_section_malformed() {
-        // Missing the second address.
-        assert!(parse_splice_section(".rspl.1670").unwrap().is_err());
-        // Non-hex address.
-        assert!(parse_splice_section(".rspl.zz.10").unwrap().is_err());
-    }
-
-    // Wrap object bytes in a minimal GNU `ar` archive so we can exercise the
-    // rlib reader without invoking a compiler.
-    fn ar_wrap(member_name: &str, data: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(b"!<arch>\n");
-
-        let mut header = format!("{:<16}", format!("{member_name}/"));
-        header.push_str(&format!("{:<12}", 0)); // mtime
-        header.push_str(&format!("{:<6}", 0)); // owner
-        header.push_str(&format!("{:<6}", 0)); // group
-        header.push_str(&format!("{:<8}", "644")); // mode
-        header.push_str(&format!("{:<10}", data.len())); // size
-        header.push_str("`\n");
-        assert_eq!(header.len(), 60);
-
-        out.extend_from_slice(header.as_bytes());
-        out.extend_from_slice(data);
-        if data.len() % 2 == 1 {
-            out.push(b'\n');
-        }
-        out
     }
 
     /// Write a program header at `po` in the class-appropriate layout.
@@ -1343,29 +1016,5 @@ mod tests {
             msg.contains("no PT_NOTE") && msg.contains("padding"),
             "{msg}"
         );
-    }
-
-    #[test]
-    fn test_read_splices_from_rlib() {
-        use object::write::{Object, SectionKind};
-        use object::{Architecture, BinaryFormat, Endianness};
-
-        let mut obj = Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
-        let code = [0xb8, 0x2a, 0x00, 0x00, 0x00, 0xc3]; // mov eax, 42; ret
-        let sec = obj.add_section(Vec::new(), b".rspl.a.b".to_vec(), SectionKind::Text);
-        obj.append_section_data(sec, &code, 1);
-        let obj_bytes = obj.write().unwrap();
-
-        let archive = ar_wrap("splice.o", &obj_bytes);
-        let path = std::env::temp_dir().join(format!("resplice_rlib_test_{}.a", std::process::id()));
-        fs::write(&path, &archive).unwrap();
-
-        let splices = read_splices_from_rlib(&path).unwrap();
-        fs::remove_file(&path).ok();
-
-        assert_eq!(splices.len(), 1);
-        assert_eq!(splices[0].begin, 0xa);
-        assert_eq!(splices[0].end, 0xb);
-        assert_eq!(splices[0].code, code);
     }
 }
