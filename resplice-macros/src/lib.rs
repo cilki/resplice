@@ -45,31 +45,7 @@ pub fn Splice(args: TokenStream, input: TokenStream) -> TokenStream {
 
     let meta_list = parse_macro_input!(args with syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated);
 
-    let mut begin_addr: Option<u64> = None;
-    let mut end_addr: Option<u64> = None;
-
-    for meta in meta_list {
-        if let Meta::NameValue(nv) = meta {
-            let name = nv.path.get_ident().map(|i| i.to_string());
-
-            match name.as_deref() {
-                Some("begin") => {
-                    if let Expr::Lit(expr_lit) = nv.value
-                        && let Lit::Int(lit_int) = expr_lit.lit {
-                            begin_addr = lit_int.base10_parse().ok();
-                        }
-                }
-                Some("end") => {
-                    if let Expr::Lit(expr_lit) = nv.value
-                        && let Lit::Int(lit_int) = expr_lit.lit {
-                            end_addr = lit_int.base10_parse().ok();
-                        }
-                }
-                _ => {}
-            }
-        }
-    }
-
+    let (begin_addr, end_addr) = parse_range(meta_list);
     let begin = begin_addr.expect("Splice attribute requires 'begin' parameter");
     let end = end_addr.expect("Splice attribute requires 'end' parameter");
 
@@ -122,50 +98,51 @@ pub fn Splice(args: TokenStream, input: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
+/// Extract the `begin`/`end` integer addresses from a `#[Splice(..)]` argument
+/// list. Either may be missing (reported to the caller as `None`).
+fn parse_range(meta_list: impl IntoIterator<Item = Meta>) -> (Option<u64>, Option<u64>) {
+    let mut begin = None;
+    let mut end = None;
+    for meta in meta_list {
+        let Meta::NameValue(nv) = meta else { continue };
+        let slot = match nv.path.get_ident().map(|i| i.to_string()).as_deref() {
+            Some("begin") => &mut begin,
+            Some("end") => &mut end,
+            _ => continue,
+        };
+        if let Expr::Lit(expr_lit) = nv.value
+            && let Lit::Int(lit_int) = expr_lit.lit
+        {
+            *slot = lit_int.base10_parse().ok();
+        }
+    }
+    (begin, end)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use syn::parse_quote;
     use syn::punctuated::Punctuated;
 
-    #[test]
-    fn test_section_name_formatting() {
-        let begin: u64 = 0x1670;
-        let end: u64 = 0x1680;
-        assert_eq!(format!(".rspl.{:x}.{:x}", begin, end), ".rspl.1670.1680");
+    fn parse(input: Punctuated<Meta, syn::Token![,]>) -> (Option<u64>, Option<u64>) {
+        parse_range(input)
     }
 
     #[test]
-    fn test_address_parsing_logic() {
-        let meta_list: Punctuated<Meta, syn::Token![,]> =
-            parse_quote!(begin = 0x1000, end = 0x2000);
+    fn parses_begin_and_end() {
+        assert_eq!(
+            parse(parse_quote!(begin = 0x1000, end = 0x2000)),
+            (Some(0x1000), Some(0x2000))
+        );
+    }
 
-        let mut begin_addr: Option<u64> = None;
-        let mut end_addr: Option<u64> = None;
-
-        for meta in meta_list {
-            if let Meta::NameValue(nv) = meta {
-                let name = nv.path.get_ident().map(|i| i.to_string());
-
-                match name.as_deref() {
-                    Some("begin") => {
-                        if let Expr::Lit(expr_lit) = nv.value
-                            && let Lit::Int(lit_int) = expr_lit.lit {
-                                begin_addr = lit_int.base10_parse().ok();
-                            }
-                    }
-                    Some("end") => {
-                        if let Expr::Lit(expr_lit) = nv.value
-                            && let Lit::Int(lit_int) = expr_lit.lit {
-                                end_addr = lit_int.base10_parse().ok();
-                            }
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        assert_eq!(begin_addr, Some(0x1000));
-        assert_eq!(end_addr, Some(0x2000));
+    #[test]
+    fn missing_or_unknown_keys_yield_none() {
+        assert_eq!(
+            parse(parse_quote!(end = 0x2000, extra = 1)),
+            (None, Some(0x2000))
+        );
+        assert_eq!(parse(parse_quote!()), (None, None));
     }
 }

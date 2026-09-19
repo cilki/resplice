@@ -479,16 +479,13 @@ impl Binary {
                         first_claimed = first_claimed.min(p_off);
                     }
                 }
-                let (eshoff_off, eshoff_w, eshentsize_off, eshnum_off) = if self.is_64 {
-                    (0x28, 8, 0x3a, 0x3c)
-                } else {
-                    (0x20, 4, 0x2e, 0x30)
-                };
+                // Only the start of the section-header table matters here;
+                // its entry size and count are irrelevant to the padding gap.
+                let (eshoff_off, eshoff_w) = if self.is_64 { (0x28, 8) } else { (0x20, 4) };
                 let e_shoff = endian.read_uint(&self.data, eshoff_off, eshoff_w);
                 if e_shoff > 0 {
                     first_claimed = first_claimed.min(e_shoff);
                 }
-                let _ = (eshentsize_off, eshnum_off); // only the start of the shdr table matters here
 
                 let table_end = (phoff + phnum * phentsize) as u64;
                 if first_claimed == u64::MAX || first_claimed < table_end {
