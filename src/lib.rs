@@ -9,7 +9,8 @@ mod link;
 pub use arch::Endian;
 pub use link::{link_rlib, Applied};
 
-/// Page size used for laying out the injected segment.
+/// Fallback granularity for laying out the injected segment, used only when the
+/// target declares nothing better. See [`Binary::load_align`].
 const PAGE: u64 = 0x1000;
 
 /// Round `x` up to the next multiple of `align` (a power of two).
@@ -343,16 +344,48 @@ impl Binary {
             .unwrap_or(0))
     }
 
-    /// The base virtual address the injected segment will be mapped at:
-    /// one page above the target's current image, page-aligned.
+    /// The granularity the injected segment must be laid out at: the largest
+    /// `p_align` of any `PT_LOAD` in the target (never below [`PAGE`]).
+    ///
+    /// This is the target's *maximum page size* — the granularity the linker
+    /// aligned its segments to so the image loads under any page size the
+    /// architecture permits. It matters for two reasons, and assuming 4K for
+    /// both is wrong on every architecture with larger pages (aarch64 images are
+    /// linked for 64K, and real aarch64 kernels run 16K or 64K pages):
+    ///
+    /// - The kernel maps a `PT_LOAD` from `p_offset` rounded *down* to a page
+    ///   boundary, so a segment placed less than a page past the image shares a
+    ///   page with it and silently replaces that mapping. Landing on `.got` that
+    ///   way crashes the dynamic loader before `main` even runs.
+    /// - `p_vaddr ≡ p_offset (mod page size)` must hold, or the loader rejects
+    ///   the image outright.
+    fn load_align(&self) -> Result<u64> {
+        use goblin::elf::program_header::PT_LOAD;
+        let elf = self.elf()?;
+        let declared = elf
+            .program_headers
+            .iter()
+            .filter(|ph| ph.p_type == PT_LOAD && ph.p_align.is_power_of_two())
+            .map(|ph| ph.p_align)
+            .max()
+            .unwrap_or(PAGE);
+        Ok(declared.max(PAGE))
+    }
+
+    /// The base virtual address the injected segment will be mapped at: one
+    /// [`load_align`](Self::load_align) granule above the target's image.
     pub fn injected_base(&self) -> Result<u64> {
+        let align = self.load_align()?;
         if let Some(base) = self.inject_base {
-            if base % PAGE != 0 {
-                return Err(anyhow!("injected base {base:#x} is not page-aligned"));
+            if base % align != 0 {
+                return Err(anyhow!(
+                    "injected base {base:#x} is not aligned to the target's page \
+                     size ({align:#x})"
+                ));
             }
             return Ok(base);
         }
-        Ok(align_up(self.max_vaddr()?, PAGE) + PAGE)
+        Ok(align_up(self.max_vaddr()?, align) + align)
     }
 
     /// Resolve a symbol name against the target binary's own symbols.
@@ -409,14 +442,18 @@ impl Binary {
     /// `base`, by converting an existing `PT_NOTE` program header into a
     /// `PT_LOAD` (so the program-header table itself need not be relocated).
     ///
-    /// `base` must be page-aligned; the file is padded to a page boundary before
-    /// the blob is appended so the loader's `p_vaddr ≡ p_offset (mod p_align)`
-    /// requirement holds.
+    /// `base` must be aligned to the target's [`load_align`](Self::load_align);
+    /// the file is padded to the same granularity before the blob is appended so
+    /// the loader's `p_vaddr ≡ p_offset (mod p_align)` requirement holds.
     pub fn inject_segment(&mut self, base: u64, blob: &[u8]) -> Result<()> {
         use goblin::elf::program_header::{PF_R, PF_X, PT_LOAD, PT_NOTE};
 
-        if base % PAGE != 0 {
-            return Err(anyhow!("injected base {base:#x} is not page-aligned"));
+        let align = self.load_align()?;
+        if base % align != 0 {
+            return Err(anyhow!(
+                "injected base {base:#x} is not aligned to the target's page size \
+                 ({align:#x})"
+            ));
         }
         let expected_class = if self.is_64 { 2 } else { 1 };
         let expected_data = match self.endian {
@@ -512,8 +549,8 @@ impl Binary {
             }
         };
 
-        // Append the blob at a page-aligned file offset.
-        let file_off = align_up(self.data.len() as u64, PAGE);
+        // Append the blob at a file offset congruent to `base` modulo `align`.
+        let file_off = align_up(self.data.len() as u64, align);
         self.data.resize(file_off as usize, 0);
         self.data.extend_from_slice(blob);
         let len = blob.len() as u64;
@@ -531,7 +568,7 @@ impl Binary {
             endian.write_uint(d, note_off + 24, 8, base);
             endian.write_uint(d, note_off + 32, 8, len);
             endian.write_uint(d, note_off + 40, 8, len);
-            endian.write_uint(d, note_off + 48, 8, PAGE);
+            endian.write_uint(d, note_off + 48, 8, align);
         } else {
             endian.write_uint(d, note_off + 4, 4, file_off);
             endian.write_uint(d, note_off + 8, 4, base);
@@ -539,7 +576,7 @@ impl Binary {
             endian.write_uint(d, note_off + 16, 4, len);
             endian.write_uint(d, note_off + 20, 4, len);
             endian.write_uint(d, note_off + 24, 4, flags);
-            endian.write_uint(d, note_off + 28, 4, PAGE);
+            endian.write_uint(d, note_off + 28, 4, align);
         }
 
         Ok(())
@@ -721,20 +758,65 @@ mod tests {
     /// of `.bss`, which silently corrupts the injected code during play.
     #[test]
     fn injected_base_can_be_pinned() {
-        let mut binary = Binary {
-            data: vec![0; 0x1000],
-            format: BinaryFormat::Elf,
-            arch: Architecture::Mips,
-            is_64: false,
-            endian: Endian::Little,
-            inject_base: None,
-        };
+        let mut binary = craft_injectable(false, Endian::Little, Architecture::Mips);
 
         binary.set_injected_base(Some(0x001c_0000));
         assert_eq!(binary.injected_base().unwrap(), 0x001c_0000);
 
         binary.set_injected_base(Some(0x001c_0001));
-        assert!(binary.injected_base().unwrap_err().to_string().contains("page-aligned"));
+        assert!(binary.injected_base().unwrap_err().to_string().contains("aligned"));
+    }
+
+    /// The injected segment must be laid out at the target's *own* maximum page
+    /// size, not an assumed 4K. A target linked for 64K pages (every aarch64
+    /// image is) whose segment is only 4K-clear of the image shares a page with
+    /// it under a 16K or 64K kernel, and the kernel's mapping of the injected
+    /// segment silently replaces the image's — typically clobbering `.got`, so
+    /// the dynamic loader segfaults before `main` runs.
+    #[test]
+    fn injected_segment_uses_the_targets_page_size() {
+        let align = 0x10000u64;
+        let mut bin = craft_injectable_aligned(true, Endian::Little, Architecture::Arm64, align);
+
+        // The default base clears the image by a full granule of the target's
+        // page size, so no page can be shared with it.
+        let base = bin.injected_base().unwrap();
+        assert_eq!(base % align, 0, "base {base:#x} not aligned to {align:#x}");
+        assert!(base >= 0x400400 + align, "base {base:#x} too close to the image");
+
+        // A 4K-aligned base is not good enough for this target and must be
+        // refused rather than silently producing a broken binary.
+        bin.set_injected_base(Some(0x50_1000));
+        let err = bin.injected_base().unwrap_err().to_string();
+        assert!(err.contains("page size"), "{err}");
+        bin.set_injected_base(None);
+
+        bin.inject_segment(base, &[0xde, 0xad, 0xbe, 0xef]).unwrap();
+
+        // Find the converted phdr and check the loader's constraints hold.
+        let phoff = bin.endian().read_uint(bin.data(), 0x20, 8) as usize;
+        let phnum = bin.endian().read_uint(bin.data(), 0x38, 2) as usize;
+        let mut checked = false;
+        for i in 0..phnum {
+            let po = phoff + i * 56;
+            if bin.endian().read_uint(bin.data(), po, 4) != 1 {
+                continue;
+            }
+            let p_vaddr = bin.endian().read_uint(bin.data(), po + 16, 8);
+            if p_vaddr != base {
+                continue;
+            }
+            let p_offset = bin.endian().read_uint(bin.data(), po + 8, 8);
+            let p_align = bin.endian().read_uint(bin.data(), po + 48, 8);
+            assert_eq!(p_align, align, "p_align must be the target's page size");
+            assert_eq!(
+                p_offset % align,
+                p_vaddr % align,
+                "p_vaddr {p_vaddr:#x} and p_offset {p_offset:#x} must be congruent mod {align:#x}"
+            );
+            checked = true;
+        }
+        assert!(checked, "no injected PT_LOAD at {base:#x}");
     }
 
     /// A MIPS trampoline must carry its own delay-slot `nop`: `j` executes the
@@ -787,6 +869,7 @@ mod tests {
         p_vaddr: u64,
         p_filesz: u64,
         p_flags: u64,
+        p_align: u64,
     ) {
         endian.write_uint(d, po, 4, p_type);
         if is_64 {
@@ -796,7 +879,7 @@ mod tests {
             endian.write_uint(d, po + 24, 8, p_vaddr);
             endian.write_uint(d, po + 32, 8, p_filesz);
             endian.write_uint(d, po + 40, 8, p_filesz);
-            endian.write_uint(d, po + 48, 8, 0x1000);
+            endian.write_uint(d, po + 48, 8, p_align);
         } else {
             endian.write_uint(d, po + 4, 4, p_off);
             endian.write_uint(d, po + 8, 4, p_vaddr);
@@ -804,13 +887,20 @@ mod tests {
             endian.write_uint(d, po + 16, 4, p_filesz);
             endian.write_uint(d, po + 20, 4, p_filesz);
             endian.write_uint(d, po + 24, 4, p_flags);
-            endian.write_uint(d, po + 28, 4, 0x1000);
+            endian.write_uint(d, po + 28, 4, p_align);
         }
     }
 
     /// A `Binary` whose bytes carry an ELF header of the given class/endianness
-    /// plus a PT_LOAD and a PT_NOTE, ready for `inject_segment`.
-    fn craft_injectable(is_64: bool, endian: Endian, arch: Architecture) -> Binary {
+    /// plus a PT_LOAD and a PT_NOTE, ready for `inject_segment`. The PT_LOAD is
+    /// aligned to `load_align`, as a linker would align it to the target's
+    /// maximum page size.
+    fn craft_injectable_aligned(
+        is_64: bool,
+        endian: Endian,
+        arch: Architecture,
+        load_align: u64,
+    ) -> Binary {
         let mut d = vec![0u8; 0x400];
         d[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
         d[4] = if is_64 { 2 } else { 1 };
@@ -829,8 +919,8 @@ mod tests {
         endian.write_uint(&mut d, phentsize_off, 2, phentsize as u64);
         endian.write_uint(&mut d, phnum_off, 2, 2);
         let po = phoff as usize;
-        write_phdr(&mut d, po, is_64, endian, 1, 0, 0x400000, 0x400, 5);
-        write_phdr(&mut d, po + phentsize, is_64, endian, 4, 0x100, 0x400100, 0x20, 4);
+        write_phdr(&mut d, po, is_64, endian, 1, 0, 0x400000, 0x400, 5, load_align);
+        write_phdr(&mut d, po + phentsize, is_64, endian, 4, 0x100, 0x400100, 0x20, 4, 4);
         Binary {
             data: d,
             format: BinaryFormat::Elf,
@@ -838,7 +928,12 @@ mod tests {
             is_64,
             endian,
             inject_base: None,
-}
+        }
+    }
+
+    /// `craft_injectable_aligned` for a target linked for 4K pages.
+    fn craft_injectable(is_64: bool, endian: Endian, arch: Architecture) -> Binary {
+        craft_injectable_aligned(is_64, endian, arch, 0x1000)
     }
 
     #[test]
@@ -919,8 +1014,8 @@ mod tests {
         let po = phoff as usize;
         // Two PT_LOADs, first content starting well past the phdr table —
         // plenty of unclaimed padding to grow into.
-        write_phdr(&mut d, po, is_64, endian, 1, 0x1000, 0x400000, 0x400, 5);
-        write_phdr(&mut d, po + phentsize, is_64, endian, 1, 0x1400, 0x500000, 0x400, 6);
+        write_phdr(&mut d, po, is_64, endian, 1, 0x1000, 0x400000, 0x400, 5, 0x1000);
+        write_phdr(&mut d, po + phentsize, is_64, endian, 1, 0x1400, 0x500000, 0x400, 6, 0x1000);
         Binary {
             data: d,
             format: BinaryFormat::Elf,
@@ -998,7 +1093,18 @@ mod tests {
         // A single PT_LOAD whose file offset sits immediately after the
         // table's one entry — zero padding available.
         let po = phoff as usize;
-        write_phdr(&mut d, po, true, endian, 1, po as u64 + phentsize as u64, 0x400000, 0x40, 5);
+        write_phdr(
+            &mut d,
+            po,
+            true,
+            endian,
+            1,
+            po as u64 + phentsize as u64,
+            0x400000,
+            0x40,
+            5,
+            0x1000,
+        );
         let mut bin = Binary {
             data: d,
             format: BinaryFormat::Elf,

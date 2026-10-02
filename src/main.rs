@@ -20,8 +20,9 @@ struct Cli {
     /// By default the segment goes one page past the end of the image. That is
     /// unsafe when something else already owns that address -- console binaries
     /// commonly allocate from the end of `.bss`, so the default lands in the
-    /// heap and is overwritten during play. Pass a known-free, page-aligned
-    /// address to place it deliberately.
+    /// heap and is overwritten during play. Pass a known-free address to place
+    /// it deliberately; it must be aligned to the target's page size (the
+    /// largest `p_align` of its `PT_LOAD` segments, e.g. 64K on aarch64).
     #[arg(long, value_parser = parse_addr)]
     inject_base: Option<u64>,
 }

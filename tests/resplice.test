@@ -6,12 +6,38 @@
 ## Precondition: run `cargo build --release` before invoking attest so the
 ## `resplice` binary and `resplice-macros` artifacts already exist.
 
+## Write `compute.s`: a `compute` that returns 41, followed by `$1` bytes of
+## slack for the replacement to grow into.
+##
+## The splice is compiled for the host, so the throwaway target has to be a host
+## binary too -- which means this assembly is host-specific. Covering more than
+## x86-64 is not pedantry: the injected segment's layout depends on the target's
+## page size, and only a non-4K-page host (every aarch64 kernel) exercises that.
+writeComputeAsm() {
+	local pad=$1 fn_type ret41
+	case "$(uname -m)" in
+	x86_64 | i?86)
+		fn_type='.type compute,@function'
+		ret41='mov $41, %eax'
+		;;
+	aarch64 | arm64)
+		fn_type='.type compute,%function'
+		ret41='mov w0, #41'
+		;;
+	*)
+		echo "unsupported host architecture $(uname -m)" >&2
+		return 1
+		;;
+	esac
+	printf '%s\n' '.text' '.globl compute' "$fn_type" \
+		'compute:' "$ret41" 'ret' ".zero $pad" \
+		'.size compute, .-compute' > compute.s
+}
+
 ## A self-contained splice (no relocations): the Rust body is a constant, so its
 ## machine code is patched directly into the target with nothing to resolve.
 testSpliceSelfContained() {
-	printf '%s\n' '.text' '.globl compute' '.type compute,@function' \
-		'compute:' 'mov $41, %eax' 'ret' '.zero 32' \
-		'.size compute, .-compute' > compute.s
+	writeComputeAsm 32
 	printf '%s\n' '#include <stdio.h>' 'int compute(void);' \
 		'int main(void){ printf("%d\n", compute()); return 0; }' > prog.c
 	# The output binary must not be named `target` (cargo's build directory).
@@ -43,9 +69,7 @@ testSpliceSelfContained() {
 testSpliceResolvesRelocations() {
 	# `helper_c` stays a real, out-of-line symbol the splice can bind to; give
 	# `compute` generous padding so the larger replacement fits.
-	printf '%s\n' '.text' '.globl compute' '.type compute,@function' \
-		'compute:' 'mov $41, %eax' 'ret' '.zero 96' \
-		'.size compute, .-compute' > compute.s
+	writeComputeAsm 96
 	printf '%s\n' '#include <stdio.h>' 'int compute(void);' \
 		'int helper_c(int x){ return x + 100; }' \
 		'int main(void){ printf("%d\n", compute()); return helper_c(0) * 0; }' > prog.c
@@ -84,10 +108,9 @@ testSpliceResolvesRelocations() {
 ## original site. The patched binary must still produce the new result.
 testSpliceTrampolinesWhenOversized() {
 	# `compute` gets only tiny padding, so its region cannot hold the ~50-byte
-	# replacement (but is still big enough for the 5-byte jump).
-	printf '%s\n' '.text' '.globl compute' '.type compute,@function' \
-		'compute:' 'mov $41, %eax' 'ret' '.zero 4' \
-		'.size compute, .-compute' > compute.s
+	# replacement (but is still big enough for the jump: 5 bytes on x86-64, 4 on
+	# aarch64).
+	writeComputeAsm 4
 	printf '%s\n' '#include <stdio.h>' 'int compute(void);' \
 		'int helper_c(int x){ return x + 100; }' \
 		'int main(void){ printf("%d\n", compute()); return helper_c(0) * 0; }' > prog.c
