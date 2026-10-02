@@ -145,9 +145,10 @@ fn splice_range(name: &str) -> Option<(u64, u64)> {
     Some((u64::from_str_radix(b, 16).ok()?, u64::from_str_radix(e, 16).ok()?))
 }
 
-/// Verify that an rlib object member targets the same architecture, byte order,
-/// and pointer width as the binary being patched. Splicing wrong-arch machine
-/// code in would silently corrupt the target, so this is a hard gate.
+/// Verify that an rlib object member targets the same architecture and byte
+/// order as the binary being patched (the architecture implies the pointer
+/// width). Splicing wrong-arch machine code in would silently corrupt the
+/// target, so this is a hard gate.
 fn verify_arch(obj: &object::File, target: &Binary) -> Result<()> {
     use object::Architecture as OA;
     let obj_arch = match obj.architecture() {
@@ -163,16 +164,12 @@ fn verify_arch(obj: &object::File, target: &Binary) -> Result<()> {
         object::Endianness::Little => Endian::Little,
         object::Endianness::Big => Endian::Big,
     };
-    let obj_is_64 = obj.is_64();
 
-    if obj_arch != target.architecture()
-        || obj_endian != target.endian()
-        || obj_is_64 != target.is_64()
-    {
+    if obj_arch != target.architecture() || obj_endian != target.endian() {
         bail!(
             "rlib is {} but target is {}",
-            arch::describe(obj_arch, obj_endian, obj_is_64),
-            arch::describe(target.architecture(), target.endian(), target.is_64()),
+            arch::describe(obj_arch, obj_endian),
+            arch::describe(target.architecture(), target.endian()),
         );
     }
     Ok(())

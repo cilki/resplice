@@ -1,6 +1,6 @@
 pub use anyhow::Result;
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use std::fs;
 use std::path::Path;
 
@@ -18,24 +18,14 @@ fn align_up(x: u64, align: u64) -> u64 {
     (x + align - 1) & !(align - 1)
 }
 
-/// Represents a binary file that can be patched
+/// Represents an ELF binary that can be patched
 pub struct Binary {
     data: Vec<u8>,
-    format: BinaryFormat,
     arch: Architecture,
-    is_64: bool,
     endian: Endian,
     /// Operator-supplied virtual address for the injected segment, overriding
     /// [`Binary::injected_base`]'s default. See [`Binary::set_injected_base`].
     inject_base: Option<u64>,
-}
-
-/// Supported binary formats
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BinaryFormat {
-    Elf,
-    Pe,
-    MachO,
 }
 
 /// Supported CPU architectures
@@ -63,13 +53,11 @@ impl Binary {
     /// Load a binary file from disk
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let data = fs::read(path)?;
-        let (format, arch, is_64, endian) = Self::detect_format_and_arch(&data)?;
+        let (arch, endian) = Self::detect_arch(&data)?;
 
         Ok(Binary {
             data,
-            format,
             arch,
-            is_64,
             endian,
             inject_base: None,
         })
@@ -88,66 +76,37 @@ impl Binary {
         self.inject_base = base;
     }
 
-    /// Detect the binary format, architecture, pointer width, and byte order.
-    fn detect_format_and_arch(
-        data: &[u8],
-    ) -> Result<(BinaryFormat, Architecture, bool, Endian)> {
-        match goblin::Object::parse(data)? {
-            goblin::Object::Elf(elf) => {
-                let format = BinaryFormat::Elf;
-                let arch = match elf.header.e_machine {
-                    goblin::elf::header::EM_386 => Architecture::X86,
-                    goblin::elf::header::EM_X86_64 => Architecture::X86_64,
-                    goblin::elf::header::EM_ARM => Architecture::Arm,
-                    goblin::elf::header::EM_AARCH64 => Architecture::Arm64,
-                    goblin::elf::header::EM_MIPS => {
-                        // Determine if 32-bit or 64-bit MIPS
-                        if elf.is_64 {
-                            Architecture::Mips64
-                        } else {
-                            Architecture::Mips
-                        }
-                    }
-                    _ => return Err(anyhow!("Unsupported binary format")),
-                };
-                let endian = if elf.little_endian {
-                    Endian::Little
-                } else {
-                    Endian::Big
-                };
-                Ok((format, arch, elf.is_64, endian))
-            }
-            goblin::Object::PE(pe) => {
-                let format = BinaryFormat::Pe;
-                let arch = match pe.header.coff_header.machine {
-                    goblin::pe::header::COFF_MACHINE_X86 => Architecture::X86,
-                    goblin::pe::header::COFF_MACHINE_X86_64 => Architecture::X86_64,
-                    goblin::pe::header::COFF_MACHINE_ARM => Architecture::Arm,
-                    goblin::pe::header::COFF_MACHINE_ARM64 => Architecture::Arm64,
-                    _ => return Err(anyhow!("Unsupported binary format")),
-                };
-                Ok((format, arch, arch.is_64(), Endian::Little))
-            }
-            goblin::Object::Mach(mach) => {
-                use goblin::mach::Mach;
-                let format = BinaryFormat::MachO;
-                let arch = match mach {
-                    Mach::Binary(macho) => match macho.header.cputype {
-                        goblin::mach::cputype::CPU_TYPE_X86 => Architecture::X86,
-                        goblin::mach::cputype::CPU_TYPE_X86_64 => Architecture::X86_64,
-                        goblin::mach::cputype::CPU_TYPE_ARM => Architecture::Arm,
-                        goblin::mach::cputype::CPU_TYPE_ARM64 => Architecture::Arm64,
-                        _ => return Err(anyhow!("Unsupported binary format")),
-                    },
-                    Mach::Fat(_) => {
-                        // For fat binaries, default to x86_64 for now
-                        Architecture::X86_64
-                    }
-                };
-                Ok((format, arch, arch.is_64(), Endian::Little))
-            }
-            _ => Err(anyhow!("Unsupported binary format")),
+    /// Detect the architecture and byte order of an ELF target.
+    ///
+    /// Every operation this crate performs on a target — translating virtual
+    /// addresses, reading its symbol table, injecting a segment — is ELF-only,
+    /// so non-ELF inputs are rejected here rather than later.
+    fn detect_arch(data: &[u8]) -> Result<(Architecture, Endian)> {
+        let elf = goblin::elf::Elf::parse(data).context("target is not an ELF binary")?;
+        let arch = match elf.header.e_machine {
+            goblin::elf::header::EM_386 => Architecture::X86,
+            goblin::elf::header::EM_X86_64 => Architecture::X86_64,
+            goblin::elf::header::EM_ARM => Architecture::Arm,
+            goblin::elf::header::EM_AARCH64 => Architecture::Arm64,
+            goblin::elf::header::EM_MIPS if elf.is_64 => Architecture::Mips64,
+            goblin::elf::header::EM_MIPS => Architecture::Mips,
+            other => return Err(anyhow!("unsupported ELF machine type {other}")),
+        };
+        // The machine type implies the pointer width everywhere except MIPS,
+        // which is resolved above; a header that disagrees with itself would
+        // make every subsequent header field be read at the wrong width.
+        if arch.is_64() != elf.is_64 {
+            return Err(anyhow!(
+                "ELF class contradicts machine type {}",
+                elf.header.e_machine
+            ));
         }
+        let endian = if elf.little_endian {
+            Endian::Little
+        } else {
+            Endian::Big
+        };
+        Ok((arch, endian))
     }
 
     /// Write `code` at file offset `offset`, filling any trailing space up to
@@ -289,11 +248,6 @@ impl Binary {
         &self.data
     }
 
-    /// Get the binary format
-    pub fn format(&self) -> BinaryFormat {
-        self.format
-    }
-
     /// Get the architecture
     pub fn architecture(&self) -> Architecture {
         self.arch
@@ -301,7 +255,7 @@ impl Binary {
 
     /// Whether the target uses 64-bit pointers.
     pub fn is_64(&self) -> bool {
-        self.is_64
+        self.arch.is_64()
     }
 
     /// The target's byte order.
@@ -455,29 +409,17 @@ impl Binary {
                  ({align:#x})"
             ));
         }
-        let expected_class = if self.is_64 { 2 } else { 1 };
-        let expected_data = match self.endian {
-            Endian::Little => 1,
-            Endian::Big => 2,
-        };
-        if self.format != BinaryFormat::Elf
-            || self.data.len() < 64
-            || self.data[..4] != [0x7f, b'E', b'L', b'F']
-            || self.data[4] != expected_class
-            || self.data[5] != expected_data
-        {
-            return Err(anyhow!("segment injection requires an ELF target"));
-        }
         let endian = self.endian;
+        let is_64 = self.is_64();
 
         // Program-header table location and entry size, at class-dependent
         // offsets in the ELF header.
-        let (phoff_off, phentsize_off, phnum_off, phentsize) = if self.is_64 {
+        let (phoff_off, phentsize_off, phnum_off, phentsize) = if is_64 {
             (0x20, 0x36, 0x38, 56usize)
         } else {
             (0x1c, 0x2a, 0x2c, 32usize)
         };
-        let word = if self.is_64 { 8 } else { 4 };
+        let word = if is_64 { 8 } else { 4 };
         let phoff = endian.read_uint(&self.data, phoff_off, word) as usize;
         let got_phentsize = endian.read_uint(&self.data, phentsize_off, 2) as usize;
         let phnum = endian.read_uint(&self.data, phnum_off, 2) as usize;
@@ -507,7 +449,7 @@ impl Binary {
         let note_off = match note_off {
             Some(off) => off,
             None => {
-                let (poff_field, poff_w) = if self.is_64 { (8, 8) } else { (4, 4) };
+                let (poff_field, poff_w) = if is_64 { (8, 8) } else { (4, 4) };
                 let mut first_claimed = u64::MAX;
                 for i in 0..phnum {
                     let off = phoff + i * phentsize;
@@ -518,7 +460,7 @@ impl Binary {
                 }
                 // Only the start of the section-header table matters here;
                 // its entry size and count are irrelevant to the padding gap.
-                let (eshoff_off, eshoff_w) = if self.is_64 { (0x28, 8) } else { (0x20, 4) };
+                let (eshoff_off, eshoff_w) = if is_64 { (0x28, 8) } else { (0x20, 4) };
                 let e_shoff = endian.read_uint(&self.data, eshoff_off, eshoff_w);
                 if e_shoff > 0 {
                     first_claimed = first_claimed.min(e_shoff);
@@ -561,7 +503,7 @@ impl Binary {
         let flags = (PF_R | PF_X) as u64;
         let d = &mut self.data;
         endian.write_uint(d, note_off, 4, PT_LOAD as u64);
-        if self.is_64 {
+        if is_64 {
             endian.write_uint(d, note_off + 4, 4, flags);
             endian.write_uint(d, note_off + 8, 8, file_off);
             endian.write_uint(d, note_off + 16, 8, base);
@@ -620,38 +562,36 @@ mod tests {
     }
 
     #[test]
-    fn test_binary_format_detection_incomplete() {
-        let elf_header = vec![0x7f, 0x45, 0x4c, 0x46]; // Too short
-        assert!(Binary::detect_format_and_arch(&elf_header).is_err());
+    fn detect_arch_reads_machine_and_byte_order() {
+        let (arch, endian) = Binary::detect_arch(&create_minimal_elf()).unwrap();
+        assert_eq!(arch, Architecture::X86_64);
+        assert_eq!(endian, Endian::Little);
     }
 
+    /// Everything downstream (address translation, symbol lookup, segment
+    /// injection) is ELF-only, so anything else must be refused at load time.
     #[test]
-    fn test_binary_format_detection_elf() {
-        let elf = create_minimal_elf();
-        let (format, ..) = Binary::detect_format_and_arch(&elf).unwrap();
-        assert_eq!(format, BinaryFormat::Elf);
+    fn detect_arch_rejects_non_elf() {
+        for data in [create_minimal_pe(), vec![0x7f, 0x45, 0x4c, 0x46], vec![0; 100]] {
+            assert!(Binary::detect_arch(&data).is_err());
+        }
     }
 
+    /// The machine type drives the pointer width used to read every later header
+    /// field, so a header whose ELF class contradicts it must not be accepted.
     #[test]
-    fn test_binary_format_detection_pe() {
-        let pe = create_minimal_pe();
-        let (format, ..) = Binary::detect_format_and_arch(&pe).unwrap();
-        assert_eq!(format, BinaryFormat::Pe);
-    }
-
-    #[test]
-    fn test_binary_format_detection_invalid() {
-        let invalid = vec![0; 100];
-        assert!(Binary::detect_format_and_arch(&invalid).is_err());
+    fn detect_arch_rejects_class_machine_mismatch() {
+        let mut data = create_minimal_elf();
+        data[4] = 1; // ELFCLASS32 alongside e_machine = EM_X86_64
+        let err = Binary::detect_arch(&data).unwrap_err();
+        assert!(err.to_string().contains("contradicts"), "{err}");
     }
 
     #[test]
     fn test_patch_bytes_writes_code_and_nop_fills_the_rest() {
         let mut binary = Binary {
             data: vec![0; 100],
-            format: BinaryFormat::Elf,
             arch: Architecture::X86_64,
-            is_64: true,
             endian: Endian::Little,
             inject_base: None,
         };
@@ -670,9 +610,7 @@ mod tests {
     fn test_patch_bytes_exact_fit_leaves_no_padding() {
         let mut binary = Binary {
             data: vec![0; 100],
-            format: BinaryFormat::Elf,
             arch: Architecture::X86_64,
-            is_64: true,
             endian: Endian::Little,
             inject_base: None,
         };
@@ -688,9 +626,7 @@ mod tests {
     fn test_patch_bytes_empty_code_fills_region_with_nops() {
         let mut binary = Binary {
             data: vec![0; 100],
-            format: BinaryFormat::Elf,
             arch: Architecture::X86_64,
-            is_64: true,
             endian: Endian::Little,
             inject_base: None,
         };
@@ -705,9 +641,7 @@ mod tests {
     fn test_patch_bytes_code_too_large_errors() {
         let mut binary = Binary {
             data: vec![0; 100],
-            format: BinaryFormat::Elf,
             arch: Architecture::X86_64,
-            is_64: true,
             endian: Endian::Little,
             inject_base: None,
         };
@@ -720,9 +654,7 @@ mod tests {
     fn test_patch_bytes_region_out_of_bounds_errors() {
         let mut binary = Binary {
             data: vec![0; 100],
-            format: BinaryFormat::Elf,
             arch: Architecture::X86_64,
-            is_64: true,
             endian: Endian::Little,
             inject_base: None,
         };
@@ -734,9 +666,7 @@ mod tests {
     fn test_jump_bytes_x86_encodes_relative_offset() {
         let binary = Binary {
             data: vec![0; 1000],
-            format: BinaryFormat::Elf,
             arch: Architecture::X86_64,
-            is_64: true,
             endian: Endian::Little,
             inject_base: None,
         };
@@ -758,65 +688,15 @@ mod tests {
     /// of `.bss`, which silently corrupts the injected code during play.
     #[test]
     fn injected_base_can_be_pinned() {
-        let mut binary = craft_injectable(false, Endian::Little, Architecture::Mips);
+        use goblin::elf::program_header::PT_LOAD;
+        let phdrs: [Phdr; 1] = [(PT_LOAD as u64, 0, 0x400000, 0x400, 5, 0x1000)];
+        let mut binary = craft_injectable(Endian::Little, Architecture::Mips, 0x400, &phdrs);
 
         binary.set_injected_base(Some(0x001c_0000));
         assert_eq!(binary.injected_base().unwrap(), 0x001c_0000);
 
         binary.set_injected_base(Some(0x001c_0001));
         assert!(binary.injected_base().unwrap_err().to_string().contains("aligned"));
-    }
-
-    /// The injected segment must be laid out at the target's *own* maximum page
-    /// size, not an assumed 4K. A target linked for 64K pages (every aarch64
-    /// image is) whose segment is only 4K-clear of the image shares a page with
-    /// it under a 16K or 64K kernel, and the kernel's mapping of the injected
-    /// segment silently replaces the image's — typically clobbering `.got`, so
-    /// the dynamic loader segfaults before `main` runs.
-    #[test]
-    fn injected_segment_uses_the_targets_page_size() {
-        let align = 0x10000u64;
-        let mut bin = craft_injectable_aligned(true, Endian::Little, Architecture::Arm64, align);
-
-        // The default base clears the image by a full granule of the target's
-        // page size, so no page can be shared with it.
-        let base = bin.injected_base().unwrap();
-        assert_eq!(base % align, 0, "base {base:#x} not aligned to {align:#x}");
-        assert!(base >= 0x400400 + align, "base {base:#x} too close to the image");
-
-        // A 4K-aligned base is not good enough for this target and must be
-        // refused rather than silently producing a broken binary.
-        bin.set_injected_base(Some(0x50_1000));
-        let err = bin.injected_base().unwrap_err().to_string();
-        assert!(err.contains("page size"), "{err}");
-        bin.set_injected_base(None);
-
-        bin.inject_segment(base, &[0xde, 0xad, 0xbe, 0xef]).unwrap();
-
-        // Find the converted phdr and check the loader's constraints hold.
-        let phoff = bin.endian().read_uint(bin.data(), 0x20, 8) as usize;
-        let phnum = bin.endian().read_uint(bin.data(), 0x38, 2) as usize;
-        let mut checked = false;
-        for i in 0..phnum {
-            let po = phoff + i * 56;
-            if bin.endian().read_uint(bin.data(), po, 4) != 1 {
-                continue;
-            }
-            let p_vaddr = bin.endian().read_uint(bin.data(), po + 16, 8);
-            if p_vaddr != base {
-                continue;
-            }
-            let p_offset = bin.endian().read_uint(bin.data(), po + 8, 8);
-            let p_align = bin.endian().read_uint(bin.data(), po + 48, 8);
-            assert_eq!(p_align, align, "p_align must be the target's page size");
-            assert_eq!(
-                p_offset % align,
-                p_vaddr % align,
-                "p_vaddr {p_vaddr:#x} and p_offset {p_offset:#x} must be congruent mod {align:#x}"
-            );
-            checked = true;
-        }
-        assert!(checked, "no injected PT_LOAD at {base:#x}");
     }
 
     /// A MIPS trampoline must carry its own delay-slot `nop`: `j` executes the
@@ -826,9 +706,7 @@ mod tests {
     fn mips_trampoline_fills_its_delay_slot() {
         let binary = Binary {
             data: vec![0; 0x1000],
-            format: BinaryFormat::Elf,
             arch: Architecture::Mips,
-            is_64: false,
             endian: Endian::Little,
             inject_base: None,
         };
@@ -845,9 +723,7 @@ mod tests {
     fn mips_trampoline_rejects_region_crossing_jump() {
         let binary = Binary {
             data: vec![0; 0x1000],
-            format: BinaryFormat::Elf,
             arch: Architecture::Mips,
-            is_64: false,
             endian: Endian::Little,
             inject_base: None,
         };
@@ -857,51 +733,66 @@ mod tests {
         assert!(binary.jump_bytes(0x0022_9fd8, 0x0034_0002).is_err());
     }
 
-    /// Write a program header at `po` in the class-appropriate layout.
-    #[allow(clippy::too_many_arguments)]
-    fn write_phdr(
-        d: &mut [u8],
-        po: usize,
-        is_64: bool,
-        endian: Endian,
-        p_type: u64,
-        p_off: u64,
-        p_vaddr: u64,
-        p_filesz: u64,
-        p_flags: u64,
-        p_align: u64,
-    ) {
-        endian.write_uint(d, po, 4, p_type);
+    /// One program header, as
+    /// `(p_type, p_offset, p_vaddr, p_filesz, p_flags, p_align)`.
+    type Phdr = (u64, u64, u64, u64, u64, u64);
+
+    /// Offsets and widths of the header fields the injection tests read and
+    /// write, for the given ELF class.
+    struct Layout {
+        phoff: u64,
+        phoff_off: usize,
+        phentsize_off: usize,
+        phnum_off: usize,
+        phentsize: usize,
+        word: usize,
+        /// Program-header field offsets. The field order differs between the
+        /// two classes (notably `p_flags`, which moves from 4 to 24 in ELF32).
+        p_offset: usize,
+        p_vaddr: usize,
+        p_filesz: usize,
+        p_flags: usize,
+        p_align: usize,
+    }
+
+    fn layout(is_64: bool) -> Layout {
         if is_64 {
-            endian.write_uint(d, po + 4, 4, p_flags);
-            endian.write_uint(d, po + 8, 8, p_off);
-            endian.write_uint(d, po + 16, 8, p_vaddr);
-            endian.write_uint(d, po + 24, 8, p_vaddr);
-            endian.write_uint(d, po + 32, 8, p_filesz);
-            endian.write_uint(d, po + 40, 8, p_filesz);
-            endian.write_uint(d, po + 48, 8, p_align);
+            Layout {
+                phoff: 0x40,
+                phoff_off: 0x20,
+                phentsize_off: 0x36,
+                phnum_off: 0x38,
+                phentsize: 56,
+                word: 8,
+                p_offset: 8,
+                p_vaddr: 16,
+                p_filesz: 32,
+                p_flags: 4,
+                p_align: 48,
+            }
         } else {
-            endian.write_uint(d, po + 4, 4, p_off);
-            endian.write_uint(d, po + 8, 4, p_vaddr);
-            endian.write_uint(d, po + 12, 4, p_vaddr);
-            endian.write_uint(d, po + 16, 4, p_filesz);
-            endian.write_uint(d, po + 20, 4, p_filesz);
-            endian.write_uint(d, po + 24, 4, p_flags);
-            endian.write_uint(d, po + 28, 4, p_align);
+            Layout {
+                phoff: 0x34,
+                phoff_off: 0x1c,
+                phentsize_off: 0x2a,
+                phnum_off: 0x2c,
+                phentsize: 32,
+                word: 4,
+                p_offset: 4,
+                p_vaddr: 8,
+                p_filesz: 16,
+                p_flags: 24,
+                p_align: 28,
+            }
         }
     }
 
-    /// A `Binary` whose bytes carry an ELF header of the given class/endianness
-    /// plus a PT_LOAD and a PT_NOTE, ready for `inject_segment`. The PT_LOAD is
-    /// aligned to `load_align`, as a linker would align it to the target's
-    /// maximum page size.
-    fn craft_injectable_aligned(
-        is_64: bool,
-        endian: Endian,
-        arch: Architecture,
-        load_align: u64,
-    ) -> Binary {
-        let mut d = vec![0u8; 0x400];
+    /// A `Binary` of `len` bytes carrying an ELF header of the class implied by
+    /// `arch` plus `phdrs`, ready for `inject_segment`.
+    fn craft_injectable(endian: Endian, arch: Architecture, len: usize, phdrs: &[Phdr]) -> Binary {
+        let is_64 = arch.is_64();
+        let l = layout(is_64);
+        let mut d = vec![0u8; len];
         d[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
         d[4] = if is_64 { 2 } else { 1 };
         d[5] = match endian {
@@ -909,211 +800,187 @@ mod tests {
             Endian::Big => 2,
         };
         d[6] = 1;
-        let (phoff_off, phentsize_off, phnum_off, phentsize, phoff) = if is_64 {
-            (0x20usize, 0x36, 0x38, 56usize, 0x40u64)
-        } else {
-            (0x1c, 0x2a, 0x2c, 32, 0x34)
-        };
-        let word = if is_64 { 8 } else { 4 };
-        endian.write_uint(&mut d, phoff_off, word, phoff);
-        endian.write_uint(&mut d, phentsize_off, 2, phentsize as u64);
-        endian.write_uint(&mut d, phnum_off, 2, 2);
-        let po = phoff as usize;
-        write_phdr(&mut d, po, is_64, endian, 1, 0, 0x400000, 0x400, 5, load_align);
-        write_phdr(&mut d, po + phentsize, is_64, endian, 4, 0x100, 0x400100, 0x20, 4, 4);
+        endian.write_uint(&mut d, l.phoff_off, l.word, l.phoff);
+        endian.write_uint(&mut d, l.phentsize_off, 2, l.phentsize as u64);
+        endian.write_uint(&mut d, l.phnum_off, 2, phdrs.len() as u64);
+        for (i, &(p_type, p_off, p_vaddr, p_filesz, p_flags, p_align)) in phdrs.iter().enumerate() {
+            let po = l.phoff as usize + i * l.phentsize;
+            endian.write_uint(&mut d, po, 4, p_type);
+            endian.write_uint(&mut d, po + l.p_offset, l.word, p_off);
+            endian.write_uint(&mut d, po + l.p_vaddr, l.word, p_vaddr);
+            endian.write_uint(&mut d, po + l.p_vaddr + l.word, l.word, p_vaddr); // p_paddr
+            endian.write_uint(&mut d, po + l.p_filesz, l.word, p_filesz);
+            endian.write_uint(&mut d, po + l.p_filesz + l.word, l.word, p_filesz); // p_memsz
+            endian.write_uint(&mut d, po + l.p_flags, 4, p_flags);
+            endian.write_uint(&mut d, po + l.p_align, l.word, p_align);
+        }
         Binary {
             data: d,
-            format: BinaryFormat::Elf,
             arch,
-            is_64,
             endian,
             inject_base: None,
         }
     }
 
-    /// `craft_injectable_aligned` for a target linked for 4K pages.
-    fn craft_injectable(is_64: bool, endian: Endian, arch: Architecture) -> Binary {
-        craft_injectable_aligned(is_64, endian, arch, 0x1000)
+    /// The file offset of every program header in `bin`.
+    fn phdr_offsets(bin: &Binary) -> Vec<usize> {
+        let l = layout(bin.is_64());
+        let phoff = bin.endian().read_uint(bin.data(), l.phoff_off, l.word) as usize;
+        let phnum = bin.endian().read_uint(bin.data(), l.phnum_off, 2) as usize;
+        (0..phnum).map(|i| phoff + i * l.phentsize).collect()
     }
+
+    /// The `p_type` of every program header in `bin`.
+    fn phdr_types(bin: &Binary) -> Vec<u64> {
+        phdr_offsets(bin)
+            .into_iter()
+            .map(|po| bin.endian().read_uint(bin.data(), po, 4))
+            .collect()
+    }
+
+    /// Assert that exactly one R+X `PT_LOAD` maps `payload` at `base`, and
+    /// return the file offset of its program header.
+    fn injected_phdr(bin: &Binary, base: u64, payload: &[u8]) -> usize {
+        use goblin::elf::program_header::{PF_R, PF_X, PT_LOAD};
+        let endian = bin.endian();
+        let l = layout(bin.is_64());
+
+        let mut found = None;
+        for po in phdr_offsets(bin) {
+            if endian.read_uint(bin.data(), po, 4) != PT_LOAD as u64
+                || endian.read_uint(bin.data(), po + l.p_vaddr, l.word) != base
+            {
+                continue;
+            }
+            assert!(found.is_none(), "more than one PT_LOAD at {base:#x}");
+            found = Some(po);
+            let p_off = endian.read_uint(bin.data(), po + l.p_offset, l.word) as usize;
+            assert_eq!(
+                endian.read_uint(bin.data(), po + l.p_filesz, l.word),
+                payload.len() as u64
+            );
+            assert_eq!(
+                endian.read_uint(bin.data(), po + l.p_flags, 4),
+                (PF_R | PF_X) as u64
+            );
+            assert_eq!(&bin.data()[p_off..p_off + payload.len()], payload);
+        }
+        found.unwrap_or_else(|| panic!("expected an injected PT_LOAD at {base:#x}"))
+    }
+
+    const PAYLOAD: [u8; 7] = [0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03];
+    const INJECT_AT: u64 = 0x600000;
 
     #[test]
     fn test_inject_segment_all_classes_and_endians() {
+        use goblin::elf::program_header::{PT_LOAD, PT_NOTE};
         let cases = [
-            (true, Endian::Little, Architecture::X86_64),
-            (true, Endian::Big, Architecture::Mips64),
-            (false, Endian::Little, Architecture::Arm),
-            (false, Endian::Big, Architecture::Mips),
+            (Endian::Little, Architecture::X86_64),
+            (Endian::Big, Architecture::Mips64),
+            (Endian::Little, Architecture::Arm),
+            (Endian::Big, Architecture::Mips),
         ];
-        for (is_64, endian, arch) in cases {
-            let mut bin = craft_injectable(is_64, endian, arch);
-            let base = 0x600000u64;
-            let payload = [0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03];
-            bin.inject_segment(base, &payload).unwrap();
+        for (endian, arch) in cases {
+            // One PT_LOAD plus a PT_NOTE for `inject_segment` to convert.
+            let phdrs: [Phdr; 2] = [
+                (PT_LOAD as u64, 0, 0x400000, 0x400, 5, 0x1000),
+                (PT_NOTE as u64, 0x100, 0x400100, 0x20, 4, 4),
+            ];
+            let mut bin = craft_injectable(endian, arch, 0x400, &phdrs);
+            bin.inject_segment(INJECT_AT, &PAYLOAD).unwrap();
 
-            let (phoff_off, phentsize, phnum_off) = if is_64 {
-                (0x20usize, 56usize, 0x38usize)
-            } else {
-                (0x1c, 32, 0x2c)
-            };
-            let word = if is_64 { 8 } else { 4 };
-            let (voff, ooff, szoff, floff) = if is_64 {
-                (16usize, 8usize, 32usize, 4usize)
-            } else {
-                (8, 4, 16, 24)
-            };
-            let phoff = endian.read_uint(bin.data(), phoff_off, word) as usize;
-            let phnum = endian.read_uint(bin.data(), phnum_off, 2) as usize;
-
-            let mut found = false;
-            let mut has_note = false;
-            for i in 0..phnum {
-                let po = phoff + i * phentsize;
-                let ptype = endian.read_uint(bin.data(), po, 4);
-                if ptype == 4 {
-                    has_note = true;
-                }
-                let pvaddr = endian.read_uint(bin.data(), po + voff, word);
-                if ptype == 1 && pvaddr == base {
-                    found = true;
-                    let poff = endian.read_uint(bin.data(), po + ooff, word) as usize;
-                    let filesz = endian.read_uint(bin.data(), po + szoff, word) as usize;
-                    let flags = endian.read_uint(bin.data(), po + floff, 4);
-                    assert_eq!(filesz, payload.len(), "{arch:?}");
-                    assert_eq!(flags, 5, "R|X flags for {arch:?}");
-                    assert_eq!(&bin.data()[poff..poff + payload.len()], &payload, "{arch:?}");
-                }
-            }
-            assert!(found, "no injected PT_LOAD for {arch:?}");
-            assert!(!has_note, "PT_NOTE should be consumed for {arch:?}");
+            injected_phdr(&bin, INJECT_AT, &PAYLOAD);
+            let types = phdr_types(&bin);
+            assert_eq!(types.len(), 2, "table should not have grown for {arch:?}");
+            assert!(
+                !types.contains(&(PT_NOTE as u64)),
+                "PT_NOTE should be consumed for {arch:?}"
+            );
         }
     }
 
-    /// A `Binary` like `craft_injectable`, but with no PT_NOTE — the shape of a
-    /// ELF whose linker never emitted one. There is deliberately a large gap between the end of the
-    /// program-header table and the first PT_LOAD's file offset, mirroring
-    /// the padding real toolchains leave before the first page-aligned
-    /// segment.
-    fn craft_injectable_no_note(is_64: bool, endian: Endian, arch: Architecture) -> Binary {
-        let mut d = vec![0u8; 0x2000];
-        d[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
-        d[4] = if is_64 { 2 } else { 1 };
-        d[5] = match endian {
-            Endian::Little => 1,
-            Endian::Big => 2,
-        };
-        d[6] = 1;
-        let (phoff_off, phentsize_off, phnum_off, phentsize, phoff) = if is_64 {
-            (0x20usize, 0x36, 0x38, 56usize, 0x40u64)
-        } else {
-            (0x1c, 0x2a, 0x2c, 32, 0x34)
-        };
-        let word = if is_64 { 8 } else { 4 };
-        endian.write_uint(&mut d, phoff_off, word, phoff);
-        endian.write_uint(&mut d, phentsize_off, 2, phentsize as u64);
-        endian.write_uint(&mut d, phnum_off, 2, 2);
-        let po = phoff as usize;
-        // Two PT_LOADs, first content starting well past the phdr table —
-        // plenty of unclaimed padding to grow into.
-        write_phdr(&mut d, po, is_64, endian, 1, 0x1000, 0x400000, 0x400, 5, 0x1000);
-        write_phdr(&mut d, po + phentsize, is_64, endian, 1, 0x1400, 0x500000, 0x400, 6, 0x1000);
-        Binary {
-            data: d,
-            format: BinaryFormat::Elf,
-            arch,
-            is_64,
-            endian,
-            inject_base: None,
-}
+    /// The injected segment must be laid out at the target's *own* maximum page
+    /// size, not an assumed 4K. A target linked for 64K pages (every aarch64
+    /// image is) whose segment is only 4K-clear of the image shares a page with
+    /// it under a 16K or 64K kernel, and the kernel's mapping of the injected
+    /// segment silently replaces the image's — typically clobbering `.got`, so
+    /// the dynamic loader segfaults before `main` runs.
+    #[test]
+    fn injected_segment_uses_the_targets_page_size() {
+        use goblin::elf::program_header::{PT_LOAD, PT_NOTE};
+        let align = 0x10000u64;
+        let phdrs: [Phdr; 2] = [
+            (PT_LOAD as u64, 0, 0x400000, 0x400, 5, align),
+            (PT_NOTE as u64, 0x100, 0x400100, 0x20, 4, 4),
+        ];
+        let mut bin = craft_injectable(Endian::Little, Architecture::Arm64, 0x400, &phdrs);
+
+        // The default base clears the image by a full granule of the target's
+        // page size, so no page can be shared with it.
+        let base = bin.injected_base().unwrap();
+        assert_eq!(base % align, 0, "base {base:#x} not aligned to {align:#x}");
+        assert!(base >= 0x400400 + align, "base {base:#x} too close to the image");
+
+        // A 4K-aligned base is not good enough for this target and must be
+        // refused rather than silently producing a broken binary.
+        bin.set_injected_base(Some(0x50_1000));
+        let err = bin.injected_base().unwrap_err().to_string();
+        assert!(err.contains("page size"), "{err}");
+        bin.set_injected_base(None);
+
+        bin.inject_segment(base, &PAYLOAD).unwrap();
+
+        // The loader's constraints have to hold modulo the target's page size,
+        // not 4K.
+        let l = layout(true);
+        let po = injected_phdr(&bin, base, &PAYLOAD);
+        let p_offset = bin.endian().read_uint(bin.data(), po + l.p_offset, l.word);
+        assert_eq!(
+            bin.endian().read_uint(bin.data(), po + l.p_align, l.word),
+            align,
+            "p_align must be the target's page size"
+        );
+        assert_eq!(
+            p_offset % align,
+            base % align,
+            "p_vaddr {base:#x} and p_offset {p_offset:#x} must be congruent mod {align:#x}"
+        );
     }
 
     #[test]
     fn test_inject_segment_grows_phdr_table_without_note() {
-        // Regression test: targets with no PT_NOTE must still be injectable
-        // by growing the program-header table into its own padding, rather
-        // than failing outright.
-        let cases = [
-            (true, Endian::Little, Architecture::X86_64),
-            (false, Endian::Big, Architecture::Mips),
-        ];
-        for (is_64, endian, arch) in cases {
-            let mut bin = craft_injectable_no_note(is_64, endian, arch);
-            let base = 0x600000u64;
-            let payload = [0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03];
-            bin.inject_segment(base, &payload).unwrap();
+        // Regression test: targets with no PT_NOTE must still be injectable by
+        // growing the program-header table into its own padding, rather than
+        // failing outright. The gap between the end of the table and the first
+        // PT_LOAD's file offset mirrors the padding real toolchains leave
+        // before the first page-aligned segment.
+        use goblin::elf::program_header::PT_LOAD;
+        for (endian, arch) in [
+            (Endian::Little, Architecture::X86_64),
+            (Endian::Big, Architecture::Mips),
+        ] {
+            let phdrs: [Phdr; 2] = [
+                (PT_LOAD as u64, 0x1000, 0x400000, 0x400, 5, 0x1000),
+                (PT_LOAD as u64, 0x1400, 0x500000, 0x400, 6, 0x1000),
+            ];
+            let mut bin = craft_injectable(endian, arch, 0x2000, &phdrs);
+            bin.inject_segment(INJECT_AT, &PAYLOAD).unwrap();
 
-            let (phoff_off, phentsize, phnum_off) = if is_64 {
-                (0x20usize, 56usize, 0x38usize)
-            } else {
-                (0x1c, 32, 0x2c)
-            };
-            let word = if is_64 { 8 } else { 4 };
-            let (voff, ooff, szoff, floff) = if is_64 {
-                (16usize, 8usize, 32usize, 4usize)
-            } else {
-                (8, 4, 16, 24)
-            };
-            let phoff = endian.read_uint(bin.data(), phoff_off, word) as usize;
-            let phnum = endian.read_uint(bin.data(), phnum_off, 2) as usize;
-            assert_eq!(phnum, 3, "table should have grown by one entry for {arch:?}");
-
-            let mut found = false;
-            for i in 0..phnum {
-                let po = phoff + i * phentsize;
-                let ptype = endian.read_uint(bin.data(), po, 4);
-                let pvaddr = endian.read_uint(bin.data(), po + voff, word);
-                if ptype == 1 && pvaddr == base {
-                    found = true;
-                    let poff = endian.read_uint(bin.data(), po + ooff, word) as usize;
-                    let filesz = endian.read_uint(bin.data(), po + szoff, word) as usize;
-                    let flags = endian.read_uint(bin.data(), po + floff, 4);
-                    assert_eq!(filesz, payload.len(), "{arch:?}");
-                    assert_eq!(flags, 5, "R|X flags for {arch:?}");
-                    assert_eq!(&bin.data()[poff..poff + payload.len()], &payload, "{arch:?}");
-                }
-            }
-            assert!(found, "no injected PT_LOAD for {arch:?}");
+            injected_phdr(&bin, INJECT_AT, &PAYLOAD);
+            assert_eq!(phdr_types(&bin).len(), 3, "table should have grown for {arch:?}");
         }
     }
 
     #[test]
     fn test_inject_segment_no_note_no_room_errors() {
         // When there's no PT_NOTE *and* no padding to grow into, injection
-        // must fail with a clear error instead of corrupting the file.
-        let endian = Endian::Little;
-        let mut d = vec![0u8; 0x100];
-        d[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
-        d[4] = 2;
-        d[5] = 1;
-        d[6] = 1;
-        let (phoff_off, phentsize_off, phnum_off, phentsize, phoff) =
-            (0x20usize, 0x36, 0x38, 56usize, 0x40u64);
-        endian.write_uint(&mut d, phoff_off, 8, phoff);
-        endian.write_uint(&mut d, phentsize_off, 2, phentsize as u64);
-        endian.write_uint(&mut d, phnum_off, 2, 1);
-        // A single PT_LOAD whose file offset sits immediately after the
-        // table's one entry — zero padding available.
-        let po = phoff as usize;
-        write_phdr(
-            &mut d,
-            po,
-            true,
-            endian,
-            1,
-            po as u64 + phentsize as u64,
-            0x400000,
-            0x40,
-            5,
-            0x1000,
-        );
-        let mut bin = Binary {
-            data: d,
-            format: BinaryFormat::Elf,
-            arch: Architecture::X86_64,
-            is_64: true,
-            endian,
-            inject_base: None,
-};
-        let err = bin.inject_segment(0x600000, &[0xde, 0xad]).unwrap_err();
+        // must fail with a clear error instead of corrupting the file. The
+        // single PT_LOAD's content starts immediately after the table's one
+        // entry, so zero padding is available.
+        use goblin::elf::program_header::PT_LOAD;
+        let phdrs: [Phdr; 1] = [(PT_LOAD as u64, 0x40 + 56, 0x400000, 0x40, 5, 0x1000)];
+        let mut bin = craft_injectable(Endian::Little, Architecture::X86_64, 0x100, &phdrs);
+        let err = bin.inject_segment(INJECT_AT, &[0xde, 0xad]).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("no PT_NOTE") && msg.contains("padding"),

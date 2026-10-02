@@ -392,9 +392,9 @@ fn apply_mips(
     Ok(())
 }
 
-/// Map an `object` crate architecture/endianness/class to ours, for verifying
-/// that an rlib member matches the target it is being spliced into.
-pub fn describe(arch: Architecture, endian: Endian, is_64: bool) -> String {
+/// Render an architecture and byte order for diagnostics, used when reporting
+/// that an rlib member does not match the target it is being spliced into.
+pub fn describe(arch: Architecture, endian: Endian) -> String {
     let a = match arch {
         Architecture::X86 => "x86",
         Architecture::X86_64 => "x86-64",
@@ -407,7 +407,7 @@ pub fn describe(arch: Architecture, endian: Endian, is_64: bool) -> String {
         Endian::Little => "LE",
         Endian::Big => "BE",
     };
-    let c = if is_64 { "64-bit" } else { "32-bit" };
+    let c = if arch.is_64() { "64-bit" } else { "32-bit" };
     format!("{a} ({e}, {c})")
 }
 
