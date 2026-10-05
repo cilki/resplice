@@ -138,6 +138,29 @@ fn is_splice_section<'a, S: ObjectSection<'a>>(section: &S) -> bool {
     matches!(section.name(), Ok(n) if n.starts_with(".rspl."))
 }
 
+/// Whether a section is still writable once the target is running, and so
+/// cannot live in the injected segment (which is mapped read-only + executable).
+///
+/// `SHF_WRITE` alone is not the answer. RELRO sections (`.data.rel.ro*`) carry
+/// *immutable* data that merely contains pointers: they are writable only for as
+/// long as the dynamic linker needs to relocate them, and are mapped read-only
+/// before any user code runs. `resplice` resolves those relocations statically,
+/// so by the time the target executes there is nothing left to write — they are
+/// read-only data and belong in the injected segment like any other `.rodata`.
+///
+/// rustc puts an immutable `static` holding a reference (`static NAMES: [&T; 2]`)
+/// there, as well as the `core::panic::Location` records behind a bounds check,
+/// so rejecting them would turn ordinary Rust into an error.
+fn is_runtime_writable<'a, S: ObjectSection<'a>>(section: &S) -> bool {
+    match section.kind() {
+        SectionKind::Data | SectionKind::UninitializedData => !matches!(
+            section.name(),
+            Ok(n) if n == ".data.rel.ro" || n.starts_with(".data.rel.ro.")
+        ),
+        _ => false,
+    }
+}
+
 /// Parse a `.rspl.<begin>.<end>` section name into its `(begin, end)` range.
 fn splice_range(name: &str) -> Option<(u64, u64)> {
     let rest = name.strip_prefix(".rspl.")?;
@@ -245,8 +268,7 @@ fn link_object(
                 splice: splice_range(&name),
                 name,
                 align: section.align().max(1),
-                writable: section.kind() == SectionKind::Data
-                    || section.kind() == SectionKind::UninitializedData,
+                writable: is_runtime_writable(&section),
                 bytes: section.data().unwrap_or(&[]).to_vec(),
                 relocs,
             },
@@ -817,5 +839,108 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("aarch64"), "message was {msg:?}");
         assert!(msg.contains("x86-64"), "message was {msg:?}");
+    }
+
+    const STR_DATA: [u8; 4] = *b"abc\0";
+    /// An 8-byte splice: `lea rax, [rip + NAMES]` (operand@3); `ret`.
+    const PTR_SPLICE_CODE: [u8; 8] = [0x48, 0x8d, 0x05, 0, 0, 0, 0, 0xc3];
+
+    /// An rlib whose splice reads a `static` that itself holds a pointer. rustc
+    /// emits such a `static` into a `SHF_WRITE` `.data.rel.ro` section (named
+    /// `data_section` here so the same builder can produce genuinely mutable
+    /// data), with a relocation for the pointer it contains.
+    fn build_rlib_relro(data_section: &str) -> Vec<u8> {
+        use object::write::{Object, Relocation, Symbol, SymbolSection as WSection};
+        use object::{
+            Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolFlags,
+            SymbolKind, SymbolScope,
+        };
+
+        let mut obj = Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+
+        let strs = obj.add_section(vec![], b".rodata.str1.1".to_vec(), SectionKind::ReadOnlyData);
+        obj.append_section_data(strs, &STR_DATA, 1);
+        let str_sym = obj.section_symbol(strs);
+
+        // `static NAMES: &[u8; 4] = &STR;` — one pointer, relocated at link time.
+        let names_sec =
+            obj.add_section(vec![], data_section.as_bytes().to_vec(), SectionKind::Data);
+        obj.append_section_data(names_sec, &[0u8; 8], 8);
+        let names_sym = obj.add_symbol(Symbol {
+            name: b"NAMES".to_vec(),
+            value: 0,
+            size: 8,
+            kind: SymbolKind::Data,
+            scope: SymbolScope::Compilation,
+            weak: false,
+            section: WSection::Section(names_sec),
+            flags: SymbolFlags::None,
+        });
+        obj.add_relocation(
+            names_sec,
+            Relocation {
+                offset: 0,
+                symbol: str_sym,
+                addend: 0,
+                flags: RelocationFlags::Elf { r_type: object::elf::R_X86_64_64 },
+            },
+        )
+        .unwrap();
+
+        let name = format!(".rspl.{SPLICE_VA:x}.{:x}", SPLICE_VA + 0x20).into_bytes();
+        let rspl = obj.add_section(vec![], name, SectionKind::Text);
+        obj.append_section_data(rspl, &PTR_SPLICE_CODE, 16);
+        obj.add_relocation(
+            rspl,
+            Relocation {
+                offset: 3,
+                symbol: names_sym,
+                addend: -4,
+                flags: RelocationFlags::Elf { r_type: object::elf::R_X86_64_PC32 },
+            },
+        )
+        .unwrap();
+
+        ar_wrap("splice.o", &obj.write().unwrap())
+    }
+
+    /// RELRO data is only writable while a dynamic linker relocates it, and
+    /// `resplice` does that statically — so it must be injected like `.rodata`,
+    /// not rejected as mutable. Rejecting it would fail on an ordinary immutable
+    /// `static` that happens to contain a reference.
+    #[test]
+    fn test_link_rlib_injects_relro_data() {
+        let (bin, applied) = run_link(&build_rlib_relro(".data.rel.ro.NAMES"));
+        assert_eq!(applied.len(), 1);
+        assert!(!applied[0].trampoline);
+
+        // Follow `lea rax, [rip + NAMES]` to the injected `static`.
+        let d = bin.data();
+        assert_eq!(d[0x1000 + 2], 0x05, "lea opcode");
+        let disp = i32::from_le_bytes(d[0x1003..0x1007].try_into().unwrap());
+        let names_va = (SPLICE_VA as i64 + 7 + disp as i64) as u64;
+        assert!(names_va >= INJECT_BASE, "RELRO data not in injected segment");
+
+        // The pointer it holds must have been relocated to the injected string.
+        let noff = bin.va_to_offset(names_va).unwrap();
+        let str_va = u64::from_le_bytes(d[noff..noff + 8].try_into().unwrap());
+        assert!(str_va >= INJECT_BASE, "pointer {str_va:#x} not relocated");
+        let soff = bin.va_to_offset(str_va).unwrap();
+        assert_eq!(&d[soff..soff + STR_DATA.len()], &STR_DATA);
+    }
+
+    /// Data that really is mutable at runtime still has to be refused: the
+    /// injected segment is mapped read-only.
+    #[test]
+    fn test_link_rlib_rejects_mutable_data() {
+        let rlib_path = temp_path("rlib_mutable");
+        fs::write(&rlib_path, build_rlib_relro(".data.COUNTER")).unwrap();
+        let mut bin = load(&crafted_target());
+        let err = link_rlib(&mut bin, &rlib_path).unwrap_err();
+        fs::remove_file(&rlib_path).ok();
+
+        let msg = err.to_string();
+        assert!(msg.contains("writable section"), "message was {msg:?}");
+        assert!(msg.contains(".data.COUNTER"), "message was {msg:?}");
     }
 }
