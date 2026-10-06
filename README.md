@@ -88,7 +88,11 @@ Build it to an rlib and apply it to the target binary:
 ```sh
 cargo build --release              # produces target/release/libyourcrate.rlib
 resplice ./original-binary target/release/libyourcrate.rlib ./patched-binary
+./patched-binary                   # runnable: it keeps the original's mode
 ```
+
+The patched copy is written with the permissions of the original binary, so an
+executable in gives an executable out and there is no `chmod` step.
 
 See `examples/adder` for a complete crate.
 

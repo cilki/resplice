@@ -13,8 +13,13 @@
 ## binary too -- which means this assembly is host-specific. Covering more than
 ## x86-64 is not pedantry: the injected segment's layout depends on the target's
 ## page size, and only a non-4K-page host (every aarch64 kernel) exercises that.
+##
+## Also clears the artifacts of any previous test, so an assertion about
+## `prog.patched` -- that resplice left it executable, say -- cannot be
+## satisfied by a leftover file from an earlier one.
 writeComputeAsm() {
 	local pad=$1 fn_type ret41
+	rm -f prog prog.patched
 	case "$(uname -m)" in
 	x86_64 | i?86)
 		fn_type='.type compute,@function'
@@ -58,7 +63,9 @@ testSpliceSelfContained() {
 	[ -f target/release/libadder.rlib ]
 
 	target/release/resplice ./prog target/release/libadder.rlib ./prog.patched
-	chmod +x ./prog.patched
+	# Deliberately no `chmod`: resplice reproduces the target's mode on the
+	# output, so the patched binary runs as it comes out of the tool.
+	[ -x ./prog.patched ]
 	[ "$(./prog.patched)" = "42" ]
 }
 
@@ -98,7 +105,7 @@ testSpliceResolvesRelocations() {
 	[ -f target/release/libadder.rlib ]
 
 	target/release/resplice ./prog target/release/libadder.rlib ./prog.patched
-	chmod +x ./prog.patched
+	[ -x ./prog.patched ]
 	[ "$(./prog.patched)" = "2107" ]
 }
 
@@ -137,7 +144,7 @@ testSpliceInjectsReferenceHoldingStatic() {
 	[ -f target/release/libadder.rlib ]
 
 	target/release/resplice ./prog target/release/libadder.rlib ./prog.patched
-	chmod +x ./prog.patched
+	[ -x ./prog.patched ]
 	[ "$(./prog.patched)" = "87" ]
 }
 
@@ -177,6 +184,6 @@ testSpliceTrampolinesWhenOversized() {
 	[ -f target/release/libadder.rlib ]
 
 	target/release/resplice ./prog target/release/libadder.rlib ./prog.patched
-	chmod +x ./prog.patched
+	[ -x ./prog.patched ]
 	[ "$(./prog.patched)" = "2107" ]
 }
