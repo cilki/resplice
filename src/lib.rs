@@ -1,6 +1,6 @@
 pub use anyhow::Result;
 
-use anyhow::{anyhow, bail};
+use anyhow::{anyhow, bail, Context};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -64,6 +64,9 @@ pub struct Binary {
     /// Operator-supplied virtual address for the injected segment, overriding
     /// [`Binary::injected_base`]'s default. See [`Binary::set_injected_base`].
     inject_base: Option<u64>,
+    /// Permissions of the file [`Binary::load`] read, re-applied by
+    /// [`Binary::save`]. `None` for a `Binary` not loaded from a file.
+    perms: Option<fs::Permissions>,
 }
 
 /// What a name the target defines resolves to.
@@ -256,20 +259,31 @@ impl Architecture {
 }
 
 impl Binary {
-    /// Load a binary file from disk
+    /// Load a binary file from disk.
+    ///
+    /// The file's permissions are remembered so [`Binary::save`] can reproduce
+    /// them on the patched copy.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let data = fs::read(path)?;
+        let path = path.as_ref();
+        let data = fs::read(path)
+            .with_context(|| format!("failed to read target {}", path.display()))?;
         let (arch, endian) = Self::detect_arch(&data)?;
-        Ok(Self::new(data, arch, endian))
+        let mut binary = Self::new(data, arch, endian);
+        binary.perms = fs::metadata(path).ok().map(|m| m.permissions());
+        Ok(binary)
     }
 
     /// Wrap an image already held in memory.
+    ///
+    /// `perms` is `None`: an image that did not come from a file has no mode for
+    /// [`Binary::save`] to carry over.
     fn new(data: Vec<u8>, arch: Architecture, endian: Endian) -> Self {
         Binary {
             data,
             arch,
             endian,
             inject_base: None,
+            perms: None,
         }
     }
 
@@ -490,9 +504,22 @@ impl Binary {
         }
     }
 
-    /// Save the patched binary to disk
+    /// Save the patched binary to disk, carrying over the permissions of the
+    /// file it was loaded from.
+    ///
+    /// The whole point of a patched *executable* is that it runs, and a fresh
+    /// file gets the process umask (`0644` typically) rather than the original's
+    /// mode — so without this the output is unrunnable and the caller has to
+    /// know to `chmod +x` it. An output path that already exists is overwritten
+    /// mode and all, so the result does not depend on what was there before.
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        fs::write(path, &self.data)?;
+        let path = path.as_ref();
+        fs::write(path, &self.data)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        if let Some(perms) = self.perms.clone() {
+            fs::set_permissions(path, perms)
+                .with_context(|| format!("failed to set permissions on {}", path.display()))?;
+        }
         Ok(())
     }
 
@@ -1338,6 +1365,54 @@ mod tests {
         data[4] = 1; // ELFCLASS32 alongside e_machine = EM_X86_64
         let err = Binary::detect_arch(&data).unwrap_err();
         assert!(err.to_string().contains("contradicts"), "{err}");
+    }
+
+    /// The patched copy of an executable must itself be executable. A freshly
+    /// created file gets `0666 & !umask`, so without carrying the original's
+    /// mode over the output of the whole tool cannot be run.
+    #[cfg(unix)]
+    #[test]
+    fn save_carries_over_the_originals_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("resplice_perms_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let original = dir.join("original");
+        fs::write(&original, create_minimal_elf()).unwrap();
+        fs::set_permissions(&original, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let binary = Binary::load(&original).unwrap();
+
+        // A path that does not exist yet: the mode comes from the original
+        // rather than from the umask.
+        let fresh = dir.join("fresh");
+        binary.save(&fresh).unwrap();
+        assert_eq!(fs::metadata(&fresh).unwrap().permissions().mode() & 0o777, 0o755);
+
+        // A path that does exist: it is overwritten mode and all, so the result
+        // does not depend on whatever was there before.
+        let stale = dir.join("stale");
+        fs::write(&stale, b"junk").unwrap();
+        fs::set_permissions(&stale, fs::Permissions::from_mode(0o600)).unwrap();
+        binary.save(&stale).unwrap();
+        assert_eq!(fs::metadata(&stale).unwrap().permissions().mode() & 0o777, 0o755);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Three paths go in on the command line; a failure to read one of them has
+    /// to say which.
+    #[test]
+    fn load_names_the_target_it_could_not_read() {
+        let missing = std::env::temp_dir().join("resplice_no_such_target_xyz");
+        let err = match Binary::load(&missing) {
+            Err(e) => e,
+            Ok(_) => panic!("loading {} should have failed", missing.display()),
+        };
+        assert!(
+            format!("{err:#}").contains("resplice_no_such_target_xyz"),
+            "{err:#}"
+        );
     }
 
     #[test]

@@ -105,10 +105,15 @@ symRange() {
 }
 
 ## Patch the throwaway target with every splice in the built rlib.
+##
+## Deliberately no `chmod`: `resplice` reproduces the target's mode on the
+## output, so the patched binary runs as it comes out of the tool. `newFixture`
+## removes the previous case's `prog.patched`, so this cannot pass on a stale
+## file an earlier case left executable.
 applySplices() {
 	target/release/resplice "$fixture/prog" target/release/libfixture.rlib \
 		"$fixture/prog.patched"
-	chmod +x "$fixture/prog.patched"
+	[ -x "$fixture/prog.patched" ]
 }
 
 ## A self-contained splice (no relocations): the Rust body is a constant, so its
