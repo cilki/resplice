@@ -12,8 +12,11 @@ use syn::{parse_macro_input, Expr, Item, Lit, Meta};
 ///
 /// # Arguments
 ///
-/// * `begin` - The starting address of the code to replace
-/// * `end` - The ending address of the code to replace
+/// Both are **virtual addresses** in the target image, and the range is
+/// half-open: `[begin, end)`.
+///
+/// * `begin` - Address of the first byte to replace
+/// * `end` - Address just past the last byte to replace
 ///
 /// # Example
 ///
@@ -22,8 +25,11 @@ use syn::{parse_macro_input, Expr, Item, Lit, Meta};
 /// are added automatically when absent, so the annotated function can be written
 /// as a plain `fn`; an explicitly written visibility or ABI is left untouched.
 ///
+/// Replacing a function whose last instruction is a four-byte `ret` at `0x1680`
+/// means an `end` of `0x1684`, not `0x1680`:
+///
 /// ```ignore
-/// #[Splice(begin = 0x1670, end = 0x1680)]
+/// #[Splice(begin = 0x1670, end = 0x1684)]
 /// fn add_one_plus_one() -> i32 {
 ///     1 + 1
 /// }

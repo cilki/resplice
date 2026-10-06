@@ -3,10 +3,17 @@
 //! pairing) that the generic driver in [`crate::link`] needs to stay
 //! architecture-agnostic.
 //!
-//! Only x86-64 is exercised end-to-end in this repository; the AArch64, ARM and
-//! MIPS encoders are implemented from their ABI documents and pinned by unit
-//! tests that assert exact instruction-field encodings. MIPS in particular is
-//! spec-derived and has known gaps (see [`apply_mips`]).
+//! x86-64 and AArch64 are exercised end-to-end in this repository
+//! (`tests/resplice.test` assembles its throwaway target for the host, so a run
+//! covers whichever of the two it runs on). The ARM and MIPS encoders are
+//! implemented from their ABI documents and pinned only by unit tests that
+//! assert exact instruction-field encodings. MIPS in particular is spec-derived
+//! and has known gaps (see [`apply_mips`]).
+//!
+//! 32-bit x86 is routed through [`apply_x86_64`], whose `R_X86_64_*` type
+//! numbers do not mean the same things as i386's `R_386_*` (`R_386_32` and
+//! `R_X86_64_64` are both type 1), so i386 objects with absolute relocations
+//! are mis-linked rather than rejected.
 
 use crate::Architecture;
 use anyhow::{anyhow, bail, Result};

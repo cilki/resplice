@@ -111,7 +111,8 @@ of item is a compile error — `#[Splice]` accepts only `fn` and `static`.
 ### Placing the injected segment
 
 By default the injected segment is mapped one page past the end of the target's
-image. That is only safe when nothing else claims that address, and often
+image — one *target* page, which is 64K on a typical aarch64 image rather than
+4K. That is only safe when nothing else claims that address, and often
 something does: a binary whose allocator hands out memory from the end of
 `.bss` will overwrite the injected code and data on its first large allocation.
 Pass a known-free address instead:
@@ -125,8 +126,23 @@ among its `PT_LOAD` segments, which is 64K for a typical aarch64 image rather
 than 4K. `resplice` rejects a misaligned base instead of emitting a binary the
 loader would refuse.
 
-Note that the segment is mapped read+execute, so referenced *writable* data
-(mutable `static`s, `.bss`) is not supported yet and is reported as an error.
+### What the injected segment can hold
+
+The segment is mapped read+execute, so only data that is immutable at run time
+can go in it. That is not the same as "not `SHF_WRITE`": an immutable `static`
+holding references (`static NAMES: [&[u8; 4]; 2] = [&A, &B]`) is emitted into
+`.data.rel.ro`, and so are the `core::panic::Location` records behind a bounds
+check. Those are writable only for as long as a dynamic linker needs to
+relocate them — `resplice` resolves their pointers statically — so they are
+injected like any other `.rodata`.
+
+Data that really is mutable at run time (`static mut`, `.bss`) is still
+unsupported and reported as an error:
+
+```
+error: splice references writable section ".data._ZN4demo5COUNT17h…E.0";
+injecting writable data (mutable statics/.bss) is not yet supported
+```
 
 ### Cross-compiling for another architecture
 
@@ -144,3 +160,38 @@ resplice ./aarch64-binary \
     ./patched
 ```
 
+`resplice` refuses an rlib whose architecture or byte order differs from the
+target's rather than splicing in machine code the target cannot run:
+
+```
+error: rlib is aarch64 (LE, 64-bit) but target is x86-64 (LE, 64-bit)
+```
+
+## Supported targets
+
+The target must be an **ELF** image; anything else is rejected while loading.
+Within ELF, how far support goes varies by architecture:
+
+| Architecture | Status |
+| --- | --- |
+| x86-64 | Exercised end-to-end by the test suite |
+| AArch64 | Exercised end-to-end by the test suite |
+| ARM (32-bit) | Relocation encoders written from the ABI, unit-tested only |
+| MIPS / MIPS64 (LE and BE) | As ARM, plus the gaps below |
+| x86 (32-bit) | Detected, but mis-linked — see below |
+
+`tests/resplice.test` builds its throwaway target out of host assembly, so one
+run covers whichever of x86-64 or AArch64 it runs on; covering both means
+running it on both. AArch64 is worth running specifically because its 64K
+`p_align` is what exercises the non-4K segment layout.
+
+Known gaps:
+
+- **MIPS `$gp`-relative GOT relocations** (`R_MIPS_GOT16` and friends) index
+  the target's own GOT, which the injected segment cannot extend, so they are
+  rejected rather than mis-resolved. Splices that only call target-*defined*
+  symbols are the reliable path on MIPS.
+- **32-bit x86** object files are decoded with the x86-64 relocation table,
+  where the type numbers mean different things (`R_386_32` and `R_X86_64_64`
+  are both type 1). An i386 rlib with absolute relocations is therefore
+  mis-linked; treat i386 as unsupported until that is fixed.
