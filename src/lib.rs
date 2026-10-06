@@ -121,26 +121,27 @@ impl Binary {
             ));
         }
 
-        let end_pos = offset + code.len();
-        if offset + region_len > self.data.len() {
-            return Err(anyhow!(
-                "patch region {:#x}..{:#x} is outside the binary",
-                offset,
-                offset + region_len
-            ));
-        }
+        // Checked, not `offset + region_len`: both come from addresses in a
+        // splice section's name, and a wrapping sum here would pass for in
+        // bounds and leave the NOP fill below running off the end of the buffer.
+        let region_end = offset
+            .checked_add(region_len)
+            .filter(|&end| end <= self.data.len())
+            .ok_or_else(|| {
+                anyhow!("patch region {offset:#x}..+{region_len:#x} is outside the binary")
+            })?;
 
+        let end_pos = offset + code.len();
         self.data[offset..end_pos].copy_from_slice(code);
 
         // If the new code is smaller than the region, fill the rest with NOPs.
-        if code.len() < region_len {
+        if end_pos < region_end {
             let nop_insn = self.get_nop_instruction();
-            let remaining = offset + region_len - end_pos;
-            let mut written = 0;
-            while written < remaining {
-                let n = std::cmp::min(nop_insn.len(), remaining - written);
-                self.data[end_pos + written..end_pos + written + n].copy_from_slice(&nop_insn[..n]);
-                written += n;
+            let mut pos = end_pos;
+            while pos < region_end {
+                let n = std::cmp::min(nop_insn.len(), region_end - pos);
+                self.data[pos..pos + n].copy_from_slice(&nop_insn[..n]);
+                pos += n;
             }
         }
 
@@ -660,6 +661,24 @@ mod tests {
         };
 
         assert!(binary.patch_bytes(96, 14, &[0x90; 5]).is_err());
+    }
+
+    /// `region_len` comes from the addresses in a splice section's name. A
+    /// region so long that `offset + region_len` wraps must be refused rather
+    /// than wrapping into something that looks in bounds, which would leave the
+    /// NOP fill writing past the end of the image.
+    #[test]
+    fn test_patch_bytes_region_length_cannot_wrap_past_the_bounds_check() {
+        let mut binary = Binary {
+            data: vec![0; 100],
+            arch: Architecture::X86_64,
+            endian: Endian::Little,
+            inject_base: None,
+        };
+
+        let err = binary.patch_bytes(10, usize::MAX - 5, &[0xAA]).unwrap_err();
+        assert!(err.to_string().contains("outside the binary"));
+        assert!(binary.data.iter().all(|&b| b == 0), "binary was modified");
     }
 
     #[test]
