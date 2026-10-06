@@ -102,6 +102,45 @@ testSpliceResolvesRelocations() {
 	[ "$(./prog.patched)" = "2107" ]
 }
 
+## A splice reading an immutable `static` that holds references. rustc emits
+## such a static into a `SHF_WRITE` `.data.rel.ro` section, because the pointers
+## it contains need relocating -- but it is read-only by the time the program
+## runs, and resplice resolves those pointers itself, so it has to be injected
+## like any other `.rodata` rather than refused as mutable data.
+testSpliceInjectsReferenceHoldingStatic() {
+	writeComputeAsm 96
+	printf '%s\n' '#include <stdio.h>' 'int compute(int x);' \
+		'int main(void){ printf("%d\n", compute(1)); return 0; }' > prog.c
+	cc -fcf-protection=none -no-pie -O2 -o prog prog.c compute.s
+
+	[ "$(./prog)" = "41" ]
+
+	va=$(readelf -sW prog | awk '$8=="compute"{ print strtonum("0x" $2); exit }')
+	size=$(readelf -sW prog | awk '$8=="compute"{ print $3; exit }')
+	end=$((va + size))
+
+	# NAMES[1] is `WXYZ`, whose first byte is 'W' (87). Indexing with a runtime
+	# argument keeps the load out of the constant folder, so the splice really
+	# does reference NAMES.
+	{
+		printf 'use resplice_macros::Splice;\n'
+		printf 'static A: [u8; 4] = *b"abcd";\n'
+		printf 'static B: [u8; 4] = *b"WXYZ";\n'
+		printf 'static NAMES: [&[u8; 4]; 2] = [&A, &B];\n'
+		printf '#[Splice(begin = %d, end = %d)]\n' "$va" "$end"
+		printf 'pub extern "C" fn compute(x: i32) -> i32 {\n'
+		printf '    let name = unsafe { *NAMES.get_unchecked((x & 1) as usize) };\n'
+		printf '    name[0] as i32\n'
+		printf '}\n'
+	} > examples/adder/src/lib.rs
+	cargo build --release -p adder
+	[ -f target/release/libadder.rlib ]
+
+	target/release/resplice ./prog target/release/libadder.rlib ./prog.patched
+	chmod +x ./prog.patched
+	[ "$(./prog.patched)" = "87" ]
+}
+
 ## An oversized splice: the same relocation-heavy replacement, but the target's
 ## `compute` is only a few bytes — too small to hold it. The full function is
 ## relocated into the injected segment and a jump (trampoline) is written at the
