@@ -109,7 +109,25 @@ pub fn mips_lo16_addend(endian: Endian, buf: &[u8], off: usize) -> i64 {
     (insn & 0xffff) as i16 as i64
 }
 
+/// Width of the field the encoder for `r_type` reads and writes at the
+/// relocated offset: eight bytes for the handful of 64-bit relocations, and a
+/// four-byte instruction (or word) for everything else, including the types
+/// [`apply`] goes on to reject.
+fn field_width(arch: Architecture, r_type: RelocationType) -> usize {
+    let wide = match arch {
+        Architecture::X86 | Architecture::X86_64 => matches!(r_type, R_X86_64_64 | R_X86_64_PC64),
+        Architecture::Arm64 => matches!(r_type, R_AARCH64_ABS64 | R_AARCH64_PREL64),
+        Architecture::Arm => false,
+        Architecture::Mips | Architecture::Mips64 => r_type == R_MIPS_64,
+    };
+    if wide { 8 } else { 4 }
+}
+
 /// Apply one relocation, writing the resolved field into `buf` at `off`.
+///
+/// `buf` is the section the relocation belongs to, and nothing beyond it: the
+/// field at `off` is required to lie inside it, so a malformed object cannot
+/// reach past the section it is relocating.
 ///
 /// - `s` is the resolved symbol virtual address, `a` the explicit RELA addend
 ///   (0 for REL — those addends live in the instruction and are recovered here),
@@ -132,6 +150,15 @@ pub fn apply(
     has_implicit: bool,
     pair_lo: Option<i64>,
 ) -> Result<()> {
+    let width = field_width(arch, r_type);
+    if off.checked_add(width).is_none_or(|end| end > buf.len()) {
+        bail!(
+            "relocation at offset {off:#x} has a {width}-byte field that runs past the \
+             end of its {}-byte section",
+            buf.len()
+        );
+    }
+
     match arch {
         Architecture::X86 | Architecture::X86_64 => {
             apply_x86_64(endian, r_type, buf, off, s, a, p, got_va)
@@ -447,6 +474,27 @@ mod tests {
         assert_eq!(Endian::Big.read_uint(&b, 0, 4), 0x1122_3344);
         Endian::Little.write_uint(&mut b, 0, 8, 0x1122_3344_5566_7788);
         assert_eq!(Endian::Little.read_uint(&b, 0, 8), 0x1122_3344_5566_7788);
+    }
+
+    /// `buf` is the relocation's own section, so a field that does not fit
+    /// inside it is an error -- never a write into the bytes that follow.
+    #[test]
+    fn field_outside_its_section_is_rejected() {
+        let (a, le) = (Architecture::X86_64, Endian::Little);
+        let mut buf = [0u8; 8];
+
+        // An 8-byte ABS64 field needs the whole buffer; one byte in, it does not
+        // fit, even though the 4-byte relocation types still would.
+        let err = apply(a, le, R_X86_64_64, &mut buf, 1, 0x1234, 0, 0, None, false, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("runs past the end"), "message was {err:?}");
+        assert!(buf.iter().all(|&b| b == 0), "buffer was written to");
+
+        apply(a, le, R_X86_64_32, &mut buf, 4, 0x1234, 0, 0, None, false, None).unwrap();
+        assert!(apply(a, le, R_X86_64_32, &mut buf, 5, 0x1234, 0, 0, None, false, None).is_err());
+        // An offset at or past the end is rejected rather than wrapping.
+        assert!(apply(a, le, R_X86_64_32, &mut buf, usize::MAX, 0, 0, 0, None, false, None).is_err());
     }
 
     #[test]

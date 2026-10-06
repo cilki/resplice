@@ -83,6 +83,27 @@ pub fn link_rlib(binary: &mut Binary, rlib_path: &Path) -> Result<Vec<Applied>> 
         link_object(&obj, binary, base, &mut blob, &mut patches)?;
     }
 
+    // Two splices claiming overlapping ranges cannot both survive: each patch
+    // NOP-fills the whole of its own region, so whichever is written last erases
+    // part of the other's code. Nothing downstream would notice, and the result
+    // depends on the order the rlib's sections happened to be visited in, so
+    // refuse rather than emit a silently corrupt binary. Checked before anything
+    // is written. Sorting also makes the report below independent of that order.
+    patches.sort_by_key(|p| (p.begin, p.end));
+    for pair in patches.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        if b.begin < a.end {
+            bail!(
+                "splices {:#x}..{:#x} and {:#x}..{:#x} overlap; each one NOP-fills its \
+                 whole region, so they would overwrite each other",
+                a.begin,
+                a.end,
+                b.begin,
+                b.end
+            );
+        }
+    }
+
     if !blob.is_empty() {
         binary.inject_segment(base, &blob)?;
     }
@@ -162,10 +183,32 @@ fn is_runtime_writable<'a, S: ObjectSection<'a>>(section: &S) -> bool {
 }
 
 /// Parse a `.rspl.<begin>.<end>` section name into its `(begin, end)` range.
-fn splice_range(name: &str) -> Option<(u64, u64)> {
-    let rest = name.strip_prefix(".rspl.")?;
-    let (b, e) = rest.split_once('.')?;
-    Some((u64::from_str_radix(b, 16).ok()?, u64::from_str_radix(e, 16).ok()?))
+///
+/// `end <= begin` is refused. `#[Splice]` already rejects such a range at
+/// compile time, but the name is read back out of an arbitrary rlib file, and
+/// `end - begin` is used as a region *length* throughout: an unsigned underflow
+/// there yields a region spanning most of the address space, which slips past
+/// `patch_bytes`' bounds check by overflowing it.
+fn splice_range(name: &str) -> Result<Option<(u64, u64)>> {
+    let Some(rest) = name.strip_prefix(".rspl.") else {
+        return Ok(None);
+    };
+    let parsed = rest.split_once('.').and_then(|(b, e)| {
+        Some((
+            u64::from_str_radix(b, 16).ok()?,
+            u64::from_str_radix(e, 16).ok()?,
+        ))
+    });
+    let Some((begin, end)) = parsed else {
+        bail!("splice section {name:?} does not name a `.rspl.<begin>.<end>` range");
+    };
+    if end <= begin {
+        bail!(
+            "splice section {name:?} has an empty or reversed range \
+             ({begin:#x}..{end:#x}); `end` must be past `begin`"
+        );
+    }
+    Ok(Some((begin, end)))
 }
 
 /// Verify that an rlib object member targets the same architecture and byte
@@ -203,7 +246,13 @@ fn verify_arch(obj: &object::File, target: &Binary) -> Result<()> {
 fn find_pair_lo(arch: Architecture, sec: &Sec, sym: usize, endian: Endian) -> Option<i64> {
     sec.relocs
         .iter()
-        .find(|r| arch::is_mips_lo16(arch, r.r_type) && r.sym == sym)
+        .find(|r| {
+            arch::is_mips_lo16(arch, r.r_type)
+                && r.sym == sym
+                // The instruction is read straight out of the section, so an
+                // offset that does not hold a whole instruction is no pair.
+                && r.offset.saturating_add(4) <= sec.bytes.len() as u64
+        })
         .map(|r| arch::mips_lo16_addend(endian, &sec.bytes, r.offset as usize))
 }
 
@@ -265,7 +314,7 @@ fn link_object(
         secs.insert(
             idx,
             Sec {
-                splice: splice_range(&name),
+                splice: splice_range(&name)?,
                 name,
                 align: section.align().max(1),
                 writable: is_runtime_writable(&section),
@@ -399,10 +448,14 @@ fn link_object(
                 None
             };
 
+            // Hand the encoder exactly this section's bytes. Slicing only from
+            // `bo` would let a relocation whose offset lies past the end of its
+            // own section quietly rewrite whichever section follows it in the
+            // injected blob, and `arch::apply` would have no way to tell.
             let buf: &mut [u8] = if is_fit_splice {
                 &mut out
             } else {
-                &mut blob[bo..]
+                &mut blob[bo..bo + sec.bytes.len()]
             };
             arch::apply(
                 arch,
@@ -848,8 +901,9 @@ mod tests {
     /// An rlib whose splice reads a `static` that itself holds a pointer. rustc
     /// emits such a `static` into a `SHF_WRITE` `.data.rel.ro` section (named
     /// `data_section` here so the same builder can produce genuinely mutable
-    /// data), with a relocation for the pointer it contains.
-    fn build_rlib_relro(data_section: &str) -> Vec<u8> {
+    /// data), with a relocation at `ptr_reloc_off` for the pointer it contains
+    /// (an offset past the end of the 8-byte static makes it malformed).
+    fn build_rlib_relro(data_section: &str, ptr_reloc_off: u64) -> Vec<u8> {
         use object::write::{Object, Relocation, Symbol, SymbolSection as WSection};
         use object::{
             Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolFlags,
@@ -879,7 +933,7 @@ mod tests {
         obj.add_relocation(
             names_sec,
             Relocation {
-                offset: 0,
+                offset: ptr_reloc_off,
                 symbol: str_sym,
                 addend: 0,
                 flags: RelocationFlags::Elf { r_type: object::elf::R_X86_64_64 },
@@ -910,7 +964,7 @@ mod tests {
     /// `static` that happens to contain a reference.
     #[test]
     fn test_link_rlib_injects_relro_data() {
-        let (bin, applied) = run_link(&build_rlib_relro(".data.rel.ro.NAMES"));
+        let (bin, applied) = run_link(&build_rlib_relro(".data.rel.ro.NAMES", 0));
         assert_eq!(applied.len(), 1);
         assert!(!applied[0].trampoline);
 
@@ -934,7 +988,7 @@ mod tests {
     #[test]
     fn test_link_rlib_rejects_mutable_data() {
         let rlib_path = temp_path("rlib_mutable");
-        fs::write(&rlib_path, build_rlib_relro(".data.COUNTER")).unwrap();
+        fs::write(&rlib_path, build_rlib_relro(".data.COUNTER", 0)).unwrap();
         let mut bin = load(&crafted_target());
         let err = link_rlib(&mut bin, &rlib_path).unwrap_err();
         fs::remove_file(&rlib_path).ok();
@@ -942,5 +996,67 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("writable section"), "message was {msg:?}");
         assert!(msg.contains(".data.COUNTER"), "message was {msg:?}");
+    }
+
+    /// Link `rlib` into the crafted target and return the error it must produce.
+    fn link_err(tag: &str, rlib: &[u8]) -> String {
+        let rlib_path = temp_path(tag);
+        fs::write(&rlib_path, rlib).unwrap();
+        let mut bin = load(&crafted_target());
+        let result = link_rlib(&mut bin, &rlib_path);
+        fs::remove_file(&rlib_path).ok();
+        match result {
+            Ok(applied) => panic!("expected an error, linked {} splice(s)", applied.len()),
+            Err(e) => format!("{e:#}"),
+        }
+    }
+
+    /// `end - begin` is used as the length of the replaced region throughout, so
+    /// a reversed range (easy to produce: `begin`/`end` are hand-typed hex
+    /// addresses) underflows into a region spanning nearly the whole address
+    /// space. That then overflows `patch_bytes`' bounds check instead of failing
+    /// it, and the NOP fill runs off the end of the image.
+    #[test]
+    fn test_link_rlib_rejects_reversed_splice_range() {
+        let msg = link_err("rlib_reversed", &build_rlib(SPLICE_VA - 8));
+        assert!(msg.contains("reversed"), "message was {msg:?}");
+        assert!(msg.contains("0x401000..0x400ff8"), "message was {msg:?}");
+    }
+
+    /// A relocation whose field lies outside the section it belongs to must be
+    /// refused. Applying it would write into whatever section happens to follow
+    /// in the injected blob -- the splice's own data relocated to the wrong
+    /// place, with `resplice` reporting success.
+    #[test]
+    fn test_link_rlib_rejects_out_of_section_relocation() {
+        // The `static` is 8 bytes, so an 8-byte pointer field at offset 8 is
+        // entirely past its end.
+        let msg = link_err("rlib_oob_reloc", &build_rlib_relro(".data.rel.ro.NAMES", 8));
+        assert!(msg.contains("runs past the end"), "message was {msg:?}");
+        assert!(msg.contains(".data.rel.ro.NAMES"), "message was {msg:?}");
+    }
+
+    /// Two splices over the same bytes: each NOP-fills the whole of its region,
+    /// so applying both leaves one of them half-overwritten. Which one depends
+    /// on section visit order, so this has to be an error, not a coin flip.
+    #[test]
+    fn test_link_rlib_rejects_overlapping_splices() {
+        use object::write::Object;
+        use object::{Architecture, BinaryFormat, Endianness, SectionKind};
+
+        let mut obj = Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+        for (begin, end) in [(SPLICE_VA, SPLICE_VA + 0x10), (SPLICE_VA + 8, SPLICE_VA + 0x18)] {
+            let name = format!(".rspl.{begin:x}.{end:x}").into_bytes();
+            let sec = obj.add_section(vec![], name, SectionKind::Text);
+            obj.append_section_data(sec, &[0xc3], 1); // ret
+        }
+        let rlib = ar_wrap("splice.o", &obj.write().unwrap());
+
+        let msg = link_err("rlib_overlap", &rlib);
+        assert!(msg.contains("overlap"), "message was {msg:?}");
+        assert!(
+            msg.contains("0x401000..0x401010") && msg.contains("0x401008..0x401018"),
+            "message was {msg:?}"
+        );
     }
 }

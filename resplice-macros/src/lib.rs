@@ -45,9 +45,25 @@ pub fn Splice(args: TokenStream, input: TokenStream) -> TokenStream {
 
     let meta_list = parse_macro_input!(args with syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated);
 
-    let (begin_addr, end_addr) = parse_range(meta_list);
-    let begin = begin_addr.expect("Splice attribute requires 'begin' parameter");
-    let end = end_addr.expect("Splice attribute requires 'end' parameter");
+    // The range is encoded into the section name and recovered by the tool,
+    // which relies on `end - begin` as the length of the region being replaced.
+    // A missing or reversed range has to be refused here, where the diagnostic
+    // can point at the attribute that got it wrong.
+    let (begin, end) = match parse_range(meta_list) {
+        (Some(begin), Some(end)) if begin < end => (begin, end),
+        (None, _) => return range_error(&item, "#[Splice] requires a `begin` address"),
+        (_, None) => return range_error(&item, "#[Splice] requires an `end` address"),
+        (Some(begin), Some(end)) => {
+            return range_error(
+                &item,
+                &format!(
+                    "#[Splice] range {begin:#x}..{end:#x} is empty or reversed: `end` is \
+                     the address just past the last byte being replaced, so it must be \
+                     greater than `begin`"
+                ),
+            )
+        }
+    };
 
     let section = format!(".rspl.{:x}.{:x}", begin, end);
 
@@ -96,6 +112,13 @@ pub fn Splice(args: TokenStream, input: TokenStream) -> TokenStream {
     };
 
     TokenStream::from(expanded)
+}
+
+/// A compile error about the `#[Splice]` range, spanned on the annotated item.
+fn range_error(item: &Item, message: &str) -> TokenStream {
+    syn::Error::new_spanned(item, message)
+        .to_compile_error()
+        .into()
 }
 
 /// Extract the `begin`/`end` integer addresses from a `#[Splice(..)]` argument
