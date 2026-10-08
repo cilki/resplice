@@ -343,6 +343,73 @@ impl Binary {
         Ok(align_up(self.max_vaddr()?, align) + align)
     }
 
+    /// The lowest file offset at or after `limit` that something in the target
+    /// already occupies, or `None` if the target carries no information that
+    /// answers the question.
+    ///
+    /// [`inject_segment`](Self::inject_segment) uses this to size the padding
+    /// gap that follows the program-header table, so it must report *content*,
+    /// not mere mapping. Section headers are the authoritative source: a
+    /// section is exactly a claimed range of file bytes, and neither the ELF
+    /// header nor the program-header table is a section, so the first section
+    /// body at or after `limit` is where the padding stops.
+    ///
+    /// Segment `p_offset`s cannot answer it, because a `PT_LOAD` says which
+    /// bytes are *mapped* rather than which hold content. The first `PT_LOAD`
+    /// of an executable starts at file offset 0 and spans the ELF header, the
+    /// program-header table, the padding *and* the content that follows; and
+    /// `PT_PHDR` describes the table itself, so its `p_offset` lies below the
+    /// table's end. They are only consulted for a target with no section
+    /// headers, and then only for segments beginning at or after `limit`,
+    /// where their start really is the start of content.
+    fn first_claimed_after(&self, limit: u64) -> Result<Option<u64>> {
+        use goblin::elf::program_header::PT_PHDR;
+        use goblin::elf::section_header::SHT_NOBITS;
+        let elf = self.elf()?;
+
+        let mut first: Option<u64> = None;
+        let mut claim = |start: u64, size: u64| {
+            if size == 0 {
+                return;
+            }
+            // A range beginning below `limit` but reaching past it occupies
+            // `limit` itself, leaving no gap at all.
+            let start = if start < limit && start.saturating_add(size) > limit {
+                limit
+            } else {
+                start
+            };
+            if start >= limit {
+                first = Some(first.map_or(start, |f: u64| f.min(start)));
+            }
+        };
+
+        if elf.section_headers.is_empty() {
+            for ph in &elf.program_headers {
+                if ph.p_type != PT_PHDR && ph.p_offset >= limit {
+                    // `p_filesz` can be 0 for a segment that still pins its
+                    // `p_offset`; treat the offset itself as occupied.
+                    claim(ph.p_offset, ph.p_filesz.max(1));
+                }
+            }
+        } else {
+            for sh in &elf.section_headers {
+                // `SHT_NOBITS` sections (`.bss`, `.tbss`) occupy no file
+                // bytes, and their `sh_offset` routinely overlaps content that
+                // does.
+                if sh.sh_type != SHT_NOBITS {
+                    claim(sh.sh_offset, sh.sh_size);
+                }
+            }
+        }
+        // The section-header table, which conventionally ends the file.
+        claim(
+            elf.header.e_shoff,
+            elf.header.e_shentsize as u64 * elf.section_headers.len() as u64,
+        );
+        Ok(first)
+    }
+
     /// Resolve a symbol name against the target binary's own symbols.
     ///
     /// Tries, in order: a defined symbol in `.symtab`, a defined symbol in
@@ -401,7 +468,7 @@ impl Binary {
     /// the file is padded to the same granularity before the blob is appended so
     /// the loader's `p_vaddr ≡ p_offset (mod p_align)` requirement holds.
     pub fn inject_segment(&mut self, base: u64, blob: &[u8]) -> Result<()> {
-        use goblin::elf::program_header::{PF_R, PF_X, PT_LOAD, PT_NOTE};
+        use goblin::elf::program_header::{PF_R, PF_X, PT_LOAD, PT_NOTE, PT_PHDR};
 
         let align = self.load_align()?;
         if base % align != 0 {
@@ -442,40 +509,27 @@ impl Binary {
         // Many statically-linked targets carry no PT_NOTE at all,
         // just REGINFO + a couple of PT_LOADs. Rather than give up, grow the
         // program-header table by one entry into the padding gap between the
-        // table itself and whatever comes first after it in the file (the
-        // start of file content any existing segment or the section-header
-        // table claims) — the same trick linkers use to leave slack for
-        // PT_NOTE in the first place. This never touches bytes any parser
-        // needs, since it strictly stays inside currently-unclaimed padding.
+        // table itself and the first file byte the target already occupies —
+        // the same trick linkers use to leave slack for PT_NOTE in the first
+        // place. This never touches bytes any parser needs, since it strictly
+        // stays inside currently-unclaimed padding.
         let note_off = match note_off {
             Some(off) => off,
             None => {
-                let (poff_field, poff_w) = if is_64 { (8, 8) } else { (4, 4) };
-                let mut first_claimed = u64::MAX;
-                for i in 0..phnum {
-                    let off = phoff + i * phentsize;
-                    let p_off = endian.read_uint(&self.data, off + poff_field, poff_w);
-                    if p_off > 0 {
-                        first_claimed = first_claimed.min(p_off);
-                    }
-                }
-                // Only the start of the section-header table matters here;
-                // its entry size and count are irrelevant to the padding gap.
-                let (eshoff_off, eshoff_w) = if is_64 { (0x28, 8) } else { (0x20, 4) };
-                let e_shoff = endian.read_uint(&self.data, eshoff_off, eshoff_w);
-                if e_shoff > 0 {
-                    first_claimed = first_claimed.min(e_shoff);
-                }
-
                 let table_end = (phoff + phnum * phentsize) as u64;
-                if first_claimed == u64::MAX || first_claimed < table_end {
+                // See `first_claimed_after` for why this cannot be answered
+                // from the program headers' own `p_offset`s.
+                let Some(first_claimed) = self.first_claimed_after(table_end)? else {
                     return Err(anyhow!(
-                        "no PT_NOTE segment to convert, and no room to grow the \
-                         program-header table (next file content starts at \
-                         {first_claimed:#x}, table ends at {table_end:#x})"
+                        "no PT_NOTE segment to convert, and the target has no section \
+                         headers and no segment past its program-header table, so \
+                         there is no way to tell whether the bytes after the table \
+                         are padding or content"
                     ));
-                }
-                let gap = first_claimed - table_end;
+                };
+                // A claim past the end of the file cannot vouch for bytes that
+                // are not there.
+                let gap = first_claimed.min(self.data.len() as u64) - table_end;
                 if gap < phentsize as u64 {
                     return Err(anyhow!(
                         "no PT_NOTE segment to convert, and insufficient padding to add \
@@ -488,6 +542,20 @@ impl Binary {
                     return Err(anyhow!("program header count overflow"));
                 }
                 endian.write_uint(&mut self.data, phnum_off, 2, new_phnum as u64);
+                // PT_PHDR describes the table, so it has to grow with it.
+                // Leaving it behind makes it contradict `e_phnum`, and every
+                // reader that trusts it -- `dl_iterate_phdr` in the target
+                // itself included -- stops one entry short of the segment just
+                // added.
+                let table_size = (new_phnum * phentsize) as u64;
+                for i in 0..phnum {
+                    let off = phoff + i * phentsize;
+                    if endian.read_uint(&self.data, off, 4) as u32 == PT_PHDR {
+                        let (filesz_off, memsz_off) = if is_64 { (32, 40) } else { (16, 20) };
+                        endian.write_uint(&mut self.data, off + filesz_off, word, table_size);
+                        endian.write_uint(&mut self.data, off + memsz_off, word, table_size);
+                    }
+                }
                 table_end as usize
             }
         };
@@ -841,6 +909,42 @@ mod tests {
         }
     }
 
+    /// Give `bin` a section-header table at file offset `shoff` describing a
+    /// `SHT_NULL` entry plus one `(sh_type, sh_offset, sh_size)` per element of
+    /// `sections`. 64-bit little-endian only, which is all the callers need.
+    ///
+    /// Real targets all carry section headers, and they are the only thing that
+    /// says where the padding after the program-header table ends -- so the
+    /// no-`PT_NOTE` fallback cannot be tested honestly without them.
+    fn craft_sections(bin: &mut Binary, shoff: u64, sections: &[(u32, u64, u64)]) {
+        const SHENTSIZE: usize = 64;
+        let endian = bin.endian;
+        let shnum = sections.len() + 1;
+        assert!(bin.data.len() >= shoff as usize + shnum * SHENTSIZE);
+        endian.write_uint(&mut bin.data, 0x28, 8, shoff); // e_shoff
+        endian.write_uint(&mut bin.data, 0x3a, 2, SHENTSIZE as u64); // e_shentsize
+        endian.write_uint(&mut bin.data, 0x3c, 2, shnum as u64); // e_shnum
+        endian.write_uint(&mut bin.data, 0x3e, 2, 0); // e_shstrndx -> the null entry
+        for (i, &(sh_type, sh_offset, sh_size)) in sections.iter().enumerate() {
+            let so = shoff as usize + (i + 1) * SHENTSIZE;
+            endian.write_uint(&mut bin.data, so + 4, 4, sh_type as u64);
+            endian.write_uint(&mut bin.data, so + 24, 8, sh_offset);
+            endian.write_uint(&mut bin.data, so + 32, 8, sh_size);
+        }
+    }
+
+    /// A `PT_PHDR` + `PT_LOAD` pair as every dynamically linked executable has
+    /// it: the `PT_LOAD` begins at file offset 0, so it spans the ELF header,
+    /// the program-header table and everything after.
+    fn phdr_and_load(phnum: usize) -> [Phdr; 2] {
+        use goblin::elf::program_header::{PT_LOAD, PT_PHDR};
+        let table = (phnum * 56) as u64;
+        [
+            (PT_PHDR as u64, 0x40, 0x400040, table, 4, 8),
+            (PT_LOAD as u64, 0, 0x400000, 0x400, 5, 0x1000),
+        ]
+    }
+
     /// The file offset of every program header in `bin`.
     fn phdr_offsets(bin: &Binary) -> Vec<usize> {
         let l = layout(bin.is_64());
@@ -988,6 +1092,78 @@ mod tests {
             injected_phdr(&bin, INJECT_AT, &PAYLOAD);
             assert_eq!(phdr_types(&bin).len(), 3, "table should have grown for {arch:?}");
         }
+    }
+
+    /// A `PT_PHDR` must not be mistaken for content blocking the growth of the
+    /// table it describes. Its `p_offset` *is* the table, so it necessarily
+    /// starts below the table's end -- and taking the minimum `p_offset` over
+    /// every segment therefore reported "no room" on every dynamically linked
+    /// executable, which is to say on the overwhelming majority of targets.
+    #[test]
+    fn test_inject_segment_grows_phdr_table_past_pt_phdr() {
+        use goblin::elf::program_header::PT_PHDR;
+        let phdrs = phdr_and_load(2);
+        let mut bin = craft_injectable(Endian::Little, Architecture::X86_64, 0x400, &phdrs);
+        // Content starts at 0x200, well past the table's end at 0xb0, so there
+        // is room for one more 56-byte entry.
+        craft_sections(&mut bin, 0x300, &[(1 /* SHT_PROGBITS */, 0x200, 0x100)]);
+
+        bin.inject_segment(INJECT_AT, &PAYLOAD).unwrap();
+
+        injected_phdr(&bin, INJECT_AT, &PAYLOAD);
+        let types = phdr_types(&bin);
+        assert_eq!(types.len(), 3, "table should have grown");
+
+        // The PT_PHDR has to describe the grown table, not the old one, or it
+        // contradicts `e_phnum` and hides the segment just added from every
+        // reader that trusts it.
+        let l = layout(true);
+        let po = phdr_offsets(&bin)
+            .into_iter()
+            .find(|&po| bin.endian().read_uint(bin.data(), po, 4) == PT_PHDR as u64)
+            .expect("PT_PHDR should survive");
+        let expected = (types.len() * l.phentsize) as u64;
+        assert_eq!(
+            bin.endian().read_uint(bin.data(), po + l.p_filesz, l.word),
+            expected,
+            "PT_PHDR p_filesz"
+        );
+        assert_eq!(
+            bin.endian()
+                .read_uint(bin.data(), po + l.p_filesz + l.word, l.word),
+            expected,
+            "PT_PHDR p_memsz"
+        );
+    }
+
+    /// The padding gap after the program-header table cannot be measured from
+    /// segment `p_offset`s: the first `PT_LOAD` of an executable starts at file
+    /// offset 0 and covers the headers, the padding *and* the content that
+    /// follows, so it says nothing about where that content begins. Reading the
+    /// gap that way declared it clear on a target whose `.text` began
+    /// immediately after the table, and the new program header was written over
+    /// the entry point -- with `resplice` reporting success.
+    #[test]
+    fn test_inject_segment_refuses_to_overwrite_content_after_the_table() {
+        use goblin::elf::program_header::PT_LOAD;
+        // A freestanding `-nostdlib -static` executable, which is exactly the
+        // no-PT_NOTE shape this fallback exists for: one PT_LOAD from file
+        // offset 0, and `.text` right behind the single program header.
+        let phdrs: [Phdr; 1] = [(PT_LOAD as u64, 0, 0x400000, 0x400, 5, 0x1000)];
+        let mut bin = craft_injectable(Endian::Little, Architecture::X86_64, 0x400, &phdrs);
+        // `.text` begins at 0x78, exactly where the table ends: no padding.
+        craft_sections(&mut bin, 0x300, &[(1 /* SHT_PROGBITS */, 0x78, 0x100)]);
+        let before = bin.data().to_vec();
+
+        let msg = bin
+            .inject_segment(INJECT_AT, &PAYLOAD)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("no PT_NOTE") && msg.contains("padding"),
+            "{msg}"
+        );
+        assert_eq!(bin.data(), &before[..], "target must be left untouched");
     }
 
     #[test]
