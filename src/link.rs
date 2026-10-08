@@ -128,6 +128,10 @@ struct Sec {
     name: String,
     align: u64,
     writable: bool,
+    /// Whether the section holds machine code (`SHF_EXECINSTR`). A `#[Splice]`
+    /// on a `fn` lands in an executable section, one on a `static` does not,
+    /// and the two cannot be patched the same way. See [`link_object`].
+    code: bool,
     bytes: Vec<u8>,
     relocs: Vec<Rel>,
     /// `Some((begin, end))` for a pinned `.rspl.*` section.
@@ -318,6 +322,7 @@ fn link_object(
                 name,
                 align: section.align().max(1),
                 writable: is_runtime_writable(&section),
+                code: matches!(section.kind(), SectionKind::Text),
                 bytes: section.data().unwrap_or(&[]).to_vec(),
                 relocs,
             },
@@ -352,11 +357,35 @@ fn link_object(
     // A splice whose code fits its `[begin, end)` region is pinned there and
     // patched directly. One that is too large is relocated into the injected
     // segment, with a jump written at `begin` to reach it (a trampoline).
+    //
+    // Both of those moves assume the splice is *code*. A `#[Splice]` on a
+    // `static` replaces data byte-for-byte, and neither works for it:
+    //
+    // - Oversized, it would be trampolined, leaving a branch instruction
+    //   where the target expects a table. The target then reads the branch's
+    //   encoding as data, and the real bytes sit unreferenced in the injected
+    //   segment.
+    // - Undersized, `patch_bytes` fills the remainder of the region with NOP
+    //   *instructions*, so the tail of the replaced table becomes whatever
+    //   this architecture's NOP happens to encode as.
+    //
+    // Both are invisible downstream -- `resplice` reports success -- so a data
+    // splice has to match its range exactly.
     let mut oversized: Vec<usize> = Vec::new();
     let mut sec_va: HashMap<usize, u64> = HashMap::new();
     for &si in &splice_idxs {
-        let (begin, end) = secs[&si].splice.unwrap();
-        if secs[&si].bytes.len() <= (end - begin) as usize {
+        let sec = &secs[&si];
+        let (begin, end) = sec.splice.unwrap();
+        let region = (end - begin) as usize;
+        if !sec.code && sec.bytes.len() != region {
+            bail!(
+                "data splice {begin:#x}..{end:#x} is {} bytes but its range is {region}; \
+                 a `static` splice replaces its range byte-for-byte, so the two have to \
+                 match exactly -- adjust `begin`/`end` or the size of the `static`",
+                sec.bytes.len()
+            );
+        }
+        if sec.bytes.len() <= region {
             sec_va.insert(si, begin);
         } else {
             oversized.push(si);
@@ -1034,6 +1063,46 @@ mod tests {
         let msg = link_err("rlib_oob_reloc", &build_rlib_relro(".data.rel.ro.NAMES", 8));
         assert!(msg.contains("runs past the end"), "message was {msg:?}");
         assert!(msg.contains(".data.rel.ro.NAMES"), "message was {msg:?}");
+    }
+
+    /// A `#[Splice]` on a `static` lands in a non-executable section and
+    /// replaces its range byte-for-byte. Neither of the sizing moves available
+    /// to code works for it: an oversized one would be trampolined, writing a
+    /// branch instruction where the target expects a table, and an undersized
+    /// one would have the tail of its range filled with NOP instructions.
+    /// Both report success, so both have to be refused up front.
+    #[test]
+    fn test_link_rlib_rejects_missized_data_splice() {
+        use object::write::Object;
+        use object::{Architecture, BinaryFormat, Endianness, SectionKind};
+
+        // An 8-byte range holding `bytes` as read-only data, not code.
+        let build = |bytes: &[u8]| {
+            let mut obj =
+                Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+            let name = format!(".rspl.{SPLICE_VA:x}.{:x}", SPLICE_VA + 8).into_bytes();
+            let sec = obj.add_section(vec![], name, SectionKind::ReadOnlyData);
+            obj.append_section_data(sec, bytes, 8);
+            ar_wrap("splice.o", &obj.write().unwrap())
+        };
+
+        let msg = link_err("rlib_data_oversize", &build(&[0xaa; 16]));
+        assert!(msg.contains("data splice"), "message was {msg:?}");
+        assert!(msg.contains("16 bytes"), "message was {msg:?}");
+        assert!(msg.contains("0x401000..0x401008"), "message was {msg:?}");
+
+        let msg = link_err("rlib_data_undersize", &build(&[0xaa; 4]));
+        assert!(msg.contains("data splice"), "message was {msg:?}");
+        assert!(msg.contains("4 bytes"), "message was {msg:?}");
+
+        // An exact fit is still patched straight over the range, and the byte
+        // just past it is left alone.
+        let data = [0xde, 0xad, 0xbe, 0xef, 0x11, 0x22, 0x33, 0x44];
+        let (bin, applied) = run_link(&build(&data));
+        assert_eq!(applied.len(), 1);
+        assert!(!applied[0].trampoline);
+        assert_eq!(&bin.data()[0x1000..0x1008], &data);
+        assert_eq!(bin.data()[0x1008], 0xcc, "past the range, untouched");
     }
 
     /// Two splices over the same bytes: each NOP-fills the whole of its region,

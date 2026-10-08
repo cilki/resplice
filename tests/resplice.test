@@ -180,3 +180,45 @@ testSpliceTrampolinesWhenOversized() {
 	chmod +x ./prog.patched
 	[ "$(./prog.patched)" = "2107" ]
 }
+
+## A `#[Splice]` on a `static`: its initializer bytes replace a data range of
+## the target byte-for-byte, with no code involved anywhere. The target is plain
+## C here -- nothing architecture-specific is needed to put a table in
+## `.rodata`.
+##
+## Also pins down the refusal of a `static` whose size does not match its range.
+## A data splice has neither of the escapes `resplice` has for code: relocating
+## it into the injected segment leaves a branch instruction where the table
+## should be, and filling a short one out leaves NOP *instructions* inside the
+## table. Both would otherwise be reported as a successful splice.
+testDataSpliceReplacesTableAndRefusesAMissizedOne() {
+	# `argc` indexes the table so the read survives constant folding and the
+	# patched bytes are what the program actually prints.
+	printf '%s\n' '#include <stdio.h>' \
+		'const unsigned int prices[4] = { 100, 200, 300, 400 };' \
+		'int main(int argc, char **argv){ (void)argv; printf("%u\n", prices[argc & 3]); return 0; }' > prog.c
+	cc -no-pie -O2 -o prog prog.c
+
+	[ "$(./prog)" = "200" ]
+
+	va=$(readelf -sW prog | awk '$8=="prices"{ print strtonum("0x" $2); exit }')
+	size=$(readelf -sW prog | awk '$8=="prices"{ print $3; exit }')
+	[ "$size" = "16" ]
+	end=$((va + size))
+
+	# Exact fit: four u32s over the 16-byte range.
+	printf 'use resplice_macros::Splice;\n#[Splice(begin = %d, end = %d)]\nstatic PRICES: [u32; 4] = [11, 22, 33, 44];\n' \
+		"$va" "$end" > examples/adder/src/lib.rs
+	cargo build --release -p adder
+	target/release/resplice ./prog target/release/libadder.rlib ./prog.patched
+	chmod +x ./prog.patched
+	[ "$(./prog.patched)" = "22" ]
+
+	# Half the range: must be refused, and must leave no output behind.
+	printf 'use resplice_macros::Splice;\n#[Splice(begin = %d, end = %d)]\nstatic PRICES: [u32; 2] = [11, 22];\n' \
+		"$va" "$end" > examples/adder/src/lib.rs
+	cargo build --release -p adder
+	rm -f ./prog.short
+	! target/release/resplice ./prog target/release/libadder.rlib ./prog.short
+	[ ! -e ./prog.short ]
+}

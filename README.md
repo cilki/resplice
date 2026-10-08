@@ -104,9 +104,21 @@ static PRICES: [u32; 2] = [100, 200];
 ```
 
 Give the static a `repr(C)` type so its layout is exactly what you wrote. Unlike
-a function, a data splice has to fit its range: the oversize path writes a jump
-at `begin` to the relocated copy, which is meaningless for data. Any other kind
-of item is a compile error — `#[Splice]` accepts only `fn` and `static`.
+a function, a data splice has to match its range *exactly* — neither way out
+that `resplice` has for code means anything for data, so a mismatch is an error
+rather than a patch:
+
+```
+error: data splice 0x2ec70..0x2ec78 is 32 bytes but its range is 8; a `static`
+splice replaces its range byte-for-byte, so the two have to match exactly --
+adjust `begin`/`end` or the size of the `static`
+```
+
+An oversized one would be relocated into the injected segment and reached by a
+jump written at `begin`, leaving a branch instruction where the target expects a
+table; an undersized one would have the rest of its range filled with NOP
+*instructions*. Any other kind of item is a compile error — `#[Splice]` accepts
+only `fn` and `static`.
 
 ### Placing the injected segment
 
@@ -123,7 +135,16 @@ resplice --inject-base 0x1c0000 ./original-binary ./lib.rlib ./patched-binary
 The address must be aligned to the target's page size — the largest `p_align`
 among its `PT_LOAD` segments, which is 64K for a typical aarch64 image rather
 than 4K. `resplice` rejects a misaligned base instead of emitting a binary the
-loader would refuse.
+loader would refuse, and likewise rejects a base that is aligned but not free —
+one whose segment would be mapped over the target's own image, which the loader
+either refuses outright or loads into a program with its code overwritten:
+
+```
+error: injected segment 0x400000..0x400010 would be mapped over the target's own
+PT_LOAD at 0x400000..0x4009d4 (both round out to pages of 0x10000, so
+0x400000..0x410000 overlaps 0x400000..0x410000); choose an --inject-base that is
+free in the target's address space
+```
 
 Note that the segment is mapped read+execute, so referenced *writable* data
 (mutable `static`s, `.bss`) is not supported yet and is reported as an error.
