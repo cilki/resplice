@@ -13,9 +13,10 @@ pub use link::{link_rlib, Applied};
 /// target declares nothing better. See [`Binary::load_align`].
 const PAGE: u64 = 0x1000;
 
-/// Round `x` up to the next multiple of `align` (a power of two).
+/// Round `x` up to the next multiple of `align` (a power of two), saturating at
+/// the largest representable multiple rather than wrapping back to zero.
 fn align_up(x: u64, align: u64) -> u64 {
-    (x + align - 1) & !(align - 1)
+    x.saturating_add(align - 1) & !(align - 1)
 }
 
 /// Represents an ELF binary that can be patched
@@ -393,6 +394,49 @@ impl Binary {
         Ok(None)
     }
 
+    /// Verify that `[base, base + len)` does not collide with the target's own
+    /// image, so the injected segment adds a mapping instead of replacing one.
+    ///
+    /// Alignment used to be the only thing checked about an operator-supplied
+    /// base, which let an address that simply is not free through: a mistyped
+    /// `--inject-base` (the image's own base, or an address a digit short of
+    /// the intended one) produced a `PT_LOAD` mapping the injected blob over
+    /// the target's code. `resplice` reported success, and the result either
+    /// crashed or was refused by the loader.
+    ///
+    /// Pages *shared* with an existing `PT_LOAD` count as a collision: the
+    /// kernel maps whole pages, and the later mapping replaces the earlier one
+    /// rather than being merged into it. Both ranges are therefore compared
+    /// after rounding out to `align`, the target's page size.
+    fn check_base_is_free(&self, base: u64, len: u64, align: u64) -> Result<()> {
+        use goblin::elf::program_header::PT_LOAD;
+
+        let end = base.checked_add(len).ok_or_else(|| {
+            anyhow!("injected segment at {base:#x} runs past the end of the address space")
+        })?;
+        let claimed_end = align_up(end, align);
+
+        let elf = self.elf()?;
+        for ph in &elf.program_headers {
+            if ph.p_type != PT_LOAD {
+                continue;
+            }
+            let seg_end = ph.p_vaddr.saturating_add(ph.p_memsz);
+            let (lo, hi) = (ph.p_vaddr & !(align - 1), align_up(seg_end, align));
+            if base < hi && lo < claimed_end {
+                return Err(anyhow!(
+                    "injected segment {base:#x}..{end:#x} would be mapped over the \
+                     target's own PT_LOAD at {:#x}..{seg_end:#x} (both round out to \
+                     pages of {align:#x}, so {base:#x}..{claimed_end:#x} overlaps \
+                     {lo:#x}..{hi:#x}); choose an --inject-base that is free in the \
+                     target's address space",
+                    ph.p_vaddr
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Inject `blob` as a new read+execute segment mapped at virtual address
     /// `base`, by converting an existing `PT_NOTE` program header into a
     /// `PT_LOAD` (so the program-header table itself need not be relocated).
@@ -410,6 +454,7 @@ impl Binary {
                  ({align:#x})"
             ));
         }
+        self.check_base_is_free(base, blob.len() as u64, align)?;
         let endian = self.endian;
         let is_64 = self.is_64();
 
@@ -988,6 +1033,43 @@ mod tests {
             injected_phdr(&bin, INJECT_AT, &PAYLOAD);
             assert_eq!(phdr_types(&bin).len(), 3, "table should have grown for {arch:?}");
         }
+    }
+
+    /// A base that is aligned but not *free* has to be refused. Alignment used
+    /// to be the only check, so an `--inject-base` pointing into the target's
+    /// own image produced a `PT_LOAD` mapping the blob over the target's code,
+    /// reported as a successful splice.
+    #[test]
+    fn test_inject_segment_rejects_base_overlapping_the_image() {
+        use goblin::elf::program_header::{PT_LOAD, PT_NOTE};
+        // Image occupies 0x400000..0x400400, so the first free page is
+        // 0x401000 and everything below it is taken.
+        let phdrs: [Phdr; 2] = [
+            (PT_LOAD as u64, 0, 0x400000, 0x400, 5, 0x1000),
+            (PT_NOTE as u64, 0x100, 0x400100, 0x20, 4, 4),
+        ];
+        let make = || craft_injectable(Endian::Little, Architecture::X86_64, 0x400, &phdrs);
+
+        // The image's own base.
+        let err = make().inject_segment(0x400000, &PAYLOAD).unwrap_err().to_string();
+        assert!(err.contains("over the target's own PT_LOAD"), "{err}");
+        assert!(err.contains("0x400000..0x400400"), "{err}");
+
+        // A base below the image whose blob grows up into it.
+        let err = make()
+            .inject_segment(0x3ff000, &[0u8; 0x1001])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("over the target's own PT_LOAD"), "{err}");
+
+        // The first page past the image is free, and still accepted.
+        let mut bin = make();
+        bin.inject_segment(0x401000, &PAYLOAD).unwrap();
+        injected_phdr(&bin, 0x401000, &PAYLOAD);
+        assert!(
+            !phdr_types(&bin).contains(&(PT_NOTE as u64)),
+            "PT_NOTE should have been consumed"
+        );
     }
 
     #[test]
