@@ -1,6 +1,8 @@
 pub use anyhow::Result;
 
 use anyhow::{anyhow, Context};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -27,6 +29,27 @@ pub struct Binary {
     /// Operator-supplied virtual address for the injected segment, overriding
     /// [`Binary::injected_base`]'s default. See [`Binary::set_injected_base`].
     inject_base: Option<u64>,
+    /// Every name the target can bind an external reference to, built on first
+    /// use by [`Binary::build_symbol_map`] and dropped whenever `data` changes.
+    ///
+    /// A splice typically calls several functions the target already defines, so
+    /// this is consulted once per relocation. Scanning `.symtab`/`.dynsym` for
+    /// each of those is quadratic in a real target's symbol count, which is
+    /// where this tool spent nearly all of its time before the map existed.
+    symbols: RefCell<Option<HashMap<String, u64>>>,
+}
+
+/// One entry of the target's program-header table.
+#[derive(Debug)]
+struct Phdr {
+    /// File offset of this entry, for rewriting it in place.
+    entry_off: usize,
+    p_type: u32,
+    p_offset: u64,
+    p_vaddr: u64,
+    p_filesz: u64,
+    p_memsz: u64,
+    p_align: u64,
 }
 
 /// Supported CPU architectures
@@ -55,13 +78,23 @@ impl Binary {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let data = fs::read(path)?;
         let (arch, endian) = Self::detect_arch(&data)?;
+        Ok(Self::new(data, arch, endian))
+    }
 
-        Ok(Binary {
+    /// Wrap an image already held in memory.
+    fn new(data: Vec<u8>, arch: Architecture, endian: Endian) -> Self {
+        Binary {
             data,
             arch,
             endian,
             inject_base: None,
-        })
+            symbols: RefCell::new(None),
+        }
+    }
+
+    /// Drop everything derived from `data`, after `data` has been changed.
+    fn invalidate_caches(&mut self) {
+        *self.symbols.get_mut() = None;
     }
 
     /// Pin the injected segment to `base` instead of the default.
@@ -146,6 +179,7 @@ impl Binary {
             }
         }
 
+        self.invalidate_caches();
         Ok(())
     }
 
@@ -275,11 +309,81 @@ impl Binary {
         }
     }
 
+    /// Read the program-header table straight out of the image.
+    ///
+    /// This is deliberately not a full [`elf`](Self::elf) parse: the table is a
+    /// dozen fixed-layout entries, while parsing the whole image walks its
+    /// section headers, symbol tables and string tables. Address translation
+    /// needs nothing but this table and is called once per splice, so paying
+    /// for the rest of the parse each time dominated the tool's runtime.
+    ///
+    /// Reading the bytes directly also keeps the result current: the table is
+    /// rewritten by [`inject_segment`](Self::inject_segment), and every caller
+    /// here must see that edit.
+    fn program_headers(&self) -> Result<Vec<Phdr>> {
+        let endian = self.endian;
+        let is_64 = self.is_64();
+        // Header fields holding the table's location, and the entry layout of
+        // this ELF class. ELF32 has no `p_flags` between `p_type` and
+        // `p_offset`, so every field after the first sits elsewhere.
+        let (phoff_off, phentsize_off, phnum_off, phentsize, ehsize) = if is_64 {
+            (0x20, 0x36, 0x38, 56usize, 64usize)
+        } else {
+            (0x1c, 0x2a, 0x2c, 32usize, 52usize)
+        };
+        let (o_offset, o_vaddr, o_filesz, o_memsz, o_align) = if is_64 {
+            (8, 16, 32, 40, 48)
+        } else {
+            (4, 8, 16, 20, 28)
+        };
+        let word = if is_64 { 8 } else { 4 };
+
+        if self.data.len() < ehsize {
+            return Err(anyhow!(
+                "image is {} bytes, too short for an ELF header",
+                self.data.len()
+            ));
+        }
+        let phoff = endian.read_uint(&self.data, phoff_off, word) as usize;
+        let got_phentsize = endian.read_uint(&self.data, phentsize_off, 2) as usize;
+        let phnum = endian.read_uint(&self.data, phnum_off, 2) as usize;
+        if got_phentsize != phentsize {
+            return Err(anyhow!("unexpected program-header entry size {got_phentsize}"));
+        }
+        // Checked, so a table the header claims lies past the end of the file is
+        // refused here instead of panicking on the reads below. (`phnum` is a
+        // 16-bit field and `phentsize` is fixed, so the product cannot wrap.)
+        if phoff
+            .checked_add(phnum * phentsize)
+            .is_none_or(|end| end > self.data.len())
+        {
+            return Err(anyhow!(
+                "program-header table at {phoff:#x} ({phnum} entries of {phentsize} \
+                 bytes) runs past the end of the {}-byte image",
+                self.data.len()
+            ));
+        }
+
+        Ok((0..phnum)
+            .map(|i| {
+                let off = phoff + i * phentsize;
+                Phdr {
+                    entry_off: off,
+                    p_type: endian.read_uint(&self.data, off, 4) as u32,
+                    p_offset: endian.read_uint(&self.data, off + o_offset, word),
+                    p_vaddr: endian.read_uint(&self.data, off + o_vaddr, word),
+                    p_filesz: endian.read_uint(&self.data, off + o_filesz, word),
+                    p_memsz: endian.read_uint(&self.data, off + o_memsz, word),
+                    p_align: endian.read_uint(&self.data, off + o_align, word),
+                }
+            })
+            .collect())
+    }
+
     /// Translate a virtual address to a file offset using the program headers.
     pub fn va_to_offset(&self, va: u64) -> Result<usize> {
         use goblin::elf::program_header::PT_LOAD;
-        let elf = self.elf()?;
-        for ph in &elf.program_headers {
+        for ph in self.program_headers()? {
             if ph.p_type == PT_LOAD && va >= ph.p_vaddr && va < ph.p_vaddr + ph.p_filesz {
                 return Ok((ph.p_offset + (va - ph.p_vaddr)) as usize);
             }
@@ -290,9 +394,8 @@ impl Binary {
     /// The highest virtual address occupied by any loadable segment.
     fn max_vaddr(&self) -> Result<u64> {
         use goblin::elf::program_header::PT_LOAD;
-        let elf = self.elf()?;
-        Ok(elf
-            .program_headers
+        Ok(self
+            .program_headers()?
             .iter()
             .filter(|ph| ph.p_type == PT_LOAD)
             .map(|ph| ph.p_vaddr + ph.p_memsz)
@@ -317,9 +420,8 @@ impl Binary {
     ///   the image outright.
     fn load_align(&self) -> Result<u64> {
         use goblin::elf::program_header::PT_LOAD;
-        let elf = self.elf()?;
-        let declared = elf
-            .program_headers
+        let declared = self
+            .program_headers()?
             .iter()
             .filter(|ph| ph.p_type == PT_LOAD && ph.p_align.is_power_of_two())
             .map(|ph| ph.p_align)
@@ -350,22 +452,37 @@ impl Binary {
     /// `.dynsym`, then a function the target imports through its PLT (the stub's
     /// address). Returns `None` if the target provides no such symbol.
     pub fn resolve_target_symbol(&self, name: &str) -> Result<Option<u64>> {
+        let mut cached = self.symbols.borrow_mut();
+        if cached.is_none() {
+            *cached = Some(self.build_symbol_map()?);
+        }
+        Ok(cached.as_ref().and_then(|map| map.get(name).copied()))
+    }
+
+    /// Collect every name [`resolve_target_symbol`](Self::resolve_target_symbol)
+    /// can bind, with the address it resolves to.
+    ///
+    /// Earlier insertions win, which is what gives that function its documented
+    /// precedence: `.symtab` over `.dynsym` over the PLT, and within one table
+    /// the first matching entry.
+    fn build_symbol_map(&self) -> Result<HashMap<String, u64>> {
         use goblin::elf::section_header::SHN_UNDEF;
         let elf = self.elf()?;
+        let mut map: HashMap<String, u64> = HashMap::new();
 
-        // 1 & 2: a symbol the target defines itself.
+        // 1 & 2: symbols the target defines itself.
         for (syms, strtab) in [(&elf.syms, &elf.strtab), (&elf.dynsyms, &elf.dynstrtab)] {
             for sym in syms.iter() {
                 if sym.st_shndx as u32 == SHN_UNDEF || sym.st_value == 0 {
                     continue;
                 }
-                if strtab.get_at(sym.st_name) == Some(name) {
-                    return Ok(Some(sym.st_value));
+                if let Some(name) = strtab.get_at(sym.st_name) {
+                    map.entry(name.to_owned()).or_insert(sym.st_value);
                 }
             }
         }
 
-        // 3: a function the target imports through the PLT. The i-th `.rela.plt`
+        // 3: functions the target imports through the PLT. The i-th `.rela.plt`
         // entry maps to the `.plt` stub at `plt_base + header + i * entry`, whose
         // sizes are architecture-specific. (MIPS classically uses `.MIPS.stubs`
         // rather than a `.plt` of this shape; its import binding is best-effort
@@ -384,14 +501,15 @@ impl Binary {
         if let Some(plt_addr) = plt_addr {
             for (i, reloc) in elf.pltrelocs.iter().enumerate() {
                 if let Some(sym) = elf.dynsyms.get(reloc.r_sym) {
-                    if elf.dynstrtab.get_at(sym.st_name) == Some(name) {
-                        return Ok(Some(plt_addr + plt_header + i as u64 * plt_entry));
+                    if let Some(name) = elf.dynstrtab.get_at(sym.st_name) {
+                        map.entry(name.to_owned())
+                            .or_insert(plt_addr + plt_header + i as u64 * plt_entry);
                     }
                 }
             }
         }
 
-        Ok(None)
+        Ok(map)
     }
 
     /// Verify that `[base, base + len)` does not collide with the target's own
@@ -416,8 +534,7 @@ impl Binary {
         })?;
         let claimed_end = align_up(end, align);
 
-        let elf = self.elf()?;
-        for ph in &elf.program_headers {
+        for ph in self.program_headers()? {
             if ph.p_type != PT_LOAD {
                 continue;
             }
@@ -458,31 +575,24 @@ impl Binary {
         let endian = self.endian;
         let is_64 = self.is_64();
 
-        // Program-header table location and entry size, at class-dependent
-        // offsets in the ELF header.
-        let (phoff_off, phentsize_off, phnum_off, phentsize) = if is_64 {
-            (0x20, 0x36, 0x38, 56usize)
+        // Where the program-header table lives and how big its entries are, at
+        // class-dependent offsets in the ELF header. The no-PT_NOTE path below
+        // appends an entry to the table and bumps the count.
+        let (phoff_off, phnum_off, phentsize) = if is_64 {
+            (0x20, 0x38, 56usize)
         } else {
-            (0x1c, 0x2a, 0x2c, 32usize)
+            (0x1c, 0x2c, 32usize)
         };
         let word = if is_64 { 8 } else { 4 };
         let phoff = endian.read_uint(&self.data, phoff_off, word) as usize;
-        let got_phentsize = endian.read_uint(&self.data, phentsize_off, 2) as usize;
-        let phnum = endian.read_uint(&self.data, phnum_off, 2) as usize;
-        if got_phentsize != phentsize {
-            return Err(anyhow!("unexpected program-header entry size {got_phentsize}"));
-        }
+        let phdrs = self.program_headers()?;
+        let phnum = phdrs.len();
 
-        // Find a PT_NOTE entry to repurpose (p_type is the first word of every
-        // program header, in both ELF classes).
-        let mut note_off = None;
-        for i in 0..phnum {
-            let off = phoff + i * phentsize;
-            if endian.read_uint(&self.data, off, 4) as u32 == PT_NOTE {
-                note_off = Some(off);
-                break;
-            }
-        }
+        // Find a PT_NOTE entry to repurpose.
+        let note_off = phdrs
+            .iter()
+            .find(|ph| ph.p_type == PT_NOTE)
+            .map(|ph| ph.entry_off);
 
         // Many statically-linked targets carry no PT_NOTE at all,
         // just REGINFO + a couple of PT_LOADs. Rather than give up, grow the
@@ -495,15 +605,12 @@ impl Binary {
         let note_off = match note_off {
             Some(off) => off,
             None => {
-                let (poff_field, poff_w) = if is_64 { (8, 8) } else { (4, 4) };
-                let mut first_claimed = u64::MAX;
-                for i in 0..phnum {
-                    let off = phoff + i * phentsize;
-                    let p_off = endian.read_uint(&self.data, off + poff_field, poff_w);
-                    if p_off > 0 {
-                        first_claimed = first_claimed.min(p_off);
-                    }
-                }
+                let mut first_claimed = phdrs
+                    .iter()
+                    .map(|ph| ph.p_offset)
+                    .filter(|&off| off > 0)
+                    .min()
+                    .unwrap_or(u64::MAX);
                 // Only the start of the section-header table matters here;
                 // its entry size and count are irrelevant to the padding gap.
                 let (eshoff_off, eshoff_w) = if is_64 { (0x28, 8) } else { (0x20, 4) };
@@ -567,6 +674,7 @@ impl Binary {
             endian.write_uint(d, note_off + 28, 4, align);
         }
 
+        self.invalidate_caches();
         Ok(())
     }
 }
@@ -635,12 +743,7 @@ mod tests {
 
     #[test]
     fn test_patch_bytes_writes_code_and_nop_fills_the_rest() {
-        let mut binary = Binary {
-            data: vec![0; 100],
-            arch: Architecture::X86_64,
-            endian: Endian::Little,
-            inject_base: None,
-        };
+        let mut binary = Binary::new(vec![0; 100], Architecture::X86_64, Endian::Little);
 
         binary.patch_bytes(10, 10, &[0xAA, 0xBB]).unwrap();
 
@@ -654,12 +757,7 @@ mod tests {
 
     #[test]
     fn test_patch_bytes_exact_fit_leaves_no_padding() {
-        let mut binary = Binary {
-            data: vec![0; 100],
-            arch: Architecture::X86_64,
-            endian: Endian::Little,
-            inject_base: None,
-        };
+        let mut binary = Binary::new(vec![0; 100], Architecture::X86_64, Endian::Little);
 
         binary.patch_bytes(10, 10, &[0xAA; 10]).unwrap();
 
@@ -670,12 +768,7 @@ mod tests {
 
     #[test]
     fn test_patch_bytes_empty_code_fills_region_with_nops() {
-        let mut binary = Binary {
-            data: vec![0; 100],
-            arch: Architecture::X86_64,
-            endian: Endian::Little,
-            inject_base: None,
-        };
+        let mut binary = Binary::new(vec![0; 100], Architecture::X86_64, Endian::Little);
 
         binary.patch_bytes(10, 10, &[]).unwrap();
 
@@ -685,12 +778,7 @@ mod tests {
 
     #[test]
     fn test_patch_bytes_code_too_large_errors() {
-        let mut binary = Binary {
-            data: vec![0; 100],
-            arch: Architecture::X86_64,
-            endian: Endian::Little,
-            inject_base: None,
-        };
+        let mut binary = Binary::new(vec![0; 100], Architecture::X86_64, Endian::Little);
 
         let err = binary.patch_bytes(10, 10, &[0x90; 15]).unwrap_err();
         assert!(err.to_string().contains("larger than region"));
@@ -698,12 +786,7 @@ mod tests {
 
     #[test]
     fn test_patch_bytes_region_out_of_bounds_errors() {
-        let mut binary = Binary {
-            data: vec![0; 100],
-            arch: Architecture::X86_64,
-            endian: Endian::Little,
-            inject_base: None,
-        };
+        let mut binary = Binary::new(vec![0; 100], Architecture::X86_64, Endian::Little);
 
         assert!(binary.patch_bytes(96, 14, &[0x90; 5]).is_err());
     }
@@ -714,12 +797,7 @@ mod tests {
     /// NOP fill writing past the end of the image.
     #[test]
     fn test_patch_bytes_region_length_cannot_wrap_past_the_bounds_check() {
-        let mut binary = Binary {
-            data: vec![0; 100],
-            arch: Architecture::X86_64,
-            endian: Endian::Little,
-            inject_base: None,
-        };
+        let mut binary = Binary::new(vec![0; 100], Architecture::X86_64, Endian::Little);
 
         let err = binary.patch_bytes(10, usize::MAX - 5, &[0xAA]).unwrap_err();
         assert!(err.to_string().contains("outside the binary"));
@@ -728,12 +806,7 @@ mod tests {
 
     #[test]
     fn test_jump_bytes_x86_encodes_relative_offset() {
-        let binary = Binary {
-            data: vec![0; 1000],
-            arch: Architecture::X86_64,
-            endian: Endian::Little,
-            inject_base: None,
-        };
+        let binary = Binary::new(vec![0; 1000], Architecture::X86_64, Endian::Little);
 
         // Forward jump: E9 followed by rel32 = target - (from + 5).
         let jump = binary.jump_bytes(0x100, 0x200).unwrap();
@@ -768,12 +841,7 @@ mod tests {
     /// instruction is leftover code from the function being replaced.
     #[test]
     fn mips_trampoline_fills_its_delay_slot() {
-        let binary = Binary {
-            data: vec![0; 0x1000],
-            arch: Architecture::Mips,
-            endian: Endian::Little,
-            inject_base: None,
-        };
+        let binary = Binary::new(vec![0; 0x1000], Architecture::Mips, Endian::Little);
 
         let jump = binary.jump_bytes(0x0022_9fd8, 0x0034_0000).unwrap();
         assert_eq!(jump.len(), 8, "trampoline must be j + nop");
@@ -785,12 +853,7 @@ mod tests {
     /// unencodable and must be reported rather than silently truncated.
     #[test]
     fn mips_trampoline_rejects_region_crossing_jump() {
-        let binary = Binary {
-            data: vec![0; 0x1000],
-            arch: Architecture::Mips,
-            endian: Endian::Little,
-            inject_base: None,
-        };
+        let binary = Binary::new(vec![0; 0x1000], Architecture::Mips, Endian::Little);
 
         let err = binary.jump_bytes(0x0022_9fd8, 0x1234_5678).unwrap_err();
         assert!(err.to_string().contains("256MB"), "got: {err}");
@@ -878,12 +941,7 @@ mod tests {
             endian.write_uint(&mut d, po + l.p_flags, 4, p_flags);
             endian.write_uint(&mut d, po + l.p_align, l.word, p_align);
         }
-        Binary {
-            data: d,
-            arch,
-            endian,
-            inject_base: None,
-        }
+        Binary::new(d, arch, endian)
     }
 
     /// The file offset of every program header in `bin`.
@@ -1009,6 +1067,85 @@ mod tests {
             base % align,
             "p_vaddr {base:#x} and p_offset {p_offset:#x} must be congruent mod {align:#x}"
         );
+    }
+
+    /// Address translation and segment layout read the program-header table
+    /// directly instead of parsing the whole image, so that reader has to agree
+    /// with a real ELF parse -- in both classes and both byte orders, whose
+    /// program-header layouts differ.
+    #[test]
+    fn program_headers_match_a_full_elf_parse() {
+        use goblin::elf::program_header::{PT_LOAD, PT_NOTE};
+        for (endian, arch) in [
+            (Endian::Little, Architecture::X86_64),
+            (Endian::Big, Architecture::Mips64),
+            (Endian::Little, Architecture::Arm),
+            (Endian::Big, Architecture::Mips),
+        ] {
+            let phdrs: [Phdr; 3] = [
+                (PT_LOAD as u64, 0x1000, 0x400000, 0x400, 5, 0x10000),
+                (PT_LOAD as u64, 0x1400, 0x500000, 0x123, 6, 0x1000),
+                (PT_NOTE as u64, 0x100, 0x400100, 0x20, 4, 4),
+            ];
+            let bin = craft_injectable(endian, arch, 0x2000, &phdrs);
+            let elf = goblin::elf::Elf::parse(bin.data()).unwrap();
+            let ours = bin.program_headers().unwrap();
+
+            assert_eq!(ours.len(), elf.program_headers.len(), "{arch:?}");
+            for (i, (o, g)) in ours.iter().zip(&elf.program_headers).enumerate() {
+                let layout = layout(arch.is_64());
+                assert_eq!(o.entry_off, layout.phoff as usize + i * layout.phentsize);
+                assert_eq!(
+                    (o.p_type, o.p_offset, o.p_vaddr, o.p_filesz, o.p_memsz, o.p_align),
+                    (
+                        g.p_type,
+                        g.p_offset,
+                        g.p_vaddr,
+                        g.p_filesz,
+                        g.p_memsz,
+                        g.p_align
+                    ),
+                    "{arch:?} program header {i}"
+                );
+            }
+        }
+    }
+
+    /// A header claiming more program headers than the file holds must be
+    /// refused. The reader indexes the image directly, so an unchecked count
+    /// would panic rather than report a malformed target.
+    #[test]
+    fn program_headers_refuse_a_table_outside_the_image() {
+        use goblin::elf::program_header::PT_LOAD;
+        let phdrs: [Phdr; 1] = [(PT_LOAD as u64, 0, 0x400000, 0x400, 5, 0x1000)];
+        let mut bin = craft_injectable(Endian::Little, Architecture::X86_64, 0x400, &phdrs);
+        let l = layout(true);
+        bin.endian.write_uint(&mut bin.data, l.phnum_off, 2, 1000);
+
+        let err = bin.program_headers().unwrap_err().to_string();
+        assert!(err.contains("runs past the end"), "{err}");
+        // Every entry point that reads the table has to report it, not panic.
+        assert!(bin.va_to_offset(0x400000).is_err());
+        assert!(bin.injected_base().is_err());
+        assert!(bin.inject_segment(INJECT_AT, &PAYLOAD).is_err());
+    }
+
+    /// Address translation must see a segment that was just injected: nothing
+    /// derived from the program headers may outlive the edit that rewrote them.
+    #[test]
+    fn va_to_offset_sees_a_freshly_injected_segment() {
+        use goblin::elf::program_header::{PT_LOAD, PT_NOTE};
+        let phdrs: [Phdr; 2] = [
+            (PT_LOAD as u64, 0, 0x400000, 0x400, 5, 0x1000),
+            (PT_NOTE as u64, 0x100, 0x400100, 0x20, 4, 4),
+        ];
+        let mut bin = craft_injectable(Endian::Little, Architecture::X86_64, 0x400, &phdrs);
+
+        assert!(bin.va_to_offset(INJECT_AT).is_err(), "nothing is mapped there yet");
+        bin.inject_segment(INJECT_AT, &PAYLOAD).unwrap();
+
+        let off = bin.va_to_offset(INJECT_AT).unwrap();
+        assert_eq!(&bin.data()[off..off + PAYLOAD.len()], &PAYLOAD);
     }
 
     #[test]
