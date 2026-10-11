@@ -382,8 +382,28 @@ impl Binary {
 
     /// Translate a virtual address to a file offset using the program headers.
     pub fn va_to_offset(&self, va: u64) -> Result<usize> {
+        Self::translate(&self.program_headers()?, va)
+    }
+
+    /// Translate every address in `vas`, reading the program-header table once
+    /// instead of once per address.
+    ///
+    /// The table cannot be cached across calls to
+    /// [`patch_bytes`](Self::patch_bytes), which may rewrite the bytes it is
+    /// read from, so translating each splice's address as it is patched re-read
+    /// it once per splice. That was the bulk of what applying a few thousand
+    /// splices cost; the caller translates the whole batch up front instead,
+    /// which also means an unmapped address is reported before any of the
+    /// others have been written.
+    pub fn va_to_offsets(&self, vas: impl IntoIterator<Item = u64>) -> Result<Vec<usize>> {
+        let phdrs = self.program_headers()?;
+        vas.into_iter().map(|va| Self::translate(&phdrs, va)).collect()
+    }
+
+    /// Find the `PT_LOAD` mapping `va` and convert it to a file offset.
+    fn translate(phdrs: &[Phdr], va: u64) -> Result<usize> {
         use goblin::elf::program_header::PT_LOAD;
-        for ph in self.program_headers()? {
+        for ph in phdrs {
             if ph.p_type == PT_LOAD && va >= ph.p_vaddr && va < ph.p_vaddr + ph.p_filesz {
                 return Ok((ph.p_offset + (va - ph.p_vaddr)) as usize);
             }
