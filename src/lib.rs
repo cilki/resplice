@@ -382,13 +382,75 @@ impl Binary {
 
     /// Translate a virtual address to a file offset using the program headers.
     pub fn va_to_offset(&self, va: u64) -> Result<usize> {
+        self.va_range_to_offset(va, 1)
+    }
+
+    /// Translate `[va, va + len)` to the file offset of its first byte,
+    /// requiring the *whole* range to be file-backed by a single `PT_LOAD`.
+    ///
+    /// Translating only `va` is not enough for a caller that goes on to write
+    /// `len` bytes there. A virtual address range is contiguous in the file only
+    /// for as long as one segment maps it: past `p_offset + p_filesz` the file
+    /// carries something else entirely — inter-segment padding, the next
+    /// segment's content, or the section headers — while the addresses past
+    /// `p_vaddr + p_filesz` are `.bss` or not mapped at all.
+    ///
+    /// So a patch region that runs off the end of its segment lands on file
+    /// bytes that have nothing to do with the addresses asked for. A `static`
+    /// splice whose range overshot `.data` into `.bss` used to overwrite the
+    /// symbol table, and a longer overshoot reached the next segment's
+    /// `.dynamic` and `.got`, producing a binary that segfaults in the loader —
+    /// both reported as a successful splice.
+    pub fn va_range_to_offset(&self, va: u64, len: u64) -> Result<usize> {
         use goblin::elf::program_header::PT_LOAD;
+
+        let end = va
+            .checked_add(len)
+            .ok_or_else(|| anyhow!("range {va:#x}..+{len:#x} wraps the address space"))?;
+
+        // Saturating throughout: `p_vaddr`/`p_filesz`/`p_offset` come straight
+        // out of the target's headers, which nothing has vetted, and a sum that
+        // wrapped would make a segment appear to map addresses it does not.
+        let mut truncated = None;
         for ph in self.program_headers()? {
-            if ph.p_type == PT_LOAD && va >= ph.p_vaddr && va < ph.p_vaddr + ph.p_filesz {
-                return Ok((ph.p_offset + (va - ph.p_vaddr)) as usize);
+            if ph.p_type != PT_LOAD {
+                continue;
             }
+            let seg_end = ph.p_vaddr.saturating_add(ph.p_filesz);
+            if va < ph.p_vaddr || va >= seg_end {
+                continue;
+            }
+            if end > seg_end {
+                // Another segment may still map the whole range (they are not
+                // required to be disjoint), so keep looking and report this one
+                // only if none does.
+                truncated = Some((ph.p_vaddr, seg_end));
+                continue;
+            }
+            let off = ph.p_offset.saturating_add(va - ph.p_vaddr);
+            if off.saturating_add(len) > self.data.len() as u64 {
+                return Err(anyhow!(
+                    "{va:#x} maps to file offset {off:#x}, where {len:#x} bytes run \
+                     past the end of the {}-byte image",
+                    self.data.len()
+                ));
+            }
+            return Ok(off as usize);
         }
-        Err(anyhow!("virtual address {va:#x} is not mapped by any PT_LOAD segment"))
+
+        match truncated {
+            Some((seg_start, seg_end)) => Err(anyhow!(
+                "the PT_LOAD that maps {va:#x} holds file-backed data only for \
+                 {seg_start:#x}..{seg_end:#x}, so the {} bytes of {va:#x}..{end:#x} \
+                 past {seg_end:#x} are not mapped there at all -- writing them would \
+                 land on whatever the file happens to hold instead (inter-segment \
+                 padding, the next segment's content, the section headers)",
+                end - seg_end
+            )),
+            None => Err(anyhow!(
+                "virtual address {va:#x} is not mapped by any PT_LOAD segment"
+            )),
+        }
     }
 
     /// The highest virtual address occupied by any loadable segment.
@@ -398,7 +460,10 @@ impl Binary {
             .program_headers()?
             .iter()
             .filter(|ph| ph.p_type == PT_LOAD)
-            .map(|ph| ph.p_vaddr + ph.p_memsz)
+            // Saturating: the header fields are unvetted, and a wrapping sum
+            // here would under-report the end of the image, putting the default
+            // injected base inside it.
+            .map(|ph| ph.p_vaddr.saturating_add(ph.p_memsz))
             .max()
             .unwrap_or(0))
     }
@@ -1128,6 +1193,64 @@ mod tests {
         assert!(bin.va_to_offset(0x400000).is_err());
         assert!(bin.injected_base().is_err());
         assert!(bin.inject_segment(INJECT_AT, &PAYLOAD).is_err());
+    }
+
+    /// A patch region that starts inside a segment but runs past the end of its
+    /// file-backed data must be refused.
+    ///
+    /// Translating `begin` alone said nothing about the rest of the region, so
+    /// the bytes past the segment's `p_filesz` were written at file offsets that
+    /// hold something else entirely -- padding, the next segment's content, the
+    /// section headers -- while the addresses they were meant for were never
+    /// touched. The image is long enough for the write either way, so
+    /// `patch_bytes`' own bounds check does not see it.
+    #[test]
+    fn va_range_to_offset_refuses_a_region_past_its_segment() {
+        use goblin::elf::program_header::PT_LOAD;
+        // Two segments, each with 0x400 bytes of file-backed data, inside a
+        // 0x2000-byte image: everything past the first one's 0x400 bytes is
+        // file content that does not belong to its addresses.
+        let phdrs: [Phdr; 2] = [
+            (PT_LOAD as u64, 0, 0x400000, 0x400, 5, 0x1000),
+            (PT_LOAD as u64, 0x1000, 0x500000, 0x400, 6, 0x1000),
+        ];
+        let bin = craft_injectable(Endian::Little, Architecture::X86_64, 0x2000, &phdrs);
+
+        // A region ending exactly at the segment's end still translates.
+        assert_eq!(bin.va_range_to_offset(0x4003f0, 0x10).unwrap(), 0x3f0);
+        assert_eq!(bin.va_range_to_offset(0x500000, 0x400).unwrap(), 0x1000);
+
+        // One byte more runs off the segment, and must be reported rather than
+        // written to the file byte that follows (which is not at that address).
+        let err = bin.va_range_to_offset(0x4003f0, 0x11).unwrap_err().to_string();
+        assert!(err.contains("file-backed data only for"), "{err}");
+        assert!(err.contains("0x400000..0x400400"), "{err}");
+
+        // Unmapped addresses, and ranges that wrap, are still refused.
+        assert!(bin.va_range_to_offset(0x450000, 1).is_err());
+        assert!(bin.va_range_to_offset(0x400000, u64::MAX).is_err());
+    }
+
+    /// A segment claiming more file-backed data than the image holds, and one
+    /// whose `p_vaddr + p_filesz` overflows, both have to be reported rather
+    /// than translated (or panicked on): the header fields come straight out of
+    /// a target nothing has vetted.
+    #[test]
+    fn va_range_to_offset_refuses_headers_the_image_cannot_back() {
+        use goblin::elf::program_header::PT_LOAD;
+        // 0x400 bytes of claimed file data starting at file offset 0x300, in an
+        // image only 0x400 bytes long.
+        let phdrs: [Phdr; 1] = [(PT_LOAD as u64, 0x300, 0x400000, 0x400, 5, 0x1000)];
+        let bin = craft_injectable(Endian::Little, Architecture::X86_64, 0x400, &phdrs);
+        assert_eq!(bin.va_range_to_offset(0x400000, 0x100).unwrap(), 0x300);
+        let err = bin.va_range_to_offset(0x400000, 0x101).unwrap_err().to_string();
+        assert!(err.contains("run past the end"), "{err}");
+
+        // A segment whose end wraps must not appear to map everything.
+        let phdrs: [Phdr; 1] = [(PT_LOAD as u64, 0, u64::MAX - 0xff, 0x400, 5, 0x1000)];
+        let bin = craft_injectable(Endian::Little, Architecture::X86_64, 0x400, &phdrs);
+        assert!(bin.va_range_to_offset(0x1000, 1).is_err());
+        assert!(bin.va_range_to_offset(u64::MAX - 0xff, 0x100).is_err());
     }
 
     /// Address translation must see a segment that was just injected: nothing
