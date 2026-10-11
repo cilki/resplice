@@ -104,13 +104,27 @@ pub fn link_rlib(binary: &mut Binary, rlib_path: &Path) -> Result<Vec<Applied>> 
         }
     }
 
+    // Translate each region to a file offset before anything is written: the
+    // *whole* region has to be file-backed by one segment, not just `begin`.
+    // A region that runs off the end of the segment mapping it would otherwise
+    // be written over whatever the file holds past that segment -- see
+    // [`Binary::va_range_to_offset`]. Appending the injected segment only grows
+    // the image, so these offsets stay valid across the injection below.
+    let offsets = patches
+        .iter()
+        .map(|p| {
+            binary
+                .va_range_to_offset(p.begin, p.end - p.begin)
+                .with_context(|| format!("splice {:#x}..{:#x}", p.begin, p.end))
+        })
+        .collect::<Result<Vec<usize>>>()?;
+
     if !blob.is_empty() {
         binary.inject_segment(base, &blob)?;
     }
 
     let mut applied = Vec::new();
-    for patch in patches {
-        let offset = binary.va_to_offset(patch.begin)?;
+    for (patch, offset) in patches.into_iter().zip(offsets) {
         let region = (patch.end - patch.begin) as usize;
         binary.patch_bytes(offset, region, &patch.code)?;
         applied.push(Applied {
@@ -1102,6 +1116,48 @@ mod tests {
         let msg = link_err("rlib_reversed", &build_rlib(SPLICE_VA - 8));
         assert!(msg.contains("reversed"), "message was {msg:?}");
         assert!(msg.contains("0x401000..0x400ff8"), "message was {msg:?}");
+    }
+
+    /// A splice whose region runs off the end of the segment that maps its
+    /// `begin` must be refused.
+    ///
+    /// Only `begin` used to be translated, and the region length was then
+    /// written from there — so the part of the region past the segment's
+    /// file-backed data landed on file bytes belonging to something else, while
+    /// the addresses it was meant for were never touched. On a real target that
+    /// silently rewrote the symbol table (a `static` splice whose range overshot
+    /// `.data` into `.bss`) or, for a longer overshoot, the next segment's
+    /// `.dynamic` and `.got`, leaving a binary that segfaults in the loader —
+    /// and `resplice` reported a successful splice either way.
+    #[test]
+    fn test_link_rlib_rejects_splice_past_its_segment() {
+        // Shrink the target's PT_LOAD so its file-backed data stops at
+        // 0x401010, leaving the 0x20-byte splice region half outside it. The
+        // image is still 0x2000 bytes, so the write itself would fit in the
+        // file: nothing downstream would notice.
+        let mut target = crafted_target();
+        for field in [32, 40] {
+            // p_filesz, p_memsz of the first program header (at offset 64).
+            target[64 + field..64 + field + 8].copy_from_slice(&0x1010u64.to_le_bytes());
+        }
+
+        let rlib_path = temp_path("rlib_past_segment");
+        fs::write(&rlib_path, build_rlib(SPLICE_VA + 0x20)).unwrap();
+        let mut bin = load(&target);
+        let result = link_rlib(&mut bin, &rlib_path);
+        fs::remove_file(&rlib_path).ok();
+
+        let msg = format!("{:#}", result.expect_err("expected an error"));
+        assert!(msg.contains("splice 0x401000..0x401020"), "message was {msg:?}");
+        assert!(msg.contains("file-backed data only for"), "message was {msg:?}");
+        assert!(msg.contains("0x400000..0x401010"), "message was {msg:?}");
+        // Refused before anything was written over the target's own bytes.
+        assert_eq!(&bin.data()[0x1000..0x1020], &[0xcc; 0x20], "target was patched");
+
+        // The same splice is still applied when the segment does cover it.
+        let (bin, applied) = run_link(&build_rlib(SPLICE_VA + 0x20));
+        assert_eq!(applied.len(), 1);
+        assert_ne!(&bin.data()[0x1000..0x1020], &[0xcc; 0x20]);
     }
 
     /// A relocation whose field lies outside the section it belongs to must be
