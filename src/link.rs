@@ -25,7 +25,7 @@ use object::elf::RelocationType;
 use object::{
     Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget, SectionKind,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -124,6 +124,11 @@ pub fn link_rlib(binary: &mut Binary, rlib_path: &Path) -> Result<Vec<Applied>> 
 }
 
 /// Owned copy of a section we may need to inject or patch.
+///
+/// Only the metadata is read for every section of the object. The contents --
+/// `bytes` and `relocs` -- are what the linker is expensive about, so they stay
+/// empty until the closure in [`link_object`] reaches the section. See
+/// [`extract_relocs`].
 struct Sec {
     name: String,
     align: u64,
@@ -132,7 +137,9 @@ struct Sec {
     /// on a `fn` lands in an executable section, one on a `static` does not,
     /// and the two cannot be patched the same way. See [`link_object`].
     code: bool,
+    /// The section's contents; empty until the closure reaches the section.
     bytes: Vec<u8>,
+    /// The section's relocations; empty until the closure reaches the section.
     relocs: Vec<Rel>,
     /// `Some((begin, end))` for a pinned `.rspl.*` section.
     splice: Option<(u64, u64)>,
@@ -245,6 +252,61 @@ fn verify_arch(obj: &object::File, target: &Binary) -> Result<()> {
     Ok(())
 }
 
+/// Read the relocations of one section, recording every symbol they reference
+/// in `syms`.
+///
+/// Called for the sections the closure in [`link_object`] actually reaches,
+/// rather than for the whole object, because the bulk of an rlib's relocations
+/// belong to sections no splice can reach. A `cargo build` compiles with debug
+/// info, and the resulting `.debug_info`, `.debug_ranges`, `.debug_loc` and
+/// `.eh_frame` carry tens of thousands of relocations apiece -- for a crate of
+/// 2000 splices, 98k of the object's 110k relocations were debug info. Reading
+/// those, and interning the name of every symbol they mention, was the single
+/// most expensive thing linking did.
+fn extract_relocs(
+    obj: &object::File,
+    index: usize,
+    name: &str,
+    syms: &mut HashMap<usize, SymInfo>,
+) -> Result<Vec<Rel>> {
+    let section = obj
+        .section_by_index(object::SectionIndex(index))
+        .map_err(|e| anyhow!("bad section index {index} ({name}): {e}"))?;
+
+    let mut relocs = Vec::new();
+    for (offset, reloc) in section.relocations() {
+        let r_type = match reloc.flags() {
+            RelocationFlags::Elf { r_type } => r_type,
+            _ => return Err(anyhow!("non-ELF relocation in {name}")),
+        };
+        let sym = match reloc.target() {
+            RelocationTarget::Symbol(i) => i,
+            other => return Err(anyhow!("unsupported relocation target {other:?} in {name}")),
+        };
+        relocs.push(Rel {
+            offset,
+            r_type,
+            sym: sym.0,
+            addend: reloc.addend(),
+            has_implicit: reloc.has_implicit_addend(),
+        });
+
+        // Record the referenced symbol.
+        if let std::collections::hash_map::Entry::Vacant(slot) = syms.entry(sym.0) {
+            let s = obj
+                .symbol_by_index(sym)
+                .map_err(|e| anyhow!("bad symbol index {} in {name}: {e}", sym.0))?;
+            slot.insert(SymInfo {
+                name: s.name().unwrap_or("").to_string(),
+                section: s.section_index().map(|i| i.0),
+                value: s.address(),
+                undefined: s.is_undefined(),
+            });
+        }
+    }
+    Ok(relocs)
+}
+
 /// The paired `R_MIPS_LO16` addend for an `R_MIPS_HI16`, read from the original
 /// section bytes (the low half of the first matching-symbol LO16 instruction).
 fn find_pair_lo(arch: Architecture, sec: &Sec, sym: usize, endian: Endian) -> Option<i64> {
@@ -273,58 +335,24 @@ fn link_object(
     let endian = target.endian();
     let is_64 = target.is_64();
 
-    // Extract everything we need into owned structures so the borrow of `obj`
-    // does not outlive this block.
+    // Metadata for every section, into owned structures so the borrow of `obj`
+    // does not outlive this function. Reading each section's *contents* is left
+    // to the closure walk below, which knows which of them matter.
     let mut secs: HashMap<usize, Sec> = HashMap::new();
     let mut syms: HashMap<usize, SymInfo> = HashMap::new();
 
     for section in obj.sections() {
-        let idx = section.index().0;
         let name = section.name().unwrap_or("").to_string();
-        let mut relocs = Vec::new();
-        for (offset, reloc) in section.relocations() {
-            let r_type = match reloc.flags() {
-                RelocationFlags::Elf { r_type } => r_type,
-                _ => return Err(anyhow!("non-ELF relocation in {name}")),
-            };
-            let sym = match reloc.target() {
-                RelocationTarget::Symbol(i) => i.0,
-                other => {
-                    return Err(anyhow!("unsupported relocation target {other:?} in {name}"))
-                }
-            };
-            relocs.push(Rel {
-                offset,
-                r_type,
-                sym,
-                addend: reloc.addend(),
-                has_implicit: reloc.has_implicit_addend(),
-            });
-
-            // Record the referenced symbol.
-            if let std::collections::hash_map::Entry::Vacant(slot) = syms.entry(sym) {
-                let s = obj
-                    .symbol_by_index(object::SymbolIndex(sym))
-                    .map_err(|e| anyhow!("bad symbol index {sym} in {name}: {e}"))?;
-                slot.insert(SymInfo {
-                    name: s.name().unwrap_or("").to_string(),
-                    section: s.section_index().map(|i| i.0),
-                    value: s.address(),
-                    undefined: s.is_undefined(),
-                });
-            }
-        }
-
         secs.insert(
-            idx,
+            section.index().0,
             Sec {
                 splice: splice_range(&name)?,
                 name,
                 align: section.align().max(1),
                 writable: is_runtime_writable(&section),
                 code: matches!(section.kind(), SectionKind::Text),
-                bytes: section.data().unwrap_or(&[]).to_vec(),
-                relocs,
+                bytes: Vec::new(),
+                relocs: Vec::new(),
             },
         );
     }
@@ -332,26 +360,46 @@ fn link_object(
     // Transitive closure: starting from the splice sections, pull in every
     // section reachable through a relocation. Splice sections are pinned to
     // their `begin` address; everything else is injected.
-    let splice_idxs: Vec<usize> = secs
+    // Sorted, so the layout below -- and therefore every injected address and
+    // every byte of the patched binary -- does not depend on the iteration
+    // order of a `HashMap`, which varies from one run to the next.
+    let mut splice_idxs: Vec<usize> = secs
         .iter()
         .filter(|(_, s)| s.splice.is_some())
         .map(|(&i, _)| i)
         .collect();
+    splice_idxs.sort_unstable();
 
     let mut inject_order: Vec<usize> = Vec::new();
     let mut included: Vec<usize> = splice_idxs.clone();
+    // Membership test for the walk below, which `included` cannot serve: it has
+    // to keep its insertion order (it is what the layout and relocation passes
+    // iterate), and scanning it for every reference visited makes collecting
+    // the closure quadratic in the number of sections reached. A crate that
+    // reimplements a few thousand functions reaches tens of thousands of them,
+    // each helper and `.rodata` constant in its own section.
+    let mut seen: HashSet<usize> = splice_idxs.iter().copied().collect();
     let mut work: Vec<usize> = splice_idxs.clone();
     while let Some(si) = work.pop() {
-        let reloc_syms: Vec<usize> = secs[&si].relocs.iter().map(|r| r.sym).collect();
-        for sym in reloc_syms {
-            if let Some(secj) = syms.get(&sym).and_then(|s| s.section) {
-                if !included.contains(&secj) {
+        let relocs = extract_relocs(obj, si, &secs[&si].name, &mut syms)?;
+        for r in &relocs {
+            if let Some(secj) = syms.get(&r.sym).and_then(|s| s.section) {
+                if seen.insert(secj) {
                     included.push(secj);
                     inject_order.push(secj);
                     work.push(secj);
                 }
             }
         }
+        secs.get_mut(&si).unwrap().relocs = relocs;
+    }
+
+    // The closure is settled, so now read the contents of just those sections.
+    for &si in &included {
+        secs.get_mut(&si).unwrap().bytes = obj
+            .section_by_index(object::SectionIndex(si))
+            .and_then(|s| s.data().map(<[u8]>::to_vec))
+            .unwrap_or_default();
     }
 
     // A splice whose code fits its `[begin, end)` region is pinned there and
@@ -461,10 +509,15 @@ fn link_object(
     for &si in &included {
         let sec = &secs[&si];
         let site_base = sec_va[&si];
-        let is_fit_splice = sec.splice.is_some() && !oversized.contains(&si);
+        // Everything laid out into the blob above -- referenced sections and
+        // oversized splices alike -- is relocated there in place; a splice that
+        // was never laid out is the one that fits its region, and is relocated
+        // in a private buffer. (Scanning `oversized` for that answer instead
+        // cost a linear search per included section.)
+        let bo = inj_blob_off.get(&si).copied();
+        let is_fit_splice = sec.splice.is_some() && bo.is_none();
 
         let mut out = if is_fit_splice { sec.bytes.clone() } else { Vec::new() };
-        let bo = if is_fit_splice { 0 } else { inj_blob_off[&si] };
 
         for r in &sec.relocs {
             let s = resolve(r.sym)?;
@@ -481,10 +534,9 @@ fn link_object(
             // `bo` would let a relocation whose offset lies past the end of its
             // own section quietly rewrite whichever section follows it in the
             // injected blob, and `arch::apply` would have no way to tell.
-            let buf: &mut [u8] = if is_fit_splice {
-                &mut out
-            } else {
-                &mut blob[bo..bo + sec.bytes.len()]
+            let buf: &mut [u8] = match bo {
+                Some(bo) => &mut blob[bo..bo + sec.bytes.len()],
+                None => &mut out,
             };
             arch::apply(
                 arch,
@@ -1127,5 +1179,66 @@ mod tests {
             msg.contains("0x401000..0x401010") && msg.contains("0x401008..0x401018"),
             "message was {msg:?}"
         );
+    }
+
+    /// Linking the same rlib twice has to produce the same bytes.
+    ///
+    /// The sections are collected into a `HashMap` and the injected segment is
+    /// laid out in the order they come back out of it, which Rust randomizes per
+    /// process. With more than one splice that put a different address on every
+    /// injected helper and constant from one run to the next, so the patched
+    /// binary -- the artifact a user ships, checksums or compares against a
+    /// previous build -- was a different file each time it was produced.
+    #[test]
+    fn test_link_rlib_is_deterministic() {
+        use object::write::{Object, Relocation};
+        use object::{
+            Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind,
+        };
+
+        // Four splices, each calling a helper of its own, so a layout that
+        // follows `HashMap` order has four orderings to disagree about.
+        let rlib = {
+            let mut obj =
+                Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+            for i in 0..4u64 {
+                let begin = SPLICE_VA + i * 0x20;
+                let helper = obj.add_section(
+                    vec![],
+                    format!(".text.helper{i}").into_bytes(),
+                    SectionKind::Text,
+                );
+                // Distinct lengths, so a different order really does move the
+                // later helpers to different addresses.
+                obj.append_section_data(helper, &vec![0xc3; 1 + i as usize], 1);
+                let helper_sym = obj.section_symbol(helper);
+
+                let name = format!(".rspl.{begin:x}.{:x}", begin + 0x20).into_bytes();
+                let rspl = obj.add_section(vec![], name, SectionKind::Text);
+                obj.append_section_data(rspl, &[0xe8, 0, 0, 0, 0, 0xc3], 16);
+                obj.add_relocation(
+                    rspl,
+                    Relocation {
+                        offset: 1,
+                        symbol: helper_sym,
+                        addend: -4,
+                        flags: RelocationFlags::Elf {
+                            r_type: object::elf::R_X86_64_PLT32,
+                        },
+                    },
+                )
+                .unwrap();
+            }
+            ar_wrap("splice.o", &obj.write().unwrap())
+        };
+
+        let (first, applied) = run_link(&rlib);
+        assert_eq!(applied.len(), 4);
+        // Repeatedly, because the orders that disagree are drawn at random: a
+        // single second run matching could be luck.
+        for _ in 0..8 {
+            let (again, _) = run_link(&rlib);
+            assert_eq!(first.data(), again.data(), "patched binary is not reproducible");
+        }
     }
 }
