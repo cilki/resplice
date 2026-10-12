@@ -207,7 +207,23 @@ impl Binary {
         match self.arch {
             Architecture::X86 | Architecture::X86_64 => {
                 // JMP rel32 (E9 XX XX XX XX)
-                let offset = (to as i64 - (from as i64 + 5)) as i32;
+                let disp = to as i64 - (from as i64 + 5);
+                // The displacement is a signed 32-bit field, and on x86-64 the
+                // two addresses can be further apart than it can express: with
+                // an `--inject-base` more than 2GB from the splice site the
+                // high bits were dropped, leaving a jump to an unrelated
+                // address -- reported as a successfully trampolined splice.
+                // (A 32-bit target cannot get there: its whole address space
+                // fits in the field, where a backwards jump correctly wraps.)
+                if self.is_64() && i32::try_from(disp).is_err() {
+                    return Err(anyhow!(
+                        "trampoline at {from:#x} is {disp:#x} bytes from its target \
+                         {to:#x}, which does not fit the signed 32-bit displacement \
+                         of a `jmp rel32`; choose an --inject-base within 2GB of the \
+                         splice"
+                    ));
+                }
+                let offset = disp as i32;
                 Ok(vec![
                     0xE9,
                     (offset & 0xFF) as u8,

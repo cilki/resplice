@@ -146,6 +146,19 @@ PT_LOAD at 0x400000..0x4009d4 (both round out to pages of 0x10000, so
 free in the target's address space
 ```
 
+The base also has to be within *reach* of the splices. A splice addresses its
+injected helpers and constants relative to its own address, through relocation
+fields narrower than a pointer — 32 bits on x86-64, so ±2GB, and only ±128MB
+for an aarch64 `bl` — and the trampoline of an oversized splice is the same
+width. A base further away than the field can express is rejected rather than
+written with its high bits dropped:
+
+```
+error: trampoline at 0x401000 is 0xffbff01b bytes from its target 0x100000020,
+which does not fit the signed 32-bit displacement of a `jmp rel32`; choose an
+--inject-base within 2GB of the splice
+```
+
 Note that the segment is mapped read+execute, so referenced *writable* data
 (mutable `static`s, `.bss`) is not supported yet and is reported as an error.
 
