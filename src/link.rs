@@ -1160,6 +1160,61 @@ mod tests {
         assert_ne!(&bin.data()[0x1000..0x1020], &[0xcc; 0x20]);
     }
 
+    /// A reference that cannot reach the injected segment must be refused
+    /// rather than written with its high bits dropped.
+    ///
+    /// Nothing malformed is needed to get there. The injected segment holds the
+    /// splice's helpers and constants, so every reference into it is relative
+    /// to the splice site, and on x86-64 those fields are 32 bits wide -- an
+    /// `--inject-base` more than 2GB away (the README's whole reason for the
+    /// flag is placing the segment somewhere known-free, which on a 64-bit
+    /// target is easily that far) does not fit in them. The truncated
+    /// displacement pointed the call at an unrelated address -- address 0, for
+    /// the base used here -- and `resplice` reported a successful splice.
+    /// aarch64 refused the same link from the start, since its branch encoder
+    /// range-checks; this was the rest of the encoders catching up.
+    #[test]
+    fn test_link_rlib_rejects_references_beyond_their_field() {
+        /// 4GB: free in the crafted target's address space, and far enough from
+        /// the splice site that no 32-bit field can span the distance.
+        const FAR: u64 = 0x1_0000_0000;
+
+        // Link `rlib` with the injected segment pinned at `base`.
+        let link_at = |tag: &str, rlib: &[u8], base: u64| {
+            let rlib_path = temp_path(tag);
+            fs::write(&rlib_path, rlib).unwrap();
+            let mut bin = load(&crafted_target());
+            bin.set_injected_base(Some(base));
+            let result = link_rlib(&mut bin, &rlib_path);
+            fs::remove_file(&rlib_path).ok();
+            (bin, result)
+        };
+
+        // A splice that fits its region stays at `begin` and calls its injected
+        // helper through a PLT32 displacement.
+        let (bin, result) = link_at("rlib_far", &build_rlib(SPLICE_VA + 0x20), FAR);
+        let msg = format!("{:#}", result.expect_err("expected an error"));
+        assert!(msg.contains("does not fit"), "message was {msg:?}");
+        assert!(msg.contains("signed 32-bit"), "message was {msg:?}");
+        assert!(msg.contains(".rspl.401000.401020"), "message was {msg:?}");
+        assert_eq!(&bin.data()[0x1000..0x1020], &[0xcc; 0x20], "target was patched");
+
+        // An oversized one is relocated into the segment instead, and the jump
+        // written at `begin` to reach it has the same 32-bit displacement.
+        let (bin, result) = link_at("rlib_far_tramp", &build_rlib(SPLICE_VA + 8), FAR);
+        let msg = format!("{:#}", result.expect_err("expected an error"));
+        assert!(msg.contains("jmp rel32"), "message was {msg:?}");
+        assert!(msg.contains("trampoline at 0x401000"), "message was {msg:?}");
+        assert_eq!(&bin.data()[0x1000..0x1008], &[0xcc; 8], "target was patched");
+
+        // A base that is within reach still links, both ways: the check must
+        // not refuse the distances a real splice actually spans.
+        for end in [SPLICE_VA + 0x20, SPLICE_VA + 8] {
+            let (_, result) = link_at("rlib_near", &build_rlib(end), 0x1000_0000);
+            assert_eq!(result.unwrap().len(), 1);
+        }
+    }
+
     /// A relocation whose field lies outside the section it belongs to must be
     /// refused. Applying it would write into whatever section happens to follow
     /// in the injected blob -- the splice's own data relocated to the wrong

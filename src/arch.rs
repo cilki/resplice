@@ -109,6 +109,29 @@ pub fn mips_lo16_addend(endian: Endian, buf: &[u8], off: usize) -> i64 {
     (insn & 0xffff) as i16 as i64
 }
 
+/// Refuse a resolved value that the relocation field about to be written cannot
+/// hold.
+///
+/// Every narrow field below is written with a truncating cast, so a value that
+/// does not fit is silently reduced to its low bits: the patched binary calls,
+/// jumps to, or loads from an address that has nothing to do with the symbol it
+/// was relocated against, and `resplice` reports a successful splice. Nothing
+/// malformed is needed to get there -- on a 64-bit target an `--inject-base`
+/// more than 2GB from the splice site puts every PC-relative reference into the
+/// injected segment out of range of its field.
+///
+/// The aarch64 branch and ADRP encoders checked their own ranges from the
+/// start; this is the same refusal for the fields that did not.
+fn does_not_fit(kind: &str, value: i128, field: &str) -> anyhow::Error {
+    anyhow!(
+        "{kind} {value:#x} does not fit the {field} field this relocation writes; \
+         truncating it would leave the reference pointing at an unrelated \
+         address. The symbol is too far from the relocated site -- for a \
+         reference into the injected segment, choose an --inject-base closer to \
+         the splice"
+    )
+}
+
 /// Width of the field the encoder for `r_type` reads and writes at the
 /// relocated offset: eight bytes for the handful of 64-bit relocations, and a
 /// four-byte instruction (or word) for everything else, including the types
@@ -161,12 +184,23 @@ pub fn apply(
 
     match arch {
         Architecture::X86 | Architecture::X86_64 => {
-            apply_x86_64(endian, r_type, buf, off, s, a, p, got_va)
+            apply_x86_64(endian, r_type, buf, off, s, a, p, got_va, arch.is_64())
         }
         Architecture::Arm64 => apply_aarch64(endian, r_type, buf, off, s, a, p, got_va),
         Architecture::Arm => apply_arm(endian, r_type, buf, off, s, p, got_va),
         Architecture::Mips | Architecture::Mips64 => {
-            apply_mips(endian, r_type, buf, off, s, a, p, has_implicit, pair_lo)
+            apply_mips(
+                endian,
+                r_type,
+                buf,
+                off,
+                s,
+                a,
+                p,
+                has_implicit,
+                pair_lo,
+                arch.is_64(),
+            )
         }
     }
 }
@@ -185,19 +219,48 @@ fn apply_x86_64(
     a: i64,
     p: u64,
     got_va: Option<u64>,
+    is_64: bool,
 ) -> Result<()> {
-    let pc32 = |v: i64| (v as i32) as u32 as u64;
+    // A 32-bit field cannot hold every value a reference can take on a 64-bit
+    // target, so each one is range-checked before it is written. On 32-bit x86
+    // every address fits by construction and the truncation *is* the right
+    // modular arithmetic (a backwards reference wraps), so checking there would
+    // reject legitimate relocations.
+    let pc32 = |v: i64| -> Result<u64> {
+        if is_64 {
+            i32::try_from(v)
+                .map_err(|_| does_not_fit("PC-relative displacement", v as i128, "signed 32-bit"))?;
+        }
+        Ok((v as i32) as u32 as u64)
+    };
     match r_type {
         R_X86_64_64 => endian.write_uint(buf, off, 8, s.wrapping_add(a as u64)),
         R_X86_64_PC64 => endian.write_uint(buf, off, 8, (s as i64 + a - p as i64) as u64),
         R_X86_64_PC32 | R_X86_64_PLT32 => {
-            endian.write_uint(buf, off, 4, pc32(s as i64 + a - p as i64))
+            let v = pc32(s as i64 + a - p as i64)?;
+            endian.write_uint(buf, off, 4, v)
         }
-        R_X86_64_32 => endian.write_uint(buf, off, 4, s.wrapping_add(a as u64) as u32 as u64),
-        R_X86_64_32S => endian.write_uint(buf, off, 4, s.wrapping_add(a as u64) as i32 as u32 as u64),
+        R_X86_64_32 => {
+            let v = s.wrapping_add(a as u64);
+            if is_64 {
+                u32::try_from(v).map_err(|_| {
+                    does_not_fit("absolute address", v as i128, "unsigned 32-bit")
+                })?;
+            }
+            endian.write_uint(buf, off, 4, v as u32 as u64)
+        }
+        R_X86_64_32S => {
+            let v = s.wrapping_add(a as u64) as i64;
+            if is_64 {
+                i32::try_from(v)
+                    .map_err(|_| does_not_fit("absolute address", v as i128, "signed 32-bit"))?;
+            }
+            endian.write_uint(buf, off, 4, v as i32 as u32 as u64)
+        }
         R_X86_64_GOTPCREL | R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX => {
             let g = got_va.ok_or_else(|| anyhow!("missing GOT slot for GOTPCREL"))?;
-            endian.write_uint(buf, off, 4, pc32(g as i64 + a - p as i64));
+            let v = pc32(g as i64 + a - p as i64)?;
+            endian.write_uint(buf, off, 4, v);
         }
         other => return Err(unsupported("x86-64", other)),
     }
@@ -224,12 +287,25 @@ fn apply_aarch64(
     got_va: Option<u64>,
 ) -> Result<()> {
     let page = |x: i64| x & !0xfff;
+    // The ABI's range for both 32-bit word relocations is -2^31 <= X < 2^32:
+    // the field holds either representation of a 32-bit value, and nothing
+    // wider. aarch64 is always 64-bit, so unlike x86-64 this is unconditional.
+    let word32 = |v: i64, kind: &str| -> Result<u64> {
+        if i32::try_from(v).is_err() && u32::try_from(v).is_err() {
+            return Err(does_not_fit(kind, v as i128, "32-bit"));
+        }
+        Ok(v as u32 as u64)
+    };
     match r_type {
         R_AARCH64_ABS64 => endian.write_uint(buf, off, 8, s.wrapping_add(a as u64)),
-        R_AARCH64_ABS32 => endian.write_uint(buf, off, 4, s.wrapping_add(a as u64) as u32 as u64),
+        R_AARCH64_ABS32 => {
+            let v = word32(s.wrapping_add(a as u64) as i64, "absolute address")?;
+            endian.write_uint(buf, off, 4, v)
+        }
         R_AARCH64_PREL64 => endian.write_uint(buf, off, 8, (s as i64 + a - p as i64) as u64),
         R_AARCH64_PREL32 => {
-            endian.write_uint(buf, off, 4, (s as i64 + a - p as i64) as i32 as u32 as u64)
+            let v = word32(s as i64 + a - p as i64, "PC-relative displacement")?;
+            endian.write_uint(buf, off, 4, v)
         }
         R_AARCH64_CALL26 | R_AARCH64_JUMP26 => {
             let x = s as i64 + a - p as i64;
@@ -353,12 +429,22 @@ fn apply_mips(
     p: u64,
     has_implicit: bool,
     pair_lo: Option<i64>,
+    is_64: bool,
 ) -> Result<()> {
     let insn = endian.read_uint(buf, off, 4) as u32;
+    // A 32-bit field holds any mips32 address, so only a mips64 target can put
+    // a value out of its reach.
+    let word32 = |v: i64, kind: &str| -> Result<u64> {
+        if is_64 && i32::try_from(v).is_err() && u32::try_from(v).is_err() {
+            return Err(does_not_fit(kind, v as i128, "32-bit"));
+        }
+        Ok(v as u32 as u64)
+    };
     match r_type {
         R_MIPS_32 => {
             let a = if has_implicit { insn as i64 } else { a };
-            endian.write_uint(buf, off, 4, (s as i64 + a) as u32 as u64);
+            let v = word32(s as i64 + a, "absolute address")?;
+            endian.write_uint(buf, off, 4, v);
         }
         R_MIPS_64 => {
             let a = if has_implicit {
@@ -375,6 +461,22 @@ fn apply_mips(
                 a
             };
             let target = (s as i64 + a) as u64;
+            // `j`/`jal` encode only bits 27:2 of the target; the top bits come
+            // from the delay slot's own PC, so the two have to share a 256MB
+            // region and the target has to be 4-byte aligned. Truncating
+            // instead jumps into whatever sits at that offset of the *calling*
+            // region. `Binary::jump_bytes` refuses the same thing for the
+            // trampoline it encodes by hand.
+            if target & 3 != 0 {
+                bail!("mips jump target {target:#x} is not 4-byte aligned");
+            }
+            let delay_pc = p.wrapping_add(4);
+            if (delay_pc >> 28) != (target >> 28) {
+                bail!(
+                    "mips jump from {p:#x} to {target:#x} crosses a 256MB region \
+                     boundary and cannot be encoded as `j`/`jal`"
+                );
+            }
             let field = ((target >> 2) as u32) & 0x03ff_ffff;
             patch_insn(endian, buf, off, 0x03ff_ffff, field);
         }
@@ -387,7 +489,13 @@ fn apply_mips(
                 a << 16
             };
             let alo = pair_lo.unwrap_or(0);
-            let value = ((ahi + alo + s as i64 + 0x8000) >> 16) & 0xffff;
+            let full = ahi + alo + s as i64;
+            // A HI16/LO16 pair spans 32 bits and no more. Reaching further on
+            // mips64 takes the HIGHEST/HIGHER sequence, which `apply` rejects
+            // as unsupported rather than mis-encoding -- so a pair that cannot
+            // express the address has to be rejected here too.
+            word32(full, "absolute address")?;
+            let value = ((full + 0x8000) >> 16) & 0xffff;
             patch_insn(endian, buf, off, 0xffff, value as u32);
         }
         R_MIPS_LO16 => {
@@ -402,12 +510,17 @@ fn apply_mips(
                 a
             };
             let x = s as i64 + a - p as i64;
+            // A signed 16-bit field scaled by four: ±128KB of instructions.
+            if x & 3 != 0 || !(-(1 << 17)..(1 << 17)).contains(&x) {
+                bail!("mips branch target {x:#x} out of range");
+            }
             let field = ((x >> 2) as u32) & 0xffff;
             patch_insn(endian, buf, off, 0xffff, field);
         }
         R_MIPS_PC32 => {
             let a = if has_implicit { insn as i64 } else { a };
-            endian.write_uint(buf, off, 4, (s as i64 + a - p as i64) as u32 as u64);
+            let v = word32(s as i64 + a - p as i64, "PC-relative displacement")?;
+            endian.write_uint(buf, off, 4, v);
         }
         other => {
             return Err(anyhow!(
@@ -495,6 +608,65 @@ mod tests {
         assert!(apply(a, le, R_X86_64_32, &mut buf, 5, 0x1234, 0, 0, None, false, None).is_err());
         // An offset at or past the end is rejected rather than wrapping.
         assert!(apply(a, le, R_X86_64_32, &mut buf, usize::MAX, 0, 0, 0, None, false, None).is_err());
+    }
+
+    /// A resolved value that does not fit the field being written is refused,
+    /// not truncated. Writing its low bits leaves the reference pointing at an
+    /// unrelated address, and nothing downstream can tell that happened.
+    #[test]
+    fn out_of_range_fields_are_rejected() {
+        let le = Endian::Little;
+        let mut buf = [0u8; 8];
+        // 4GB away: the branch/load would have to reach it through a 32-bit
+        // field. Reachable in practice through `--inject-base`.
+        let far = 0x1_0000_0000u64;
+
+        let err = |r_type, s, a, p, arch| {
+            let mut buf = [0u8; 8];
+            let e = apply(arch, le, r_type, &mut buf, 0, s, a, p, None, false, None)
+                .expect_err("value does not fit its field")
+                .to_string();
+            assert!(buf.iter().all(|&b| b == 0), "field was written anyway");
+            e
+        };
+
+        // x86-64: a call 4GB away does not fit a PC32/PLT32 displacement.
+        let e = err(R_X86_64_PLT32, far, -4, 0x1000, Architecture::X86_64);
+        assert!(e.contains("does not fit"), "message was {e:?}");
+        assert!(e.contains("signed 32-bit"), "message was {e:?}");
+        // Nor does its address fit an absolute 32-bit field, signed or not.
+        err(R_X86_64_32, far, 0, 0, Architecture::X86_64);
+        err(R_X86_64_32S, 0x8000_0000, 0, 0, Architecture::X86_64); // fits u32, not i32
+        // In range, both still write the field.
+        apply(Architecture::X86_64, le, R_X86_64_32, &mut buf, 0, 0xffff_f000, 0, 0, None, false, None)
+            .unwrap();
+        assert_eq!(le.read_uint(&buf, 0, 4), 0xffff_f000);
+
+        // 32-bit x86 has no such limit: every address fits the field, and a
+        // backwards reference truncating to its low 32 bits is the correct
+        // modular arithmetic rather than a dropped high half.
+        apply(Architecture::X86, le, R_X86_64_PC32, &mut buf, 0, 0x1000, -4, 0xf000_0000, None, false, None)
+            .unwrap();
+        assert_eq!(le.read_uint(&buf, 0, 4), 0x1000_0ffc);
+
+        // aarch64's 32-bit word relocations: -2^31 <= X < 2^32.
+        err(R_AARCH64_ABS32, far, 0, 0, Architecture::Arm64);
+        err(R_AARCH64_PREL32, far, 0, 0, Architecture::Arm64);
+        apply(Architecture::Arm64, le, R_AARCH64_ABS32, &mut buf, 0, 0xffff_f000, 0, 0, None, false, None)
+            .unwrap();
+
+        // mips `j`/`jal` encode bits 27:2 of the target, taking the rest from
+        // the delay slot's own PC, so the two must share a 256MB region.
+        let e = err(R_MIPS_26, 0x1000_0000, 0, 0, Architecture::Mips);
+        assert!(e.contains("256MB"), "message was {e:?}");
+        let e = err(R_MIPS_26, 0x0040_0102, 0, 0, Architecture::Mips);
+        assert!(e.contains("4-byte aligned"), "message was {e:?}");
+        // A 16-bit branch field reaches ±128KB.
+        let e = err(R_MIPS_PC16, 0x0040_0000, 0, 0, Architecture::Mips);
+        assert!(e.contains("out of range"), "message was {e:?}");
+        // On mips64 a 32-bit field, and a HI16/LO16 pair, still span 32 bits.
+        err(R_MIPS_32, far, 0, 0, Architecture::Mips64);
+        err(R_MIPS_HI16, far, 0, 0, Architecture::Mips64);
     }
 
     #[test]
