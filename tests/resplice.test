@@ -102,6 +102,58 @@ testSpliceResolvesRelocations() {
 	[ "$(./prog.patched)" = "2107" ]
 }
 
+## A splice and the helper it calls in different *modules*. rustc compiles a
+## crate into one object file per codegen unit, partitioned along module
+## boundaries, so the two end up in different members of the rlib and reference
+## each other through a symbol that is undefined in the splice's own member --
+## only the rest of the archive can resolve it.
+##
+## `-C codegen-units`/`-C lto=no` pin that split rather than leaving it to
+## rustc's size heuristics, which merge the units of a crate this small; a crate
+## that reimplements more than a couple of functions is past that threshold on
+## its own, as is any `cargo build` (256 units, no cross-unit inlining).
+## `-C panic=abort` drops the unwind guard rustc puts on an `extern "C"` fn
+## whose body could unwind, which is a call into `core`'s panic machinery --
+## not in this rlib, and so not resolvable.
+testSpliceResolvesHelperInAnotherCodegenUnit() {
+	writeComputeAsm 96
+	printf '%s\n' '#include <stdio.h>' 'int compute(int x);' \
+		'int main(int argc, char **argv){ (void)argv; printf("%d\n", compute(argc)); return 0; }' > prog.c
+	cc -fcf-protection=none -no-pie -O2 -o prog prog.c compute.s
+
+	[ "$(./prog)" = "41" ]
+
+	va=$(readelf -sW prog | awk '$8=="compute"{ print strtonum("0x" $2); exit }')
+	size=$(readelf -sW prog | awk '$8=="compute"{ print $3; exit }')
+	end=$((va + size))
+
+	# scale(TABLE[1 & 3]) = 2000 * 3 + 1 = 6001.
+	{
+		printf 'pub mod helper {\n'
+		printf '    #[inline(never)]\n'
+		printf '    pub fn scale(x: i32) -> i32 { x.wrapping_mul(3).wrapping_add(1) }\n'
+		printf '    pub static TABLE: [i32; 4] = [1000, 2000, 3000, 4000];\n'
+		printf '}\n'
+		printf 'pub mod splices {\n'
+		printf '    use crate::helper::{scale, TABLE};\n'
+		printf '    use resplice_macros::Splice;\n'
+		printf '    #[Splice(begin = %d, end = %d)]\n' "$va" "$end"
+		printf '    fn compute(i: i32) -> i32 {\n'
+		printf '        scale(unsafe { *TABLE.get_unchecked((i & 3) as usize) })\n'
+		printf '    }\n'
+		printf '}\n'
+	} > examples/adder/src/lib.rs
+	cargo rustc --release -p adder -- -C codegen-units=16 -C lto=no -C panic=abort
+	[ -f target/release/libadder.rlib ]
+	# Guard the premise: without more than one object member there is no
+	# cross-member reference left to resolve.
+	[ "$(ar t target/release/libadder.rlib | grep -c '[.]o$')" -gt 1 ]
+
+	target/release/resplice ./prog target/release/libadder.rlib ./prog.patched
+	chmod +x ./prog.patched
+	[ "$(./prog.patched)" = "6001" ]
+}
+
 ## A splice reading an immutable `static` that holds references. rustc emits
 ## such a static into a `SHF_WRITE` `.data.rel.ro` section, because the pointers
 ## it contains need relocating -- but it is read-only by the time the program

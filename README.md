@@ -57,6 +57,37 @@ data, or call libc. `resplice` resolves those relocations recursively:
 - Calls to symbols the target already **defines or imports** (e.g. a libc
   function reachable through the PLT) bind to the target's own addresses.
 
+That closure spans the whole rlib, not just the object file the splice itself
+landed in. rustc compiles a crate into one object per codegen unit, partitioned
+along module boundaries, so a `#[Splice]` in one module and the helper it calls
+in another are in different members of the archive and reference each other by
+name — splitting replacements across modules is fine.
+
+What is *not* reachable is anything the rlib was not compiled from. Generic and
+`#[inline]` code from `core` is instantiated into the rlib and works, but items
+that only exist in a precompiled `core`/`std` (or any other crate's) rlib are
+never read, so a splice cannot reach them. In practice that means the
+`core::panicking` entry points, which is what a bounds check, an overflow check
+or an `unwrap` compiles into:
+
+```
+error: relocation against "_RNvNtCs..._4core9panicking18panic_bounds_check" in
+".rspl.4007e4.40084c": unresolved external symbol
+"_RNvNtCs..._4core9panicking18panic_bounds_check": no member of the rlib defines
+it, and the target neither defines nor imports it. [...]
+```
+
+So index with `get_unchecked`, do arithmetic with the `wrapping_*` methods, and
+avoid `unwrap`. Build with `--release` (a debug build has `debug_assertions` and
+overflow checks on, both of which panic), and add `panic = "abort"` to the
+profile to drop the unwind guard rustc can otherwise put on the `extern "C"`
+replacement — itself a call into `core`:
+
+```toml
+[profile.release]
+panic = "abort"
+```
+
 When a replacement is **larger than `[begin, end)`**, it does not have to fit:
 the full function is relocated into the injected segment and a jump (trampoline)
 is written at `begin` to reach it, so `[begin, end)` only needs room for the
