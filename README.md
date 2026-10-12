@@ -93,6 +93,17 @@ the full function is relocated into the injected segment and a jump (trampoline)
 is written at `begin` to reach it, so `[begin, end)` only needs room for the
 jump.
 
+One run applies every `#[Splice]` in the rlib, so a crate can replace as many
+ranges of the target as it likes. Two splices claiming *overlapping* ranges
+cannot both survive — each patch NOP-fills the whole of its own region, so
+whichever was written last would erase part of the other — and are refused
+before anything is written:
+
+```
+error: splices 0x1000..0x1020 and 0x1010..0x1030 overlap; each one NOP-fills its
+whole region, so they would overwrite each other
+```
+
 ## Usage
 
 `resplice` is a single binary; `cargo build --release` in this repository leaves
