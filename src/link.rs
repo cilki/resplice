@@ -18,6 +18,11 @@
 //!    already defines or imports, or else error — and apply it.
 //! 5. Inject the collected bytes as a new segment and patch each splice's
 //!    resolved code into its `[begin, end)` range.
+//!
+//! Nothing is written to the target until step 5, so the checks that a splice
+//! cannot survive — two splices claiming overlapping ranges, a `static` whose
+//! size does not match its range, a range not wholly backed by one `PT_LOAD` —
+//! fail with no output file rather than a half-patched one.
 
 use anyhow::{anyhow, bail, Context, Result};
 use object::read::archive::ArchiveFile;
@@ -60,9 +65,9 @@ pub fn link_rlib(binary: &mut Binary, rlib_path: &Path) -> Result<Vec<Applied>> 
     let archive = ArchiveFile::parse(&*data).context("failed to parse rlib archive")?;
 
     // Virtual address the injected segment will be mapped at. All injected
-    // sections across all object members share this single segment (there is
-    // only one PT_NOTE slot to convert), so `base + blob.len()` is always the
-    // next free virtual address.
+    // sections across all object members share this single segment -- one run
+    // injects once, so `base + blob.len()` is always the next free virtual
+    // address.
     let base = binary.injected_base()?;
 
     let mut blob: Vec<u8> = Vec::new();

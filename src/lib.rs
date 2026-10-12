@@ -105,7 +105,14 @@ impl Binary {
     /// at the end of `.bss`, so the default lands one page into the heap and the
     /// injected code and data are live only until the first big allocation.
     /// There is no portable way to detect that, so the operator supplies a known
-    /// free address instead. `base` must be page-aligned.
+    /// free address instead.
+    ///
+    /// Nothing is validated here — the base is only a request until the segment
+    /// is laid out. It is rejected later if it is not aligned to the target's
+    /// page size (see [`Binary::injected_base`]), if it is not actually free
+    /// (see [`Binary::inject_segment`]), or if it is so far from the splice
+    /// sites that their PC-relative references cannot reach it (see
+    /// [`Binary::jump_bytes`] and `arch::apply`).
     pub fn set_injected_base(&mut self, base: Option<u64>) {
         self.inject_base = base;
     }
@@ -511,8 +518,18 @@ impl Binary {
         Ok(declared.max(PAGE))
     }
 
-    /// The base virtual address the injected segment will be mapped at: one
-    /// [`load_align`](Self::load_align) granule above the target's image.
+    /// The base virtual address the injected segment will be mapped at.
+    ///
+    /// With no [pinned base](Self::set_injected_base), that is one page above
+    /// the end of the target's image — one *target* page, the largest `p_align`
+    /// of any `PT_LOAD`, which is 64K on a typical aarch64 image rather than 4K.
+    ///
+    /// A pinned base is returned as given, but only after it is checked against
+    /// that same granularity: `p_vaddr ≡ p_offset (mod p_align)` has to hold for
+    /// the loader to accept the image at all, and the file offset the blob is
+    /// appended at is derived from the base. Whether the base is *free* is not
+    /// knowable until the blob's length is, and is checked in
+    /// [`inject_segment`](Self::inject_segment).
     pub fn injected_base(&self) -> Result<u64> {
         let align = self.load_align()?;
         if let Some(base) = self.inject_base {
@@ -636,12 +653,25 @@ impl Binary {
     }
 
     /// Inject `blob` as a new read+execute segment mapped at virtual address
-    /// `base`, by converting an existing `PT_NOTE` program header into a
-    /// `PT_LOAD` (so the program-header table itself need not be relocated).
+    /// `base`.
     ///
-    /// `base` must be aligned to the target's [`load_align`](Self::load_align);
-    /// the file is padded to the same granularity before the blob is appended so
-    /// the loader's `p_vaddr ≡ p_offset (mod p_align)` requirement holds.
+    /// The segment needs a program header, and neither way of getting one
+    /// relocates the program-header table itself:
+    ///
+    /// - An existing `PT_NOTE` entry is rewritten as a `PT_LOAD`, when the
+    ///   target has one to spare.
+    /// - Otherwise the table is grown by one entry into the padding that
+    ///   follows it — many statically linked targets carry no `PT_NOTE` at all.
+    ///   A target with no such padding is refused.
+    ///
+    /// `base` must be aligned to the target's page size (see
+    /// [`injected_base`](Self::injected_base)); the file is padded to the same
+    /// granularity before the blob is appended so the loader's
+    /// `p_vaddr ≡ p_offset (mod p_align)` requirement holds. Now that `blob`'s
+    /// length is known, this is also where `base` is checked for being free: a
+    /// base whose segment would share a page with one of the target's own
+    /// `PT_LOAD`s replaces that mapping rather than adding to it, and is
+    /// refused.
     pub fn inject_segment(&mut self, base: u64, blob: &[u8]) -> Result<()> {
         use goblin::elf::program_header::{PF_R, PF_X, PT_LOAD, PT_NOTE};
 

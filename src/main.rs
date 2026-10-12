@@ -21,8 +21,21 @@ struct Cli {
     /// unsafe when something else already owns that address -- console binaries
     /// commonly allocate from the end of `.bss`, so the default lands in the
     /// heap and is overwritten during play. Pass a known-free address to place
-    /// it deliberately; it must be aligned to the target's page size (the
-    /// largest `p_align` of its `PT_LOAD` segments, e.g. 64K on aarch64).
+    /// it deliberately. Three things are required of it, each reported as an
+    /// error rather than written into a binary that misbehaves later.
+    ///
+    /// It must be aligned to the target's page size -- the largest `p_align` of
+    /// its `PT_LOAD` segments, which is 64K on a typical aarch64 image rather
+    /// than 4K -- or the loader refuses the image outright.
+    ///
+    /// It must be free: a base whose segment would share a page with one of the
+    /// target's own `PT_LOAD` segments replaces that mapping instead of adding
+    /// to it, leaving the target running with its own code overwritten.
+    ///
+    /// It must be within reach of the splices. References into the injected
+    /// segment, and the trampoline of an oversized splice, are PC-relative
+    /// through fields narrower than a pointer -- 32 bits on x86-64, so 2GB, and
+    /// only 128MB for an aarch64 `bl`.
     #[arg(long, value_parser = parse_addr)]
     inject_base: Option<u64>,
 }
