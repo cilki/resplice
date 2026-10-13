@@ -22,9 +22,10 @@ static TABLE: [i32; 4] = [10, 20, 30, 40];
 
 /// Reimplement the code at `[0x401160, 0x4011c6)` of some target binary.
 ///
-/// The addresses are illustrative (the end-to-end test discovers real ones from
-/// a throwaway target rather than touching this file). `pub extern "C"` is added
-/// automatically when omitted, so a plain `fn` works too.
+/// The addresses are illustrative: the end-to-end test writes a replacement
+/// crate of its own, against a throwaway target whose real addresses it reads
+/// out of the symbol table, rather than splicing this one. `pub extern "C"` is
+/// added automatically when omitted, so a plain `fn` works too.
 #[Splice(begin = 0x401160, end = 0x4011c6)]
 pub extern "C" fn compute(i: usize) -> i32 {
     scale(TABLE[i & 3])
