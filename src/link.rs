@@ -258,6 +258,78 @@ fn splice_range(name: &str) -> Result<Option<(u64, u64)>> {
     Ok(Some((begin, end)))
 }
 
+/// Refuse a `.rspl.*` section that carries more than one `#[Splice]` item.
+///
+/// `#[Splice]` encodes the range into the section name, so two items written
+/// with the *same* `begin`/`end` -- a copy-pasted attribute whose body was
+/// changed but whose addresses were not -- ask for the same section. When rustc
+/// puts them in one codegen unit it merges the two, appending the second item's
+/// bytes to the first, and nothing downstream can tell the result apart from a
+/// single splice twice the size: the concatenation is patched over
+/// `[begin, end)` (or trampolined to, if it no longer fits), so the target runs
+/// the first item with the second sitting dead behind it, reported as one
+/// successful splice.
+///
+/// Two such items in *different* codegen units land in different members and
+/// are caught as overlapping patches instead. This is the same mistake when
+/// they share a member, where the merge leaves only one section to look at and
+/// only the member's symbol table still records that there were two.
+///
+/// The symbols are walked once per member that carries a splice at all, which
+/// is a member the linker has to read anyway; members with no splice section
+/// are not touched.
+fn check_one_item_per_splice(obj: &object::File, splices: &HashSet<usize>) -> Result<()> {
+    let mut owners: HashMap<usize, Vec<&str>> = HashMap::new();
+    for sym in obj.symbols() {
+        // One global definition per `#[Splice]` item: the macro adds
+        // `no_mangle`, and the local symbols sharing the section (its section
+        // symbol, a `$x`/`$d` mapping symbol) say nothing about how many items
+        // landed there.
+        if sym.is_undefined() || !sym.is_global() {
+            continue;
+        }
+        let (Some(si), Ok(name)) = (sym.section_index(), sym.name()) else {
+            continue;
+        };
+        if name.is_empty() || !splices.contains(&si.0) {
+            continue;
+        }
+        owners.entry(si.0).or_default().push(name);
+    }
+
+    // The lowest-numbered collision, and its items named in sorted order, so
+    // the diagnostic does not depend on `HashMap` iteration order (nor, for the
+    // names, on the symbol table's).
+    let Some((si, mut names)) = owners
+        .into_iter()
+        .filter(|(_, items)| items.len() > 1)
+        .min_by_key(|&(si, _)| si)
+    else {
+        return Ok(());
+    };
+    names.sort_unstable();
+
+    let sec_name = obj
+        .section_by_index(object::SectionIndex(si))
+        .ok()
+        .and_then(|s| s.name().map(str::to_owned).ok())
+        .unwrap_or_default();
+    // Already parsed by `read_sec` before this runs, so the fallback is only
+    // for the name the section header turned out not to have.
+    let range = match splice_range(&sec_name) {
+        Ok(Some((begin, end))) => format!("{begin:#x}..{end:#x}"),
+        _ => sec_name.clone(),
+    };
+    bail!(
+        "{} `#[Splice]` items ({}) all claim the range {range}; they share the \
+         section {sec_name:?}, which rustc merged into one, so their bytes would be \
+         spliced over that range end to end and only the first would ever run. Give \
+         each item the range it is replacing.",
+        names.len(),
+        names.join(", "),
+    )
+}
+
 /// Verify that an rlib object member targets the same architecture and byte
 /// order as the binary being patched (the architecture implies the pointer
 /// width). Splicing wrong-arch machine code in would silently corrupt the
@@ -489,6 +561,7 @@ fn link_objects<'d>(
 
     for (mi, obj) in objs.iter().enumerate() {
         verify_arch(obj, target)?;
+        let mut mine: HashSet<usize> = HashSet::new();
         for section in obj.sections() {
             if !matches!(section.name(), Ok(n) if n.starts_with(".rspl.")) {
                 continue;
@@ -496,6 +569,13 @@ fn link_objects<'d>(
             let id = (mi, section.index().0);
             splice_idxs.push(id);
             secs.insert(id, read_sec(objs, id)?);
+            mine.insert(id.1);
+        }
+        // Two items given the same range share a section name, which rustc
+        // merges within a codegen unit; only this member's symbol table still
+        // shows that there were two. See [`check_one_item_per_splice`].
+        if !mine.is_empty() {
+            check_one_item_per_splice(obj, &mine)?;
         }
     }
 
@@ -541,11 +621,24 @@ fn link_objects<'d>(
     }
 
     // The closure is settled, so now read the contents of just those sections.
+    //
+    // A read that fails has to be an error, not an empty section. `object`
+    // refuses a section whose `sh_offset`/`sh_size` run past the end of the
+    // archive member -- which a truncated or otherwise damaged rlib has -- and
+    // substituting zero bytes for it turns that into a silent miscompile: a
+    // splice with nothing to relocate is then patched as an empty replacement,
+    // so `patch_bytes` NOP-fills the whole of `[begin, end)` and the target
+    // simply falls through the function that used to be there, reported as a
+    // successful splice. A referenced helper read that way is injected as zero
+    // bytes, and the calls to it land on whichever section follows it in the
+    // blob.
     for &si in &included {
-        secs.get_mut(&si).unwrap().bytes = objs[si.0]
+        let name = secs[&si].name;
+        let bytes = objs[si.0]
             .section_by_index(object::SectionIndex(si.1))
             .and_then(|s| s.data().map(<[u8]>::to_vec))
-            .unwrap_or_default();
+            .map_err(|e| anyhow!("failed to read the contents of section {name:?}: {e}"))?;
+        secs.get_mut(&si).unwrap().bytes = bytes;
     }
 
     // A splice whose code fits its `[begin, end)` region is pinned there and
@@ -1588,6 +1681,110 @@ mod tests {
             msg.contains("0x401000..0x401010") && msg.contains("0x401008..0x401018"),
             "message was {msg:?}"
         );
+    }
+
+    /// Two `#[Splice]` items given the same `begin`/`end` ask for the same
+    /// `.rspl.<begin>.<end>` section, and rustc merges them when they land in
+    /// the same codegen unit -- one section holding both functions, with a
+    /// global symbol apiece. That is exactly what rustc produces for
+    ///
+    /// ```ignore
+    /// #[Splice(begin = 0x401000, end = 0x401020)]
+    /// pub extern "C" fn first() -> i32 { 42 }
+    /// #[Splice(begin = 0x401000, end = 0x401020)]
+    /// pub extern "C" fn second() -> i32 { 43 }
+    /// ```
+    ///
+    /// which compiles without complaint. The concatenation was then spliced
+    /// over the range as if it were one replacement: the target ran `first` and
+    /// carried `second` as dead bytes behind it, and `resplice` reported one
+    /// successful splice of twice the expected size. The same pair in different
+    /// codegen units is caught as overlapping patches, so only the merged case
+    /// slipped through.
+    #[test]
+    fn test_link_rlib_rejects_two_splices_sharing_a_section() {
+        use object::write::{Object, Symbol, SymbolSection as WSection};
+        use object::{
+            Architecture, BinaryFormat, Endianness, SectionKind, SymbolFlags, SymbolKind,
+            SymbolScope,
+        };
+
+        let mut obj = Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+        let name = format!(".rspl.{SPLICE_VA:x}.{:x}", SPLICE_VA + 0x20).into_bytes();
+        let sec = obj.add_section(vec![], name, SectionKind::Text);
+        // What the merge leaves behind: both bodies end to end, each with its
+        // own `no_mangle` global symbol.
+        let bodies = [
+            ("second", [0xb8, 43, 0, 0, 0, 0xc3]), // mov eax,43; ret
+            ("first", [0xb8, 42, 0, 0, 0, 0xc3]),  // mov eax,42; ret
+        ];
+        for (fn_name, body) in bodies {
+            let value = obj.append_section_data(sec, &body, 1);
+            obj.add_symbol(Symbol {
+                name: fn_name.as_bytes().to_vec(),
+                value,
+                size: body.len() as u64,
+                kind: SymbolKind::Text,
+                scope: SymbolScope::Dynamic,
+                weak: false,
+                section: WSection::Section(sec),
+                flags: SymbolFlags::None,
+            });
+        }
+
+        let msg = link_err("rlib_shared_section", &ar_wrap("splice.o", &obj.write().unwrap()));
+        assert!(msg.contains("2 `#[Splice]` items"), "message was {msg:?}");
+        // Both are named, in a fixed order rather than the symbol table's.
+        assert!(msg.contains("first, second"), "message was {msg:?}");
+        assert!(msg.contains("0x401000..0x401020"), "message was {msg:?}");
+        assert!(msg.contains(".rspl.401000.401020"), "message was {msg:?}");
+
+        // One item per section is still fine, symbol and all.
+        let (_, applied) = run_link(&build_rlib(SPLICE_VA + 0x20));
+        assert_eq!(applied.len(), 1);
+    }
+
+    /// A section whose contents `object` refuses to read must be an error.
+    ///
+    /// The read failure used to be swallowed, leaving the section with zero
+    /// bytes: a splice with nothing to relocate was then patched as an empty
+    /// replacement, so `patch_bytes` NOP-filled the whole of `[begin, end)` and
+    /// the target fell straight through the function that used to be there --
+    /// reported as a successful splice.
+    #[test]
+    fn test_link_rlib_rejects_unreadable_section_contents() {
+        use object::write::Object;
+        use object::{Architecture, BinaryFormat, Endianness, SectionKind};
+
+        // A self-contained splice: no relocations, so nothing else would have
+        // noticed that its bytes never arrived.
+        let mut obj = Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+        let name = format!(".rspl.{SPLICE_VA:x}.{:x}", SPLICE_VA + 0x20).into_bytes();
+        let sec = obj.add_section(vec![], name, SectionKind::Text);
+        obj.append_section_data(sec, &[0xb8, 42, 0, 0, 0, 0xc3], 1); // mov eax,42; ret
+        let mut member = obj.write().unwrap();
+
+        // Damage the section header so its contents run past the end of the
+        // member, as a truncated rlib's would. The member still parses: only
+        // reading that one section's bytes fails.
+        let shoff = u64::from_le_bytes(member[0x28..0x30].try_into().unwrap()) as usize;
+        let shentsize = u16::from_le_bytes(member[0x3a..0x3c].try_into().unwrap()) as usize;
+        let index = {
+            let parsed = object::File::parse(&*member).unwrap();
+            parsed
+                .sections()
+                .find(|s| matches!(s.name(), Ok(n) if n.starts_with(".rspl.")))
+                .unwrap()
+                .index()
+                .0
+        };
+        // Elf64_Shdr::sh_size sits at offset 32 of the entry.
+        let sh_size = shoff + index * shentsize + 32;
+        member[sh_size..sh_size + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+
+        let msg = link_err("rlib_unreadable", &ar_wrap("splice.o", &member));
+        assert!(msg.contains("failed to read the contents"), "message was {msg:?}");
+        assert!(msg.contains(".rspl.401000.401020"), "message was {msg:?}");
     }
 
     /// Linking the same rlib twice has to produce the same bytes.
