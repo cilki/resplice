@@ -692,7 +692,8 @@ fn link_objects<'d>(
                 sec.name
             ));
         }
-        pad_to(blob, sec.align);
+        check_align(sec.name, sec.align, base)?;
+        pad_to(blob, sec.align)?;
         let va = base + blob.len() as u64;
         sec_va.insert(si, va);
         inj_blob_off.insert(si, blob.len());
@@ -706,7 +707,7 @@ fn link_objects<'d>(
     for &si in &included {
         for r in &secs[&si].relocs {
             if arch::needs_got(arch, r.r_type) && !got.contains_key(&r.sym) {
-                pad_to(blob, got_width as u64);
+                pad_to(blob, got_width as u64)?;
                 let va = base + blob.len() as u64;
                 got.insert(r.sym, (va, blob.len()));
                 blob.resize(blob.len() + got_width, 0);
@@ -846,10 +847,64 @@ fn link_objects<'d>(
     Ok(())
 }
 
+/// Refuse an alignment the injected segment cannot give a section it holds.
+///
+/// `sh_addralign` is read straight out of the rlib and was taken on trust, as
+/// both a power of two and a sane magnitude. It is neither by construction:
+///
+/// - A value that is not a power of two makes [`pad_to`]'s mask round to
+///   something that is not a multiple of it at all, so the section is laid out
+///   *misaligned* while every reference to it is relocated to that address.
+/// - A huge value (`u64::MAX`, from a damaged or hand-made rlib) overflowed the
+///   `len + align - 1` the padding was computed with. Wrapped, that rounded the
+///   blob *down*: `Vec::resize` then truncated away the sections already laid
+///   out, the next one was written over their offsets, and every reference to
+///   them was relocated to an address now holding someone else's bytes. The
+///   patched binary read the wrong data -- reported as a successful splice.
+///
+/// Only an alignment the base itself has can be honoured, since a section's
+/// address is `base + offset`: the segment is mapped wherever
+/// [`Binary::injected_base`] puts it, and that address is only ever checked
+/// against the target's page size.
+fn check_align(name: &str, align: u64, base: u64) -> Result<()> {
+    if !align.is_power_of_two() {
+        bail!(
+            "section {name:?} declares an alignment of {align:#x}, which is not a \
+             power of two; ELF requires `sh_addralign` to be one, and laying the \
+             section out to anything else would leave it misaligned at an address \
+             every reference to it is resolved against"
+        );
+    }
+    if base % align != 0 {
+        bail!(
+            "section {name:?} needs {align:#x}-byte alignment, but the injected \
+             segment is mapped at {base:#x}, which is not a multiple of it -- a \
+             section placed at `base + offset` cannot be given an alignment the base \
+             does not already have; choose an --inject-base aligned to {align:#x}"
+        );
+    }
+    Ok(())
+}
+
 /// Pad `blob` with zeroes so its length is a multiple of `align`.
-fn pad_to(blob: &mut Vec<u8>, align: u64) {
-    let aligned = (blob.len() as u64 + align - 1) & !(align - 1);
+///
+/// Checked, rather than `(len + align - 1) & !(align - 1)`: `align` comes from a
+/// section header of an arbitrary rlib, and a sum that wrapped there rounded the
+/// blob down instead of up, silently truncating the sections already laid out.
+/// See [`check_align`], which refuses such an alignment before this runs.
+fn pad_to(blob: &mut Vec<u8>, align: u64) -> Result<()> {
+    let aligned = (blob.len() as u64)
+        .checked_next_multiple_of(align)
+        .filter(|&len| len <= isize::MAX as u64)
+        .ok_or_else(|| {
+            anyhow!(
+                "padding the injected segment out from {} bytes to a multiple of \
+                 {align:#x} does not fit in memory",
+                blob.len()
+            )
+        })?;
     blob.resize(aligned as usize, 0);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1617,6 +1672,115 @@ mod tests {
         let msg = link_err("rlib_oob_reloc", &build_rlib_relro(".data.rel.ro.NAMES", 8));
         assert!(msg.contains("runs past the end"), "message was {msg:?}");
         assert!(msg.contains(".data.rel.ro.NAMES"), "message was {msg:?}");
+    }
+
+    /// Rewrite the `sh_addralign` of a named section of an ELF64 object member.
+    /// `object`'s writer only emits the alignments it is given, so a value an
+    /// rlib can actually hold has to be written into the header by hand.
+    fn set_section_align(member: &mut [u8], name: &str, align: u64) {
+        let shoff = u64::from_le_bytes(member[0x28..0x30].try_into().unwrap()) as usize;
+        let shentsize = u16::from_le_bytes(member[0x3a..0x3c].try_into().unwrap()) as usize;
+        let index = {
+            let parsed = object::File::parse(&*member).unwrap();
+            parsed
+                .sections()
+                .find(|s| matches!(s.name(), Ok(n) if n == name))
+                .expect("section to realign")
+                .index()
+                .0
+        };
+        // Elf64_Shdr::sh_addralign sits at offset 48 of the entry.
+        let at = shoff + index * shentsize + 48;
+        member[at..at + 8].copy_from_slice(&align.to_le_bytes());
+    }
+
+    /// An injected section's alignment comes out of the rlib's section headers
+    /// and is used to pad the blob the segment is built from. It was taken on
+    /// trust as a power of two of a sane size, and is neither by construction.
+    ///
+    /// `u64::MAX` overflowed the `len + align - 1` the padding was computed
+    /// with, which rounded the blob *down* instead of up: `Vec::resize` then
+    /// truncated away the sections already laid out, the next section was
+    /// written over their offsets, and every reference to them was relocated to
+    /// an address now holding someone else's bytes -- a patched binary reading
+    /// the wrong data, reported as a successful splice. (In a release build,
+    /// where that sum wraps rather than panicking.)
+    #[test]
+    fn test_link_rlib_rejects_unusable_section_alignment() {
+        use object::write::{Object, Relocation, Symbol, SymbolSection as WSection};
+        use object::{
+            Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolFlags,
+            SymbolKind, SymbolScope,
+        };
+
+        // A splice reading an injected `.rodata.table`, whose alignment is then
+        // rewritten to `align`.
+        let build = |align: u64| -> Vec<u8> {
+            let mut obj =
+                Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+
+            let table = table_data();
+            let rodata =
+                obj.add_section(vec![], b".rodata.table".to_vec(), SectionKind::ReadOnlyData);
+            obj.append_section_data(rodata, &table, 16);
+            let table_sym = obj.add_symbol(Symbol {
+                name: b"TABLE".to_vec(),
+                value: 0,
+                size: table.len() as u64,
+                kind: SymbolKind::Data,
+                scope: SymbolScope::Compilation,
+                weak: false,
+                section: WSection::Section(rodata),
+                flags: SymbolFlags::None,
+            });
+
+            let name = format!(".rspl.{SPLICE_VA:x}.{:x}", SPLICE_VA + 0x20).into_bytes();
+            let rspl = obj.add_section(vec![], name, SectionKind::Text);
+            obj.append_section_data(rspl, &PTR_SPLICE_CODE, 16);
+            obj.add_relocation(
+                rspl,
+                Relocation {
+                    offset: 3,
+                    symbol: table_sym,
+                    addend: -4,
+                    flags: RelocationFlags::Elf {
+                        r_type: object::elf::R_X86_64_PC32,
+                    },
+                },
+            )
+            .unwrap();
+
+            let mut member = obj.write().unwrap();
+            set_section_align(&mut member, ".rodata.table", align);
+            ar_wrap("splice.o", &member)
+        };
+
+        // Not a power of two, so the padding mask rounds to something that is
+        // not a multiple of the alignment either -- and `u64::MAX` wrapped the
+        // sum outright, truncating the blob.
+        for (tag, align) in [("rlib_align_wrap", u64::MAX), ("rlib_align_odd", 24)] {
+            let msg = link_err(tag, &build(align));
+            assert!(msg.contains("not a power of two"), "message was {msg:?}");
+            assert!(msg.contains(".rodata.table"), "message was {msg:?}");
+        }
+
+        // A power of two the injected base does not have: no amount of padding
+        // inside the segment can align a section the base itself is not aligned
+        // for, and the padding alone would be a terabyte of zeroes.
+        let msg = link_err("rlib_align_huge", &build(1 << 40));
+        assert!(msg.contains("not a multiple of it"), "message was {msg:?}");
+        assert!(msg.contains("0x10000000000"), "message was {msg:?}");
+
+        // What rustc emits still links, with the alignment it asked for.
+        let (bin, applied) = run_link(&build(16));
+        assert_eq!(applied.len(), 1);
+        let d = bin.data();
+        let disp = i32::from_le_bytes(d[0x1003..0x1007].try_into().unwrap());
+        let table_va = (SPLICE_VA as i64 + 3 + 4 + disp as i64) as u64;
+        assert!(table_va >= INJECT_BASE, "table not injected");
+        assert_eq!(table_va % 16, 0, "table is not 16-byte aligned: {table_va:#x}");
+        let toff = bin.va_to_offset(table_va).unwrap();
+        assert_eq!(&d[toff..toff + table_data().len()], &table_data());
     }
 
     /// A `#[Splice]` on a `static` lands in a non-executable section and
