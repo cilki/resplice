@@ -14,10 +14,21 @@ rust-version = "1.85"
 version = "0.0.3"
 
 [dependencies]
-object = "0.40"
+# `default-features = false` drops `object`'s `compression` feature, and with it
+# the `flate2`/`ruzstd` decompressors. Nothing here decompresses: the rlib is
+# read through `section_by_index` + `data()`, which hands back a section's bytes
+# as they sit in the file, and the decompressing calls (`uncompressed_data`,
+# `compressed_data().decompress()`, and `section_by_name`'s `.zdebug_*`
+# fallback) are never used. Carrying the decompressors anyway means carrying
+# their advisories -- `RUSTSEC-2026-0344`, a zstd decompression bomb, is the
+# current one -- for code that cannot run.
+object = { version = "0.40", default-features = false, features = ["read", "std"] }
 goblin = "0.10"
 anyhow = "1.0"
 clap = { version = "4.6.6", features = ["derive"] }
 
 [dev-dependencies]
-object = { version = "0.40", features = ["write"] }
+# Must repeat `default-features = false`: features are unified per package, so
+# leaving the defaults on here would pull the decompressors back into the lock
+# file (and into every `cargo test` build).
+object = { version = "0.40", default-features = false, features = ["read", "std", "write"] }
