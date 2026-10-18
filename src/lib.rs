@@ -29,14 +29,52 @@ pub struct Binary {
     /// Operator-supplied virtual address for the injected segment, overriding
     /// [`Binary::injected_base`]'s default. See [`Binary::set_injected_base`].
     inject_base: Option<u64>,
-    /// Every name the target can bind an external reference to, built on first
-    /// use by [`Binary::build_symbol_map`] and dropped whenever `data` changes.
+    /// Every name the target defines, built on first use by
+    /// [`Binary::build_symbol_map`] and dropped whenever `data` changes.
     ///
     /// A splice typically calls several functions the target already defines, so
     /// this is consulted once per relocation. Scanning `.symtab`/`.dynsym` for
     /// each of those is quadratic in a real target's symbol count, which is
     /// where this tool spent nearly all of its time before the map existed.
-    symbols: RefCell<Option<HashMap<String, u64>>>,
+    symbols: RefCell<Option<HashMap<String, Binding>>>,
+}
+
+/// What a name the target defines resolves to.
+///
+/// Not every defined symbol carries an address a reference can be pointed at:
+/// `st_value` means something else entirely for two symbol types a real target
+/// genuinely has, and binding it as an address produces a patched binary that
+/// is wrong with nothing to say so. Both are recorded here and refused by
+/// [`Binary::resolve_target_symbol`] instead.
+#[derive(Debug, Clone, Copy)]
+enum Binding {
+    /// A virtual address, which is what every usable definition is.
+    Addr(u64),
+    /// An `STT_GNU_IFUNC`, carrying the address of its resolver.
+    Ifunc(u64),
+    /// An `STT_TLS` symbol, carrying an offset into the thread-local block.
+    Tls(u64),
+}
+
+/// Record `binding` for `name` in the map [`Binary::build_symbol_map`] builds.
+///
+/// The first binding seen for a name wins, which is where that function's
+/// documented precedence comes from. A usable one is the exception: it replaces
+/// an unusable binding recorded earlier, whichever table that came from, so an
+/// ifunc or thread-local definition cannot shadow a plain address the target
+/// also offers for the same name.
+fn bind(map: &mut HashMap<String, Binding>, name: &str, binding: Binding) {
+    use std::collections::hash_map::Entry;
+    match map.entry(name.to_owned()) {
+        Entry::Vacant(slot) => {
+            slot.insert(binding);
+        }
+        Entry::Occupied(mut slot) => {
+            if matches!(binding, Binding::Addr(_)) && !matches!(slot.get(), Binding::Addr(_)) {
+                slot.insert(binding);
+            }
+        }
+    }
 }
 
 /// One entry of the target's program-header table.
@@ -549,24 +587,59 @@ impl Binary {
     /// Tries, in order: a defined symbol in `.symtab`, a defined symbol in
     /// `.dynsym`, then a function the target imports through its PLT (the stub's
     /// address). Returns `None` if the target provides no such symbol.
+    ///
+    /// A name the target *does* define, but not as something a reference can be
+    /// resolved to, is an error rather than either of those: see [`Binding`].
     pub fn resolve_target_symbol(&self, name: &str) -> Result<Option<u64>> {
         let mut cached = self.symbols.borrow_mut();
         if cached.is_none() {
             *cached = Some(self.build_symbol_map()?);
         }
-        Ok(cached.as_ref().and_then(|map| map.get(name).copied()))
+        match cached.as_ref().and_then(|map| map.get(name)).copied() {
+            Some(Binding::Addr(va)) => Ok(Some(va)),
+            None => Ok(None),
+            // An IFUNC's `st_value` is the address of the *resolver*: a
+            // function the loader calls once, with no arguments, to be told
+            // which implementation this machine should use. A static glibc
+            // defines `memcpy`, `memmove`, `memset`, `strlen` and friends that
+            // way, so this is what a splice that copies a slice or formats a
+            // string used to bind to -- the resolver ran with the splice's own
+            // arguments and its return value, a function pointer, was used as
+            // the result.
+            Some(Binding::Ifunc(va)) => Err(anyhow!(
+                "the target defines {name:?} as an ifunc (STT_GNU_IFUNC), whose \
+                 address {va:#x} is its *resolver*: calling it would run the \
+                 resolver with this reference's arguments and use the \
+                 implementation pointer it returns as the result. Resolving an \
+                 ifunc takes the target's own IRELATIVE slot, which resplice does \
+                 not read; provide the function from the rlib instead"
+            )),
+            // A TLS symbol's `st_value` is an offset within the thread-local
+            // block, meaningless until a thread pointer is added to it. glibc's
+            // `errno` is 0x30, which fits every relocation field there is, so
+            // binding it as an address was silent: the splice read or wrote
+            // absolute address 0x30.
+            Some(Binding::Tls(va)) => Err(anyhow!(
+                "the target defines {name:?} as a thread-local (STT_TLS), whose \
+                 value {va:#x} is an offset into the thread-local block rather \
+                 than an address; reaching it takes the thread pointer and the \
+                 target's own TLS relocations, which resplice does not emit"
+            )),
+        }
     }
 
     /// Collect every name [`resolve_target_symbol`](Self::resolve_target_symbol)
-    /// can bind, with the address it resolves to.
+    /// can bind, with what it resolves to.
     ///
     /// Earlier insertions win, which is what gives that function its documented
     /// precedence: `.symtab` over `.dynsym` over the PLT, and within one table
-    /// the first matching entry.
-    fn build_symbol_map(&self) -> Result<HashMap<String, u64>> {
+    /// the first matching entry. A usable definition is the exception: it
+    /// replaces an unusable one recorded earlier (see [`bind`]).
+    fn build_symbol_map(&self) -> Result<HashMap<String, Binding>> {
         use goblin::elf::section_header::SHN_UNDEF;
+        use goblin::elf::sym::{STT_GNU_IFUNC, STT_TLS};
         let elf = self.elf()?;
-        let mut map: HashMap<String, u64> = HashMap::new();
+        let mut map: HashMap<String, Binding> = HashMap::new();
 
         // 1 & 2: symbols the target defines itself.
         for (syms, strtab) in [(&elf.syms, &elf.strtab), (&elf.dynsyms, &elf.dynstrtab)] {
@@ -574,9 +647,26 @@ impl Binary {
                 if sym.st_shndx as u32 == SHN_UNDEF || sym.st_value == 0 {
                     continue;
                 }
-                if let Some(name) = strtab.get_at(sym.st_name) {
-                    map.entry(name.to_owned()).or_insert(sym.st_value);
+                let Some(name) = strtab.get_at(sym.st_name) else {
+                    continue;
+                };
+                // A nameless symbol -- a section symbol, which every object
+                // carries one of per section -- has `st_name == 0`, and the
+                // first byte of a string table is the NUL terminating the empty
+                // string, so it does not name nothing: it names `""`. Binding
+                // that made a reference with no name at all (one against
+                // `STN_UNDEF`, which `R_*_NONE` and a damaged object use)
+                // resolve to whichever section came first instead of being
+                // reported as unresolvable.
+                if name.is_empty() {
+                    continue;
                 }
+                let binding = match sym.st_type() {
+                    STT_GNU_IFUNC => Binding::Ifunc(sym.st_value),
+                    STT_TLS => Binding::Tls(sym.st_value),
+                    _ => Binding::Addr(sym.st_value),
+                };
+                bind(&mut map, name, binding);
             }
         }
 
@@ -600,8 +690,11 @@ impl Binary {
             for (i, reloc) in elf.pltrelocs.iter().enumerate() {
                 if let Some(sym) = elf.dynsyms.get(reloc.r_sym) {
                     if let Some(name) = elf.dynstrtab.get_at(sym.st_name) {
-                        map.entry(name.to_owned())
-                            .or_insert(plt_addr + plt_header + i as u64 * plt_entry);
+                        if name.is_empty() {
+                            continue;
+                        }
+                        let stub = plt_addr + plt_header + i as u64 * plt_entry;
+                        bind(&mut map, name, Binding::Addr(stub));
                     }
                 }
             }
@@ -1393,5 +1486,158 @@ mod tests {
             msg.contains("no PT_NOTE") && msg.contains("padding"),
             "{msg}"
         );
+    }
+
+    /// Virtual address of the one `.text` section in [`craft_with_symtab`]'s
+    /// output, and so the value its nameless section symbol carries.
+    const TEXT_ADDR: u64 = 0x0040_1000;
+
+    /// Build a goblin-parseable ELF64 LE executable whose `.symtab` holds
+    /// `syms`, each given as `(name, st_type, st_value)` and defined in `.text`.
+    ///
+    /// Every entry is `STB_GLOBAL`, and a nameless `STT_SECTION` symbol for
+    /// `.text` precedes them, as a real target's symbol table has.
+    fn craft_with_symtab(syms: &[(&str, u8, u64)]) -> Binary {
+        use goblin::elf::sym::STT_SECTION;
+        let le = Endian::Little;
+
+        // `.strtab` opens with the NUL that terminates the empty string, which
+        // is what `st_name == 0` points at.
+        let mut strtab = vec![0u8];
+        let mut name_offs = Vec::new();
+        for (name, _, _) in syms {
+            name_offs.push(strtab.len() as u64);
+            strtab.extend_from_slice(name.as_bytes());
+            strtab.push(0);
+        }
+
+        fn push_sym(out: &mut Vec<u8>, name: u64, st_type: u8, value: u64) {
+            let le = Endian::Little;
+            let mut e = vec![0u8; 24];
+            le.write_uint(&mut e, 0, 4, name);
+            e[4] = (1 << 4) | st_type; // STB_GLOBAL
+            le.write_uint(&mut e, 6, 2, 1); // st_shndx = .text
+            le.write_uint(&mut e, 8, 8, value);
+            out.extend_from_slice(&e);
+        }
+
+        let mut symtab = vec![0u8; 24]; // the mandatory STN_UNDEF entry
+        push_sym(&mut symtab, 0, STT_SECTION, TEXT_ADDR);
+        for (i, &(_, st_type, value)) in syms.iter().enumerate() {
+            push_sym(&mut symtab, name_offs[i], st_type, value);
+        }
+
+        let shstrtab = b"\0.text\0.symtab\0.strtab\0.shstrtab\0";
+        let align8 = |x: usize| (x + 7) & !7;
+        let off_str = 64;
+        let off_sym = align8(off_str + strtab.len());
+        let off_shstr = off_sym + symtab.len();
+        let shoff = align8(off_shstr + shstrtab.len());
+
+        let mut d = vec![0u8; shoff + 5 * 64];
+        d[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        d[4] = 2; // ELFCLASS64
+        d[5] = 1; // ELFDATA2LSB
+        d[6] = 1; // EV_CURRENT
+        le.write_uint(&mut d, 0x10, 2, 2); // e_type = ET_EXEC
+        le.write_uint(&mut d, 0x12, 2, 0x3e); // e_machine = EM_X86_64
+        le.write_uint(&mut d, 0x14, 4, 1); // e_version
+        le.write_uint(&mut d, 0x20, 8, 64); // e_phoff
+        le.write_uint(&mut d, 0x28, 8, shoff as u64); // e_shoff
+        le.write_uint(&mut d, 0x34, 2, 64); // e_ehsize
+        le.write_uint(&mut d, 0x36, 2, 56); // e_phentsize
+        le.write_uint(&mut d, 0x3a, 2, 64); // e_shentsize
+        le.write_uint(&mut d, 0x3c, 2, 5); // e_shnum
+        le.write_uint(&mut d, 0x3e, 2, 4); // e_shstrndx
+        d[off_str..off_str + strtab.len()].copy_from_slice(&strtab);
+        d[off_sym..off_sym + symtab.len()].copy_from_slice(&symtab);
+        d[off_shstr..off_shstr + shstrtab.len()].copy_from_slice(shstrtab);
+
+        // `(sh_name, sh_type, sh_addr, sh_offset, sh_size, sh_link, sh_entsize)`
+        // for the null section and the four real ones.
+        let shdrs: [(u64, u64, u64, usize, usize, u64, u64); 5] = [
+            (0, 0, 0, 0, 0, 0, 0),
+            (1, 1, TEXT_ADDR, off_str, 0, 0, 0), // .text, PROGBITS
+            (7, 2, 0, off_sym, symtab.len(), 3, 24), // .symtab, sh_link = .strtab
+            (15, 3, 0, off_str, strtab.len(), 0, 0), // .strtab
+            (23, 3, 0, off_shstr, shstrtab.len(), 0, 0), // .shstrtab
+        ];
+        for (i, &(name, kind, addr, off, size, link, entsize)) in shdrs.iter().enumerate() {
+            let sh = shoff + i * 64;
+            le.write_uint(&mut d, sh, 4, name);
+            le.write_uint(&mut d, sh + 4, 4, kind);
+            le.write_uint(&mut d, sh + 16, 8, addr);
+            le.write_uint(&mut d, sh + 24, 8, off as u64);
+            le.write_uint(&mut d, sh + 32, 8, size as u64);
+            le.write_uint(&mut d, sh + 40, 4, link);
+            le.write_uint(&mut d, sh + 56, 8, entsize);
+        }
+
+        let (arch, endian) = Binary::detect_arch(&d).expect("crafted target must parse");
+        Binary::new(d, arch, endian)
+    }
+
+    /// `st_value` is an address only for some symbol types, and a target that
+    /// defines a name as one of the others has to be reported rather than bound.
+    ///
+    /// A statically linked glibc defines `memcpy`, `memmove`, `memset` and
+    /// `strlen` as `STT_GNU_IFUNC`, whose `st_value` is the *resolver*, and
+    /// `errno` as `STT_TLS`, whose `st_value` is an offset into the thread-local
+    /// block (0x30 in glibc 2.42). Both came back as ordinary addresses, so a
+    /// splice that copied a slice called the resolver -- which takes no
+    /// arguments and returns a function pointer -- and one that touched `errno`
+    /// read absolute address 0x30. 0x30 fits every relocation field there is, so
+    /// nothing downstream noticed either.
+    #[test]
+    fn target_symbols_that_are_not_addresses_are_refused() {
+        use goblin::elf::sym::{STT_FUNC, STT_GNU_IFUNC, STT_TLS};
+        let bin = craft_with_symtab(&[
+            ("plain", STT_FUNC, 0x0040_1100),
+            ("strlen", STT_GNU_IFUNC, 0x0040_adf6),
+            ("errno", STT_TLS, 0x30),
+        ]);
+
+        // An ordinary definition still resolves, and an absent name is still
+        // left to the caller to report.
+        assert_eq!(bin.resolve_target_symbol("plain").unwrap(), Some(0x0040_1100));
+        assert_eq!(bin.resolve_target_symbol("absent").unwrap(), None);
+
+        let err = bin.resolve_target_symbol("strlen").unwrap_err().to_string();
+        assert!(err.contains("ifunc") && err.contains("resolver"), "{err}");
+        assert!(err.contains("0x40adf6"), "{err}");
+
+        let err = bin.resolve_target_symbol("errno").unwrap_err().to_string();
+        assert!(err.contains("thread-local"), "{err}");
+        assert!(err.contains("0x30"), "{err}");
+    }
+
+    /// An unusable definition must not shadow a usable one for the same name,
+    /// in either order: a target that offers both has an address to bind.
+    #[test]
+    fn a_usable_definition_wins_over_an_unusable_one() {
+        use goblin::elf::sym::{STT_FUNC, STT_GNU_IFUNC};
+        for syms in [
+            [("memcpy", STT_GNU_IFUNC, 0x0040_a000), ("memcpy", STT_FUNC, 0x0040_b000)],
+            [("memcpy", STT_FUNC, 0x0040_b000), ("memcpy", STT_GNU_IFUNC, 0x0040_a000)],
+        ] {
+            let bin = craft_with_symtab(&syms);
+            assert_eq!(
+                bin.resolve_target_symbol("memcpy").unwrap(),
+                Some(0x0040_b000),
+                "{syms:?}"
+            );
+        }
+    }
+
+    /// A nameless symbol names the empty string, not nothing: `st_name == 0`
+    /// points at the NUL that opens the string table. Every section symbol is
+    /// nameless, so the empty name used to bind to whichever section came first
+    /// -- and a reference carrying no name (one against `STN_UNDEF`, which
+    /// `R_*_NONE` and a damaged object use) resolved to it instead of being
+    /// reported as unresolvable.
+    #[test]
+    fn the_empty_name_binds_nothing() {
+        let bin = craft_with_symtab(&[("plain", goblin::elf::sym::STT_FUNC, 0x0040_1100)]);
+        assert_eq!(bin.resolve_target_symbol("").unwrap(), None);
     }
 }
