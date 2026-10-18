@@ -40,6 +40,60 @@ use std::path::Path;
 use crate::arch::{self, Endian};
 use crate::{Architecture, Binary};
 
+/// The rlib's bytes, however we got hold of them.
+///
+/// Everything downstream borrows from this -- section names, symbol names, the
+/// section contents the closure injects -- so it is one buffer for the whole
+/// link, read once and held until the patches are written.
+enum Rlib {
+    /// The file, mapped. See [`map_rlib`].
+    Mapped(memmap2::Mmap),
+    /// The file's bytes in memory, for an rlib that cannot be mapped.
+    Read(Vec<u8>),
+}
+
+impl std::ops::Deref for Rlib {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Rlib::Mapped(map) => map,
+            Rlib::Read(data) => data,
+        }
+    }
+}
+
+/// Get at an rlib's bytes, mapping the file rather than reading it where that
+/// is possible.
+///
+/// Only the archive's object members are ever looked at, and they are the
+/// smaller part of what rustc writes: a crate compiled the way `cargo build`
+/// compiles one carries its `lib.rmeta` in the same archive, 14MB of an 18MB
+/// rlib for a crate of a few thousand splices. Reading the archive copies all
+/// of that into the process; mapping it means the metadata's pages are never
+/// faulted in at all, because nothing touches them. Of the members that *are*
+/// read, only the headers, symbol tables and the handful of sections a splice
+/// reaches get touched, so the saving is not limited to `lib.rmeta`.
+///
+/// Mapping is `unsafe` because the mapping is a window onto a file another
+/// process may still be writing: a truncation under the map turns a read into
+/// `SIGBUS` rather than the short buffer `fs::read` would have produced. The
+/// rlib is a build artifact the caller has just finished compiling, so this is
+/// the same bet every linker makes about its inputs.
+///
+/// Not every input can be mapped, though -- a zero-length file, a pipe passed
+/// as `<(...)`, a filesystem that refuses `mmap` -- and all of those are inputs
+/// `fs::read` handles. Mapping failure is therefore not an error, just a reason
+/// to read the file the slow way.
+fn map_rlib(path: &Path) -> Result<Rlib> {
+    let ctx = || format!("failed to read rlib {path:?}");
+    let file = fs::File::open(path).with_context(ctx)?;
+    match unsafe { memmap2::Mmap::map(&file) } {
+        Ok(map) => Ok(Rlib::Mapped(map)),
+        Err(_) => Ok(Rlib::Read(fs::read(path).with_context(ctx)?)),
+    }
+}
+
 /// A splice that has been applied to the target, for reporting.
 #[derive(Debug)]
 pub struct Applied {
@@ -63,8 +117,7 @@ struct Patch {
 /// the sections the splices reference), inject the referenced code/data as a new
 /// segment, and patch each splice into place.
 pub fn link_rlib(binary: &mut Binary, rlib_path: &Path) -> Result<Vec<Applied>> {
-    let data = fs::read(rlib_path)
-        .with_context(|| format!("failed to read rlib {rlib_path:?}"))?;
+    let data = map_rlib(rlib_path)?;
     let archive = ArchiveFile::parse(&*data).context("failed to parse rlib archive")?;
 
     // Every object member of the archive, kept alive together, and not just

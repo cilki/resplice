@@ -26,6 +26,12 @@ object = { version = "0.40", default-features = false, features = ["read", "std"
 goblin = "0.10"
 anyhow = "1.0"
 clap = { version = "4.6.6", features = ["derive"] }
+# The rlib is read for its object members only, and in a crate compiled the
+# way `cargo build` compiles one `lib.rmeta` is the bulk of the archive -- 14MB
+# of 18MB for a crate of a few thousand splices. Mapping the file instead of
+# reading it leaves those pages unfaulted, so the metadata costs nothing in
+# either time or resident memory. See `link::map_rlib`.
+memmap2 = "0.9.11"
 
 [dev-dependencies]
 # Must repeat `default-features = false`: features are unified per package, so
