@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use resplice::{link_rlib, Binary};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -59,19 +60,29 @@ fn run(cli: Cli) -> Result<()> {
     }
     binary.save(&cli.output_binary)?;
 
+    // One line per splice, and a crate that reimplements a few thousand
+    // functions has a few thousand of them. `println!` takes the lock and
+    // flushes once per line -- stdout is line-buffered whenever it is not a
+    // terminal too -- so reporting the work cost a write syscall per splice,
+    // which was a measurable fraction of the whole run. Buffer the report and
+    // flush it once.
     let output = cli.output_binary.display();
-    println!("applied {} splice(s) to {output}:", applied.len());
+    let stdout = std::io::stdout();
+    let mut report = BufWriter::new(stdout.lock());
+    writeln!(report, "applied {} splice(s) to {output}:", applied.len())?;
     for splice in &applied {
         let how = if splice.trampoline {
             " (trampoline to injected segment)"
         } else {
             ""
         };
-        println!(
+        writeln!(
+            report,
             "  {:#x}..{:#x} <- {} bytes{how}",
             splice.begin, splice.end, splice.code_len
-        );
+        )?;
     }
+    report.flush()?;
 
     Ok(())
 }
