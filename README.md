@@ -55,7 +55,12 @@ data, or call libc. `resplice` resolves those relocations recursively:
   otherwise the program-header table is grown by one entry into the padding
   that follows it.
 - Calls to symbols the target already **defines or imports** (e.g. a libc
-  function reachable through the PLT) bind to the target's own addresses.
+  function reachable through the PLT) bind to the target's own addresses. Two
+  kinds of definition are reported rather than bound, because their `st_value`
+  is not an address: an ifunc (`STT_GNU_IFUNC`), which carries its resolver, and
+  a thread-local (`STT_TLS`), which carries an offset into the TLS block. A
+  statically linked glibc defines `memcpy`, `memmove`, `memset` and `strlen`
+  the first way and `errno` the second.
 
 That closure spans the whole rlib, not just the object file the splice itself
 landed in. rustc compiles a crate into one object per codegen unit, partitioned
