@@ -598,6 +598,27 @@ fn find_pair_lo(arch: Architecture, sec: &Sec, sym: SymId, endian: Endian) -> Op
         .map(|r| arch::mips_lo16_addend(endian, &sec.bytes, r.offset as usize))
 }
 
+/// Refusal for a reference that can only be expressed as an absolute address,
+/// against a target the loader will map somewhere else (see
+/// [`Binary::is_position_independent`]).
+///
+/// `what` names the field holding the address and `remedy` says how to get rid
+/// of it, both of which depend on how the reference ended up absolute.
+fn absolute_in_pie(what: &str, remedy: &str) -> anyhow::Error {
+    anyhow!(
+        "the target is position-independent (ET_DYN), so the loader maps it at a \
+         base chosen at run time, but {what} -- a link-time offset that nothing \
+         relocates once the image is loaded, because resplice adds no dynamic \
+         relocations. The patched binary would use it as an address and read from \
+         (or jump into) the bottom of its address space, so this is refused \
+         rather than reported as a successful splice. PC-relative references are \
+         unaffected and need nothing: calls, jumps, trampolines and the \
+         `adrp`/`lea` form of a data reference all keep working wherever the \
+         image lands. Splice a target linked at fixed addresses (`cc -no-pie`), \
+         or {remedy}"
+    )
+}
+
 /// Link every object member of the rlib into the shared injected blob + patch
 /// list.
 fn link_objects<'d>(
@@ -808,6 +829,12 @@ fn link_objects<'d>(
         endian.write_uint(&mut blob[..], goff, got_width, s);
     }
 
+    // A position-independent target is mapped at a base chosen at run time, so
+    // the only references that keep working are the ones whose field holds a
+    // displacement rather than an address. See
+    // [`Binary::is_position_independent`] and the refusal in the loop below.
+    let pie = target.is_position_independent()?;
+
     // Apply relocations for every included section. A splice that fits is
     // relocated into a private buffer and patched into `[begin, end)` later;
     // everything else (referenced sections, oversized splices) is relocated in
@@ -830,15 +857,73 @@ fn link_objects<'d>(
             // message is actionable without knowing which splice (or which of
             // its helpers) carries the reference.
             let context = || {
-                format!(
-                    "relocation against {:?} in {:?}",
-                    syms[&r.sym].name, sec.name
-                )
+                let sym = &syms[&r.sym];
+                // A section symbol has no name of its own, and rustc relocates
+                // against one for most of what a splice reaches -- every
+                // `static` and every helper gets a section to itself, and the
+                // reference is to that section rather than to the symbol. An
+                // empty name said nothing about what the reference was to, so
+                // fall back to naming the section it resolves into.
+                let what = if sym.name.is_empty() {
+                    sym.section
+                        .and_then(|secj| secs.get(&secj).map(|s| s.name))
+                        .unwrap_or("<unnamed symbol>")
+                } else {
+                    sym.name
+                };
+                format!("relocation against {what:?} in {:?}", sec.name)
             };
             let s = resolve(r.sym).with_context(context)?;
             let p = site_base + r.offset;
             let a = if r.has_implicit { 0 } else { r.addend };
             let got_va = got.get(&r.sym).map(|&(gva, _)| gva);
+
+            // An absolute address baked into a position-independent target is
+            // wrong by its load base, and there is nothing left to correct it:
+            // the dynamic relocations that would have done so were emitted when
+            // the target was linked, and `resplice` adds none. The patched
+            // binary dereferences a link-time offset instead -- a `static`
+            // holding a reference reads from the bottom of the address space --
+            // and `resplice` reports a successful splice.
+            //
+            // A symbol that is not an address at all is exempt: an `SHN_ABS`
+            // symbol (no section, not undefined) is a link-time constant and
+            // means the same wherever the image lands.
+            if pie && (syms[&r.sym].section.is_some() || syms[&r.sym].undefined) {
+                if arch::writes_absolute_address(arch, r.r_type) {
+                    return Err(absolute_in_pie(
+                        &format!(
+                            "relocation type {} writes the absolute address {s:#x}",
+                            r.r_type.0
+                        ),
+                        "keep addresses out of the data the splice reaches. What \
+                         stores one is a `static` holding a reference, a `&str`, a \
+                         function pointer, or a table of any of those -- index a \
+                         byte array rather than a slice of references",
+                    ))
+                    .with_context(context);
+                }
+                // A GOT reference *could* be resolved without a slot, by
+                // relaxing the indirect load into the PC-relative form the
+                // linker's own relaxations produce (`mov rax, [rip+got]` ->
+                // `lea rax, [rip+sym]`, `adrp`+`ldr` -> `adrp`+`add`). That
+                // rewrites the splice's instructions rather than just filling
+                // in their fields, which nothing here does yet.
+                if got_va.is_some() {
+                    return Err(absolute_in_pie(
+                        &format!(
+                            "this reference goes through a GOT slot resplice \
+                             synthesizes in the injected segment, which holds the \
+                             absolute address {s:#x}"
+                        ),
+                        "avoid the indirection: rustc routes a reference through \
+                         the GOT when its definition is in another codegen unit, \
+                         so moving the definition into the module the splice is \
+                         written in makes the reference PC-relative",
+                    ))
+                    .with_context(context);
+                }
+            }
             let pair_lo = if arch::is_mips_hi16(arch, r.r_type) && r.has_implicit {
                 find_pair_lo(arch, sec, r.sym, endian)
             } else {
@@ -1111,12 +1196,26 @@ mod tests {
     }
 
     fn run_link(rlib: &[u8]) -> (Binary, Vec<Applied>) {
-        let rlib_path = temp_path("rlib");
+        run_link_on(&crafted_target(), "rlib", rlib)
+    }
+
+    /// [`run_link`] against a target of the caller's choosing.
+    fn run_link_on(target: &[u8], tag: &str, rlib: &[u8]) -> (Binary, Vec<Applied>) {
+        let rlib_path = temp_path(tag);
         fs::write(&rlib_path, rlib).unwrap();
-        let mut bin = load(&crafted_target());
+        let mut bin = load(target);
         let applied = link_rlib(&mut bin, &rlib_path).unwrap();
         fs::remove_file(&rlib_path).ok();
         (bin, applied)
+    }
+
+    /// The crafted target marked position-independent, which is what every
+    /// mainstream toolchain emits by default. `e_type` is the first field after
+    /// the 16-byte identifier in both ELF classes.
+    fn crafted_pie_target() -> Vec<u8> {
+        let mut d = crafted_target();
+        d[0x10..0x12].copy_from_slice(&goblin::elf::header::ET_DYN.to_le_bytes());
+        d
     }
 
     /// Read the resolved call/lea targets out of a copy of `SPLICE_CODE` at file
@@ -1540,6 +1639,132 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("writable section"), "message was {msg:?}");
         assert!(msg.contains(".data.COUNTER"), "message was {msg:?}");
+    }
+
+    /// An 8-byte splice: `mov rax, [rip + d32]` (operand@3); `ret`.
+    const GOT_SPLICE_CODE: [u8; 8] = [0x48, 0x8b, 0x05, 0, 0, 0, 0, 0xc3];
+
+    /// An rlib whose splice reaches its `TABLE` indirectly, through a
+    /// `GOTPCREL`-style reference. There is no GOT in the injected segment to
+    /// point it at, so the linker has to synthesize a slot holding `TABLE`'s
+    /// address and aim the load at that.
+    fn build_rlib_got() -> Vec<u8> {
+        use object::write::{Object, Relocation, Symbol, SymbolSection as WSection};
+        use object::{
+            Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolFlags,
+            SymbolKind, SymbolScope,
+        };
+
+        let mut obj = Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+
+        let table = table_data();
+        let rodata = obj.add_section(vec![], b".rodata.table".to_vec(), SectionKind::ReadOnlyData);
+        obj.append_section_data(rodata, &table, 8);
+        let table_sym = obj.add_symbol(Symbol {
+            name: b"TABLE".to_vec(),
+            value: 0,
+            size: table.len() as u64,
+            kind: SymbolKind::Data,
+            scope: SymbolScope::Compilation,
+            weak: false,
+            section: WSection::Section(rodata),
+            flags: SymbolFlags::None,
+        });
+
+        let name = format!(".rspl.{SPLICE_VA:x}.{:x}", SPLICE_VA + 0x20).into_bytes();
+        let rspl = obj.add_section(vec![], name, SectionKind::Text);
+        obj.append_section_data(rspl, &GOT_SPLICE_CODE, 16);
+        obj.add_relocation(
+            rspl,
+            Relocation {
+                offset: 3,
+                symbol: table_sym,
+                addend: -4,
+                flags: RelocationFlags::Elf {
+                    r_type: object::elf::R_X86_64_REX_GOTPCRELX,
+                },
+            },
+        )
+        .unwrap();
+
+        ar_wrap("splice.o", &obj.write().unwrap())
+    }
+
+    /// A GOT-style reference is satisfied by a slot the linker synthesizes in
+    /// the injected segment: the load must reach that slot, and the slot must
+    /// hold the address of the injected data.
+    #[test]
+    fn test_link_rlib_synthesizes_a_got_slot() {
+        let (bin, applied) = run_link_on(&crafted_target(), "rlib_got", &build_rlib_got());
+        assert_eq!(applied.len(), 1);
+
+        // Follow `mov rax, [rip + d32]` to the slot, and the slot to the table.
+        let d = bin.data();
+        let disp = i32::from_le_bytes(d[0x1003..0x1007].try_into().unwrap());
+        let slot_va = (SPLICE_VA as i64 + 7 + disp as i64) as u64;
+        assert!(slot_va >= INJECT_BASE, "GOT slot {slot_va:#x} not injected");
+        let soff = bin.va_to_offset(slot_va).unwrap();
+        let table_va = u64::from_le_bytes(d[soff..soff + 8].try_into().unwrap());
+        assert!(table_va >= INJECT_BASE, "slot holds {table_va:#x}, not injected data");
+        let toff = bin.va_to_offset(table_va).unwrap();
+        assert_eq!(&d[toff..toff + table_data().len()], &table_data());
+    }
+
+    /// Every value `resplice` resolves is a link-time one, and a
+    /// position-independent target -- a PIE, which is what `cc` produces by
+    /// default, or a shared library -- is mapped at a base the loader picks. A
+    /// displacement survives that; an absolute address does not, and nothing
+    /// relocates it afterwards, because `resplice` emits no dynamic
+    /// relocations.
+    ///
+    /// Both ways of writing one have to be refused. The target used to be
+    /// patched regardless, and reported as a successful splice: a `static`
+    /// holding a reference (an ordinary `[&[u8; 4]; 2]`) was injected with the
+    /// pointer it contains left as a link-time offset, so the patched binary
+    /// dereferenced the bottom of its address space and died on the first read.
+    #[test]
+    fn test_link_rlib_rejects_absolute_references_into_a_pie_target() {
+        for (tag, rlib, cue) in [
+            // `R_X86_64_64`: the pointer inside an injected RELRO `static`.
+            (
+                "rlib_pie_abs",
+                build_rlib_relro(".data.rel.ro.NAMES", 0),
+                ".data.rel.ro.NAMES",
+            ),
+            // A synthesized GOT slot, which holds an address just the same.
+            ("rlib_pie_got", build_rlib_got(), "GOT slot"),
+        ] {
+            let rlib_path = temp_path(tag);
+            fs::write(&rlib_path, &rlib).unwrap();
+            let mut bin = load(&crafted_pie_target());
+            let result = link_rlib(&mut bin, &rlib_path);
+            fs::remove_file(&rlib_path).ok();
+
+            let msg = format!("{:#}", result.expect_err("expected an error"));
+            assert!(msg.contains("position-independent"), "message was {msg:?}");
+            assert!(msg.contains(cue), "message was {msg:?}");
+            // Refused before anything was written over the target's own bytes.
+            assert_eq!(&bin.data()[0x1000..0x1020], &[0xcc; 0x20], "target was patched");
+
+            // The same rlib still links against the same target as `ET_EXEC`:
+            // the absolute reference is the only thing being refused.
+            let (_, applied) = run_link_on(&crafted_target(), tag, &rlib);
+            assert_eq!(applied.len(), 1);
+        }
+    }
+
+    /// The counterpart: a position-independent target is not refused wholesale.
+    /// A call and a PC-relative data reference -- what the bulk of a replacement
+    /// compiles into -- are shifted along with everything they point at, so they
+    /// are as correct in a PIE as in a fixed-address executable and must still
+    /// be linked.
+    #[test]
+    fn test_link_rlib_accepts_pc_relative_references_into_a_pie_target() {
+        let (bin, applied) =
+            run_link_on(&crafted_pie_target(), "rlib_pie_pcrel", &build_rlib(SPLICE_VA + 0x20));
+        assert_eq!(applied.len(), 1);
+        assert!(!applied[0].trampoline);
+        assert_refs_resolved(&bin, 0x1000, SPLICE_VA);
     }
 
     /// Link `rlib` into the crafted target and return the error it must produce.

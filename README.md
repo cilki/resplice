@@ -209,6 +209,47 @@ which does not fit the signed 32-bit displacement of a `jmp rel32`; choose an
 Note that the segment is mapped read+execute, so referenced *writable* data
 (mutable `static`s, `.bss`) is not supported yet and is reported as an error.
 
+### Position-independent targets
+
+A target the loader maps at a base of its own choosing — a PIE executable,
+which is what `cc` and every other mainstream toolchain produce by default, or a
+shared library — can be spliced, with one restriction.
+
+The addresses in such an image, and so the `begin`/`end` you read out of a
+disassembly of it, are link-time *offsets*; at run time everything sits at those
+offsets plus a base picked per process. Everything `resplice` resolves is a
+link-time value, and whether that survives depends on what the reference holds:
+
+- A **PC-relative** reference survives unchanged. The splice, the injected
+  segment and the target's own code are all shifted by the same amount, so the
+  distance between any two of them is what it was. That covers calls into
+  injected helpers, calls to functions the target imports through its PLT, the
+  `adrp`/`lea` form of a data reference, and the trampoline of an oversized
+  splice — the bulk of what a replacement compiles into.
+- An **absolute** address does not. `resplice` emits no dynamic relocations, so
+  nothing corrects it once the image is loaded. Such a reference is refused
+  rather than written:
+
+```
+error: relocation against ".rodata._ZN4play1A17h..E" in
+".data.rel.ro._ZN4play5NAMES17h..E": the target is position-independent
+(ET_DYN), so the loader maps it at a base chosen at run time, but relocation
+type 257 writes the absolute address 0x40010 -- a link-time offset that nothing
+relocates once the image is loaded [...]
+```
+
+What needs an absolute address is a `static` that *stores* one — a reference, a
+`&str`, a function pointer, or a table of any of those:
+
+```rust
+static A: [u8; 4] = *b"abcd";
+static NAMES: [&[u8; 4]; 2] = [&A, &A];  // two absolute pointers
+```
+
+So either keep those out of the data a splice can reach (index a byte array
+rather than a slice of references), or splice a target linked at fixed
+addresses (`cc -no-pie`).
+
 ### Cross-compiling for another architecture
 
 The replacement crate must be compiled for the **same** architecture as the
