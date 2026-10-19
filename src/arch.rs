@@ -90,6 +90,35 @@ pub fn needs_got(arch: Architecture, r_type: RelocationType) -> bool {
     }
 }
 
+/// Whether the field this relocation writes holds an absolute address, as
+/// opposed to a displacement (or a slice of one) that a uniform shift of the
+/// whole image leaves unchanged.
+///
+/// The distinction only matters for a position-independent target, where a
+/// link-time absolute address is wrong by the load base and nothing fixes it up
+/// (see [`crate::Binary::is_position_independent`]).
+///
+/// The low-half companions of a PC-relative high half are deliberately *not*
+/// here: aarch64's `*_ABS_LO12_NC` family is named for taking the low 12 bits
+/// of `S + A`, but it completes an `ADRP` that is PC-relative, and a load base
+/// is page-aligned — so the bits it writes are the same wherever the image
+/// lands. MIPS `R_MIPS_LO16` is listed because its partner `R_MIPS_HI16` builds
+/// a genuinely absolute 32-bit address rather than a page displacement, so the
+/// pair stands or falls together.
+pub fn writes_absolute_address(arch: Architecture, r_type: RelocationType) -> bool {
+    match arch {
+        Architecture::X86 | Architecture::X86_64 => {
+            matches!(r_type, R_X86_64_64 | R_X86_64_32 | R_X86_64_32S)
+        }
+        Architecture::Arm64 => matches!(r_type, R_AARCH64_ABS64 | R_AARCH64_ABS32),
+        Architecture::Arm => matches!(r_type, R_ARM_ABS32 | R_ARM_MOVW_ABS_NC | R_ARM_MOVT_ABS),
+        Architecture::Mips | Architecture::Mips64 => matches!(
+            r_type,
+            R_MIPS_32 | R_MIPS_64 | R_MIPS_26 | R_MIPS_HI16 | R_MIPS_LO16
+        ),
+    }
+}
+
 /// True for `R_MIPS_HI16`, whose resolved value depends on the low half from a
 /// paired `R_MIPS_LO16` (only under the REL scheme, where the addend is stored
 /// in the instruction rather than carried explicitly).
@@ -770,5 +799,89 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("mips relocation"));
         assert!(!needs_got(Architecture::Mips, object::elf::R_MIPS_GOT16));
+    }
+
+    /// Which relocations hold an absolute address decides which references
+    /// `link_objects` can resolve against a position-independent target, so the
+    /// split has to follow what the encoders above actually write.
+    ///
+    /// The near-misses are the point: an aarch64 `*_ABS_LO12_NC` is named for
+    /// an absolute address but writes only the low 12 bits of one, and it
+    /// completes a PC-relative `ADRP` -- a page-aligned load base leaves both
+    /// halves correct. Classifying it as absolute would refuse the form every
+    /// Rust data reference compiles into on aarch64.
+    #[test]
+    fn absolute_and_pc_relative_relocations_are_told_apart() {
+        use Architecture::{Arm, Arm64, Mips, Mips64, X86, X86_64};
+
+        for (arch, absolute, relative) in [
+            (
+                X86_64,
+                &[R_X86_64_64, R_X86_64_32, R_X86_64_32S][..],
+                &[R_X86_64_PC64, R_X86_64_PC32, R_X86_64_PLT32, R_X86_64_GOTPCREL][..],
+            ),
+            (
+                Arm64,
+                &[R_AARCH64_ABS64, R_AARCH64_ABS32][..],
+                &[
+                    R_AARCH64_PREL64,
+                    R_AARCH64_PREL32,
+                    R_AARCH64_CALL26,
+                    R_AARCH64_JUMP26,
+                    R_AARCH64_ADR_PREL_PG_HI21,
+                    R_AARCH64_ADD_ABS_LO12_NC,
+                    R_AARCH64_LDST8_ABS_LO12_NC,
+                    R_AARCH64_LDST32_ABS_LO12_NC,
+                    R_AARCH64_LDST64_ABS_LO12_NC,
+                    R_AARCH64_LDST128_ABS_LO12_NC,
+                    R_AARCH64_ADR_GOT_PAGE,
+                    R_AARCH64_LD64_GOT_LO12_NC,
+                ][..],
+            ),
+            (
+                Arm,
+                &[R_ARM_ABS32, R_ARM_MOVW_ABS_NC, R_ARM_MOVT_ABS][..],
+                &[R_ARM_REL32, R_ARM_CALL, R_ARM_JUMP24, R_ARM_GOT_PREL][..],
+            ),
+            (
+                Mips64,
+                &[R_MIPS_32, R_MIPS_64, R_MIPS_26, R_MIPS_HI16, R_MIPS_LO16][..],
+                &[R_MIPS_PC16, R_MIPS_PC32][..],
+            ),
+        ] {
+            for &r in absolute {
+                assert!(
+                    writes_absolute_address(arch, r),
+                    "{arch:?} relocation {} should be absolute",
+                    r.0
+                );
+            }
+            for &r in relative {
+                assert!(
+                    !writes_absolute_address(arch, r),
+                    "{arch:?} relocation {} should not be absolute",
+                    r.0
+                );
+            }
+        }
+
+        // The 32-bit variants answer exactly as their 64-bit siblings do, which
+        // is how [`apply`] dispatches them: same encoders, same classification.
+        for r in [R_X86_64_64, R_X86_64_32, R_X86_64_32S, R_X86_64_PC32] {
+            assert_eq!(
+                writes_absolute_address(X86, r),
+                writes_absolute_address(X86_64, r),
+                "relocation {} classified differently for x86 and x86-64",
+                r.0
+            );
+        }
+        for r in [R_MIPS_32, R_MIPS_HI16, R_MIPS_LO16, R_MIPS_PC16] {
+            assert_eq!(
+                writes_absolute_address(Mips, r),
+                writes_absolute_address(Mips64, r),
+                "relocation {} classified differently for mips and mips64",
+                r.0
+            );
+        }
     }
 }

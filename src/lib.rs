@@ -360,6 +360,44 @@ impl Binary {
         self.endian
     }
 
+    /// Whether the target is position-independent (`ET_DYN`) — a PIE
+    /// executable, which is what every mainstream toolchain produces by
+    /// default, or a shared library.
+    ///
+    /// The loader maps such an image at a base it picks at run time, so the
+    /// addresses its headers name are only link-time *offsets*. Everything
+    /// `resplice` writes is resolved at link time against those offsets, and
+    /// `resplice` adds no dynamic relocations, so whether a reference survives
+    /// depends on what kind of value its field holds:
+    ///
+    /// - A PC-relative displacement survives unchanged. The splice, the
+    ///   injected segment and the target's own code are all shifted by the same
+    ///   amount, so the distance between any two of them is the same as it was.
+    ///   That covers a call, a jump, a trampoline, and the `adrp`/`lea` form of
+    ///   a data reference — the bulk of what a replacement compiles into.
+    /// - An *absolute* address does not. Nothing relocates it once the image is
+    ///   loaded, so the target dereferences a link-time offset as if it were an
+    ///   address and reads from (or jumps into) the bottom of its address
+    ///   space.
+    ///
+    /// [`link_rlib`] therefore refuses the absolute references rather than
+    /// reporting a successful splice whose binary faults. See
+    /// `arch::writes_absolute_address`.
+    pub fn is_position_independent(&self) -> Result<bool> {
+        use goblin::elf::header::ET_DYN;
+        // `e_type` is the first field after the 16-byte identifier in both ELF
+        // classes, so reading it needs nothing `detect_arch` has not already
+        // validated -- and reading it here rather than through `elf()` keeps
+        // this as cheap as `program_headers`.
+        if self.data.len() < 0x12 {
+            return Err(anyhow!(
+                "image is {} bytes, too short to hold an ELF header",
+                self.data.len()
+            ));
+        }
+        Ok(self.endian.read_uint(&self.data, 0x10, 2) == ET_DYN as u64)
+    }
+
     /// Parse this binary as an ELF image (errors for non-ELF targets).
     fn elf(&self) -> Result<goblin::elf::Elf<'_>> {
         match goblin::Object::parse(&self.data)? {
