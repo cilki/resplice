@@ -262,6 +262,14 @@ struct SymInfo<'d> {
     /// Value (offset within its section, or absolute value).
     value: u64,
     undefined: bool,
+    /// What the symbol's `st_shndx` actually named, for the symbols that are
+    /// neither defined in a section of this archive nor undefined.
+    ///
+    /// Only `SHN_ABS` carries a value a reference can be resolved against. The
+    /// others reach [`SymInfo`] with a `st_value` that is not an address and no
+    /// section to make one out of, and are refused rather than used: see the
+    /// `resolve` closure in [`link_objects`].
+    place: object::SymbolSection,
 }
 
 /// Whether a section is still writable once the target is running, and so
@@ -577,6 +585,7 @@ fn extract_relocs<'d>(
                 section,
                 value,
                 undefined,
+                place: s.section(),
             });
         }
     }
@@ -802,6 +811,35 @@ fn link_objects<'d>(
             let base_va = sec_va
                 .get(&secj)
                 .ok_or_else(|| anyhow!("symbol {:?} in un-laid-out section", s.name))?;
+            // `st_value` is an offset into the section the symbol is defined
+            // in, and nothing has vetted it: it is read back out of an rlib
+            // whose symbol table may be damaged or crafted. One past the end
+            // is allowed (an end marker names the first byte after the
+            // section), anything further is not an offset into the section at
+            // all, and adding it to the section's address yields whatever the
+            // injected blob happens to hold there -- the next section's bytes,
+            // a synthesized GOT slot, or an address past the end of the
+            // injected segment that nothing maps.
+            //
+            // Only `st_value` is checked, not `st_value + addend`: an addend is
+            // part of the relocation's own arithmetic rather than an offset
+            // into the symbol's section (every x86-64 PC-relative type carries
+            // -4 to account for the instruction tail), so it has no meaning to
+            // bound.
+            let len = secs[&secj].bytes.len() as u64;
+            if s.value > len {
+                bail!(
+                    "the rlib defines {:?} at offset {:#x} of section {:?}, which holds \
+                     only {len} bytes. `st_value` is an offset into that section, so \
+                     this is not a definition the reference can be pointed at: \
+                     resolving it would aim the reference at whatever follows the \
+                     section in the injected segment, or past the end of the segment \
+                     altogether",
+                    s.name,
+                    s.value,
+                    secs[&secj].name,
+                )
+            }
             Ok(base_va + s.value)
         } else if s.undefined {
             target.resolve_target_symbol(s.name)?.ok_or_else(|| {
@@ -816,9 +854,54 @@ fn link_objects<'d>(
                     s.name
                 )
             })
-        } else {
-            // Absolute symbol.
+        } else if s.place == object::SymbolSection::Absolute {
+            // `SHN_ABS`: a link-time constant, which is the one thing left
+            // whose `st_value` is usable as it stands.
             Ok(s.value)
+        } else if s.place == object::SymbolSection::Common {
+            // `SHN_COMMON` is a *request* for space rather than a definition:
+            // `st_value` holds the alignment the symbol wants and `st_size`
+            // how much of it, and a linker is expected to allocate the object
+            // itself. `resplice` allocates nothing, and `object` reports a
+            // common symbol's address as 0 so the alignment is not mistaken
+            // for one -- which is exactly the value that got written, leaving
+            // the splice reading or writing through a null pointer.
+            //
+            // rustc emits no common symbols, but an rlib is not only rustc's
+            // output: a replacement crate that compiles a C helper has those
+            // objects bundled into the same archive, and a file-scope `int x;`
+            // compiled with `-fcommon` is a common symbol.
+            bail!(
+                "the rlib defines {:?} as a common symbol (SHN_COMMON), which asks a \
+                 linker to allocate space for it rather than giving it an address. \
+                 resplice allocates none, so the reference would resolve to address 0 \
+                 and the patched binary would dereference a null pointer. Give the \
+                 symbol a definition with storage -- in C that means an initializer, \
+                 or `-fno-common` (the default since GCC 10)",
+                s.name
+            )
+        } else {
+            // Everything else: an `SHN_XINDEX` whose `.symtab_shndx` table is
+            // missing or out of range, one of the reserved indices between
+            // `SHN_LORESERVE` and `SHN_HIRESERVE`, and the `SHN_ABS` of an
+            // `STT_FILE` entry (a source file name, not a definition). There is
+            // no section to resolve against and `st_value` is still a
+            // section-relative offset, so writing it as it stands pointed the
+            // reference at an arbitrary low address.
+            let shndx = match s.place {
+                object::SymbolSection::None => "names no section at all",
+                _ => {
+                    "is reserved or unresolvable (at or above SHN_LORESERVE, or an \
+                     SHN_XINDEX with no .symtab_shndx table to read it from)"
+                }
+            };
+            bail!(
+                "the rlib defines {:?} with an `st_shndx` that {shndx}, so resplice \
+                 cannot resolve it: its value {:#x} is neither an offset into a \
+                 section it could inject nor an address a reference can be pointed at",
+                s.name,
+                s.value
+            )
         }
     };
 
@@ -2068,6 +2151,223 @@ mod tests {
         let msg = link_err("rlib_unreadable", &ar_wrap("splice.o", &member));
         assert!(msg.contains("failed to read the contents"), "message was {msg:?}");
         assert!(msg.contains(".rspl.401000.401020"), "message was {msg:?}");
+    }
+
+    /// An rlib whose splice reads a `TABLE` through
+    /// `lea rax, [rip + TABLE]`, where `TABLE` is declared at `sym_value`
+    /// bytes into the 16-byte `.rodata.table` section it is defined in.
+    ///
+    /// rustc writes 0 there. The parameter is what a damaged or crafted symbol
+    /// table can say instead: `st_value` is an offset into the section, and
+    /// nothing in the archive has vetted it.
+    fn build_obj_sym_value(sym_value: u64) -> Vec<u8> {
+        use object::write::{Object, Relocation, Symbol, SymbolSection as WSection};
+        use object::{
+            Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolFlags,
+            SymbolKind, SymbolScope,
+        };
+
+        let mut obj = Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+        let table = table_data();
+        let rodata = obj.add_section(vec![], b".rodata.table".to_vec(), SectionKind::ReadOnlyData);
+        obj.append_section_data(rodata, &table, 1);
+        let table_sym = obj.add_symbol(Symbol {
+            name: b"TABLE".to_vec(),
+            value: sym_value,
+            size: 0,
+            kind: SymbolKind::Data,
+            scope: SymbolScope::Compilation,
+            weak: false,
+            section: WSection::Section(rodata),
+            flags: SymbolFlags::None,
+        });
+
+        let name = format!(".rspl.{SPLICE_VA:x}.{:x}", SPLICE_VA + 0x20).into_bytes();
+        let rspl = obj.add_section(vec![], name, SectionKind::Text);
+        obj.append_section_data(rspl, &PTR_SPLICE_CODE, 16);
+        obj.add_relocation(
+            rspl,
+            Relocation {
+                offset: 3,
+                symbol: table_sym,
+                addend: -4,
+                flags: RelocationFlags::Elf { r_type: object::elf::R_X86_64_PC32 },
+            },
+        )
+        .unwrap();
+
+        obj.write().unwrap()
+    }
+
+    /// [`build_obj_sym_value`]'s object, as a one-member rlib.
+    fn build_rlib_sym_value(sym_value: u64) -> Vec<u8> {
+        ar_wrap("splice.o", &build_obj_sym_value(sym_value))
+    }
+
+    /// Follow the `lea rax, [rip + d32]` of [`PTR_SPLICE_CODE`] patched at file
+    /// offset 0x1000 and return the address it resolves to.
+    fn lea_target(bin: &Binary) -> u64 {
+        let d = bin.data();
+        assert_eq!((d[0x1000], d[0x1002]), (0x48, 0x05), "lea opcode");
+        let disp = i32::from_le_bytes(d[0x1003..0x1007].try_into().unwrap());
+        (SPLICE_VA as i64 + 7 + disp as i64) as u64
+    }
+
+    /// A symbol's `st_value` is an offset into the section it is defined in, so
+    /// one that runs past the end of that section is not a definition a
+    /// reference can be pointed at and has to be refused.
+    ///
+    /// It used to be added to the section's injected address unchecked. The
+    /// reference then pointed at whatever followed the section in the injected
+    /// blob -- the next section's bytes, a synthesized GOT slot -- or, for a
+    /// large enough value, past the end of the injected segment at an address
+    /// nothing maps at all. `resplice` reported a successful splice in every
+    /// case: the 16-byte table below with `st_value = 0x10000` resolved to
+    /// 0x413000, 0x10000 bytes past a segment that is 16 bytes long.
+    #[test]
+    fn test_link_rlib_rejects_symbol_value_outside_its_section() {
+        let rlib_path = temp_path("rlib_sym_oob");
+        fs::write(&rlib_path, build_rlib_sym_value(0x1_0000)).unwrap();
+        let mut bin = load(&crafted_target());
+        let result = link_rlib(&mut bin, &rlib_path);
+        fs::remove_file(&rlib_path).ok();
+
+        let msg = format!("{:#}", result.expect_err("expected an error"));
+        assert!(msg.contains("\"TABLE\" at offset 0x10000"), "message was {msg:?}");
+        assert!(msg.contains(".rodata.table"), "message was {msg:?}");
+        assert!(msg.contains("only 16 bytes"), "message was {msg:?}");
+        // Refused before anything was written over the target's own bytes.
+        assert_eq!(&bin.data()[0x1000..0x1020], &[0xcc; 0x20], "target was patched");
+
+        // One byte past the end is the same mistake, and just as refused: the
+        // interesting values are the ones a wrong offset lands on, not only the
+        // wild ones.
+        let msg = link_err("rlib_sym_oob_1", &build_rlib_sym_value(17));
+        assert!(msg.contains("at offset 0x11"), "message was {msg:?}");
+
+        // The boundary itself is legal -- an end marker names the first byte
+        // past the section -- and so is every offset inside it. Each has to
+        // still resolve, to exactly that many bytes into the injected section.
+        for value in [0, 1, 8, 16] {
+            let (bin, applied) =
+                run_link_on(&crafted_target(), "rlib_sym_ok", &build_rlib_sym_value(value));
+            assert_eq!(applied.len(), 1);
+            assert_eq!(lea_target(&bin), INJECT_BASE + value, "st_value {value}");
+        }
+    }
+
+    /// A common symbol (`SHN_COMMON`) is a request for space a linker is meant
+    /// to allocate, not a definition with an address: `st_value` holds the
+    /// alignment it wants. `resplice` allocates no such storage, so it has to
+    /// refuse the reference.
+    ///
+    /// It used to fall through to the "absolute symbol" arm, which takes
+    /// `st_value` as the final address. `object` reports a common symbol's
+    /// address as 0 precisely so the alignment is not mistaken for one, so 0 is
+    /// what got written: the patched binary dereferenced a null pointer, and
+    /// `resplice` reported a successful splice.
+    #[test]
+    fn test_link_rlib_rejects_common_symbol() {
+        use object::write::{Object, Relocation, Symbol, SymbolSection as WSection};
+        use object::{
+            Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolFlags,
+            SymbolKind, SymbolScope,
+        };
+
+        let mut obj = Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+        let counter = obj.add_symbol(Symbol {
+            name: b"shared_counter".to_vec(),
+            value: 8, // a common symbol's value is its alignment
+            size: 8,
+            kind: SymbolKind::Data,
+            scope: SymbolScope::Dynamic,
+            weak: false,
+            section: WSection::Common,
+            flags: SymbolFlags::None,
+        });
+        let name = format!(".rspl.{SPLICE_VA:x}.{:x}", SPLICE_VA + 0x20).into_bytes();
+        let rspl = obj.add_section(vec![], name, SectionKind::Text);
+        obj.append_section_data(rspl, &PTR_SPLICE_CODE, 16);
+        obj.add_relocation(
+            rspl,
+            Relocation {
+                offset: 3,
+                symbol: counter,
+                addend: -4,
+                flags: RelocationFlags::Elf { r_type: object::elf::R_X86_64_PC32 },
+            },
+        )
+        .unwrap();
+
+        let msg = link_err("rlib_common", &ar_wrap("splice.o", &obj.write().unwrap()));
+        assert!(msg.contains("SHN_COMMON"), "message was {msg:?}");
+        assert!(msg.contains("shared_counter"), "message was {msg:?}");
+        assert!(msg.contains("address 0"), "message was {msg:?}");
+    }
+
+    /// The file offset of the `Elf64_Sym` entry for the symbol named `sym`.
+    fn sym_entry_off(member: &[u8], sym: &str) -> usize {
+        let obj = object::File::parse(member).unwrap();
+        let symtab = obj
+            .sections()
+            .find(|s| matches!(s.name(), Ok(".symtab")))
+            .expect(".symtab");
+        let (off, _) = symtab.file_range().expect("symtab file range");
+        let index = obj
+            .symbols()
+            .find(|s| matches!(s.name(), Ok(n) if n == sym))
+            .expect("symbol")
+            .index()
+            .0;
+        off as usize + index * 24 // Elf64_Sym is 24 bytes
+    }
+
+    /// Rewrite the `st_shndx` of the symbol named `sym` in an ELF64 object,
+    /// leaving everything else alone. `object::write` cannot emit the reserved
+    /// indices, and a real toolchain emits `SHN_XINDEX` only for an object with
+    /// more than 65279 sections.
+    fn set_st_shndx(member: &mut [u8], sym: &str, shndx: u16) {
+        // st_shndx sits at offset 6 of the entry, after st_name/st_info/st_other.
+        let at = sym_entry_off(member, sym) + 6;
+        member[at..at + 2].copy_from_slice(&shndx.to_le_bytes());
+    }
+
+    /// `SHN_ABS` is the one section index with no section behind it whose
+    /// `st_value` really is the answer: a link-time constant, which means the
+    /// same wherever the image lands. Refusing the other such indices must not
+    /// take it with them.
+    #[test]
+    fn test_link_rlib_resolves_an_absolute_symbol() {
+        let mut member = build_obj_sym_value(0);
+        set_st_shndx(&mut member, "TABLE", object::elf::SHN_ABS.0);
+        // `st_value` is the whole address now, not an offset into a section, so
+        // give it one inside the target rather than the 0 the builder wrote.
+        let at = sym_entry_off(&member, "TABLE") + 8; // st_value
+        member[at..at + 8].copy_from_slice(&(TARGET_BASE + 0x1800).to_le_bytes());
+
+        let (bin, applied) =
+            run_link_on(&crafted_target(), "rlib_abs", &ar_wrap("splice.o", &member));
+        assert_eq!(applied.len(), 1);
+        assert_eq!(lea_target(&bin), TARGET_BASE + 0x1800);
+    }
+
+    /// A section index `resplice` cannot resolve to a section -- a reserved
+    /// one, or an `SHN_XINDEX` whose `.symtab_shndx` table is missing -- leaves
+    /// a symbol with no section to inject and an `st_value` that is still a
+    /// section-relative offset. That used to reach the "absolute symbol" arm
+    /// too, which wrote the offset as if it were an address.
+    #[test]
+    fn test_link_rlib_rejects_unresolvable_section_index() {
+        for shndx in [object::elf::SHN_LORESERVE, object::elf::SHN_XINDEX.0] {
+            let mut member = build_obj_sym_value(0x40);
+            set_st_shndx(&mut member, "TABLE", shndx);
+
+            let msg = link_err("rlib_bad_shndx", &ar_wrap("splice.o", &member));
+            assert!(msg.contains("cannot resolve it"), "message was {msg:?}");
+            assert!(msg.contains("reserved or unresolvable"), "message was {msg:?}");
+            assert!(msg.contains("TABLE"), "message was {msg:?}");
+            assert!(msg.contains("0x40"), "message was {msg:?}");
+        }
     }
 
     /// Linking the same rlib twice has to produce the same bytes.

@@ -61,6 +61,13 @@ data, or call libc. `resplice` resolves those relocations recursively:
   a thread-local (`STT_TLS`), which carries an offset into the TLS block. A
   statically linked glibc defines `memcpy`, `memmove`, `memset` and `strlen`
   the first way and `errno` the second.
+- The rlib's own symbols are read the same way, and the same rule applies to
+  them: a definition whose `st_value` is not an offset into a section the
+  closure can inject is reported rather than resolved. That covers a value past
+  the end of the section it claims to be in, a common symbol (`SHN_COMMON`,
+  which asks a linker to allocate the storage — `resplice` allocates none, so
+  the reference would resolve to address 0), and a reserved or unresolvable
+  `st_shndx`.
 
 That closure spans the whole rlib, not just the object file the splice itself
 landed in. rustc compiles a crate into one object per codegen unit, partitioned
