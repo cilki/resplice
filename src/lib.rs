@@ -21,6 +21,42 @@ fn align_up(x: u64, align: u64) -> u64 {
     x.saturating_add(align - 1) & !(align - 1)
 }
 
+/// The instruction-unit displacement an ARM/AArch64 branch at `from` needs to
+/// reach `to`, where the architecture resolves the branch against `pc` (`from`
+/// on AArch64, `from + 8` on 32-bit ARM) and encodes the displacement in a
+/// signed immediate holding `[-limit, limit)` instruction units.
+///
+/// Both conditions are checked on the full-width displacement, before it is
+/// narrowed to what the immediate can hold. Computing `(to - from) / 4 as i32`
+/// first and range-checking the result afterwards -- which is what this used to
+/// do -- lets a displacement far too large to encode wrap into the permitted
+/// range and pass: with an `--inject-base` 16GB from the splice, an AArch64
+/// trampoline whose displacement is `0x1_0000_0000` instruction units narrowed
+/// to `0`, and `resplice` reported a successful "trampoline to injected
+/// segment" for a `b` that branched to itself. The 4-byte alignment matters for
+/// the same reason: the immediate counts instructions, so a `to` that is not
+/// 4-byte aligned silently rounds towards `from` and lands somewhere else.
+fn branch_offset(from: u64, to: u64, pc: u64, limit: i64, insn: &str) -> Result<i64> {
+    let disp = (to as i64).wrapping_sub(pc as i64);
+    if disp % 4 != 0 {
+        return Err(anyhow!(
+            "trampoline at {from:#x} cannot reach {to:#x}: {insn} counts whole \
+             instructions, so it can only branch to a 4-byte aligned address"
+        ));
+    }
+    let offset = disp / 4;
+    if !(-limit..limit).contains(&offset) {
+        let reach = limit * 4;
+        let away = (to as i64).wrapping_sub(from as i64);
+        return Err(anyhow!(
+            "trampoline at {from:#x} is {away:#x} bytes from its target {to:#x}, \
+             which is out of reach of {insn}; choose an --inject-base within \
+             {reach:#x} bytes of the splice"
+        ));
+    }
+    Ok(offset)
+}
+
 /// Represents an ELF binary that can be patched
 pub struct Binary {
     data: Vec<u8>,
@@ -282,24 +318,14 @@ impl Binary {
                 // Encoding: 0xEA000000 | ((offset >> 2) & 0x00FFFFFF)
                 // Offset is calculated as (target - pc - 8) / 4
                 let pc = from + 8; // ARM PC is 2 instructions ahead
-                let offset = ((to as i64 - pc as i64) / 4) as i32;
-
-                if !(-0x800000..=0x7FFFFF).contains(&offset) {
-                    return Err(anyhow!("Invalid address range: {:#x} to {:#x}", from, to));
-                }
-
+                let offset = branch_offset(from, to, pc, 0x80_0000, "`b` (24-bit imm)")?;
                 let insn = 0xEA000000u32 | ((offset as u32) & 0x00FFFFFF);
                 Ok(self.encode_insn(insn))
             }
             Architecture::Arm64 => {
                 // ARM64 branch instruction: B <offset>
                 // Encoding: 0x14000000 | ((offset >> 2) & 0x03FFFFFF)
-                let offset = ((to as i64 - from as i64) / 4) as i32;
-
-                if !(-0x2000000..=0x1FFFFFF).contains(&offset) {
-                    return Err(anyhow!("Invalid address range: {:#x} to {:#x}", from, to));
-                }
-
+                let offset = branch_offset(from, to, from, 0x200_0000, "`b` (26-bit imm)")?;
                 let insn = 0x14000000u32 | ((offset as u32) & 0x03FFFFFF);
                 Ok(self.encode_insn(insn))
             }
@@ -1100,6 +1126,70 @@ mod tests {
         let err = binary.jump_bytes(0x0022_9fd8, 0x1234_5678).unwrap_err();
         assert!(err.to_string().contains("256MB"), "got: {err}");
         assert!(binary.jump_bytes(0x0022_9fd8, 0x0034_0002).is_err());
+    }
+
+    /// An AArch64 `b` encodes its displacement in instruction units in a signed
+    /// 26-bit immediate, so it reaches ±128MB. The range used to be checked
+    /// *after* narrowing the displacement to `i32`, which lets one far too large
+    /// to encode wrap into the permitted range: an `--inject-base` 16GB away
+    /// gives `0x1_0000_0000` instruction units, which narrows to `0` and passes
+    /// the check as a branch to the trampoline's own address. `resplice`
+    /// reported a successful "trampoline to injected segment" and the patched
+    /// binary died on the ELF header it branched into.
+    #[test]
+    fn arm64_trampoline_rejects_displacement_that_wraps_a_narrower_type() {
+        let binary = Binary::new(vec![0; 0x1000], Architecture::Arm64, Endian::Little);
+
+        // The case a real run produced: a splice at 0x400764 with
+        // `--inject-base 0x400400000`, 0x3fffff8ac bytes away. That is
+        // 0xfffffe2b instruction units, which narrows to a small *negative*
+        // `i32` and used to encode a backwards branch into the ELF header.
+        let err = binary.jump_bytes(0x400764, 0x4_0040_0010).unwrap_err();
+        assert!(err.to_string().contains("out of reach"), "got: {err}");
+
+        // 16GB either way narrows to a displacement of exactly zero, which the
+        // old check read as a branch to the trampoline's own address.
+        let from = 0x8_0000_0000u64;
+        for to in [from + 0x4_0000_0000, from - 0x4_0000_0000] {
+            let err = binary.jump_bytes(from, to).unwrap_err();
+            assert!(err.to_string().contains("out of reach"), "got: {err}");
+        }
+
+        // The edges of what the immediate really holds still encode.
+        let far = binary.jump_bytes(from, from + 0x7ff_fffc).unwrap();
+        assert_eq!(far, (0x1400_0000u32 | 0x1ff_ffff).to_le_bytes());
+        let back = binary.jump_bytes(from, from - 0x800_0000).unwrap();
+        assert_eq!(back, (0x1400_0000u32 | 0x200_0000).to_le_bytes());
+        // One instruction past each is not encodable.
+        assert!(binary.jump_bytes(from, from + 0x800_0000).is_err());
+        assert!(binary.jump_bytes(from, from - 0x800_0004).is_err());
+    }
+
+    /// Same bug, same shape, on 32-bit ARM: a signed 24-bit immediate reaching
+    /// ±32MB, resolved against `pc = from + 8`.
+    #[test]
+    fn arm_trampoline_rejects_displacement_that_wraps_a_narrower_type() {
+        let binary = Binary::new(vec![0; 0x1000], Architecture::Arm, Endian::Little);
+
+        let err = binary.jump_bytes(0x8000, 0x8008 + 0x4_0000_0000).unwrap_err();
+        assert!(err.to_string().contains("out of reach"), "got: {err}");
+
+        // Encoded relative to pc = from + 8, at the edges of the immediate.
+        let fwd = binary.jump_bytes(0x8000, 0x8008 + 0x1ff_fffc).unwrap();
+        assert_eq!(fwd, (0xEA00_0000u32 | 0x7f_ffff).to_le_bytes());
+        assert!(binary.jump_bytes(0x8000, 0x8008 + 0x200_0000).is_err());
+    }
+
+    /// Both branches count whole instructions, so a target that is not 4-byte
+    /// aligned is not reachable at all -- the division used to round it towards
+    /// the branch and emit a jump to a different address than the one asked for.
+    #[test]
+    fn arm_trampolines_reject_a_misaligned_target() {
+        for arch in [Architecture::Arm, Architecture::Arm64] {
+            let binary = Binary::new(vec![0; 0x1000], arch, Endian::Little);
+            let err = binary.jump_bytes(0x400764, 0x400802).unwrap_err();
+            assert!(err.to_string().contains("4-byte aligned"), "got: {err}");
+        }
     }
 
     /// One program header, as
