@@ -94,6 +94,60 @@ fn map_rlib(path: &Path) -> Result<Rlib> {
     }
 }
 
+/// Decide what a member of the rlib that `object` could not parse means:
+/// `Ok(())` for one the link is right to leave out, an error for one it was
+/// supposed to read.
+///
+/// Not every member is an object file. rustc puts the crate's metadata in the
+/// same archive, and on the targets where that is a raw blob rather than an
+/// object there is nothing in it for a linker to read -- so a member that
+/// cannot be parsed has to be skipped rather than refused.
+///
+/// Skipping *every* such member is how this started, and it hides the opposite
+/// case: an object member that is damaged, or that holds something other than
+/// machine code, is silently left out of the link. The splices compiled into
+/// it, and the helpers and `static`s its siblings reference in it, are then
+/// simply absent -- so `resplice` patches whichever splices the members that
+/// did parse happened to carry, reports exactly that many as applied, and exits
+/// successfully. A one-member rlib produces nothing but a "no splices found"
+/// warning next to an unpatched copy of the target.
+///
+/// Two things mark a member as one that had to parse:
+///
+/// - `object` recognizes its container format, so it really is an object file
+///   and the failure is in its contents -- a truncated or otherwise damaged
+///   member, which is what a half-written rlib has.
+/// - Failing that, its name: rustc names each codegen unit's member `*.o`,
+///   while the metadata member is `lib.rmeta`. This catches a member whose
+///   damage reaches the magic at its start, and LLVM bitcode (a container
+///   `object` does not read at all), which `-C linker-plugin-lto` puts in a
+///   `*.o` member in place of machine code.
+fn unparseable_member(name: &str, data: &[u8], err: object::Error) -> Result<()> {
+    /// Magic of a bare LLVM bitcode module, and of the wrapper form that
+    /// carries one (`0x0b17c0de`, little-endian).
+    const BITCODE: [&[u8]; 2] = [b"BC\xc0\xde", &[0xde, 0xc0, 0x17, 0x0b]];
+
+    if !name.ends_with(".o") && object::FileKind::parse(data).is_err() {
+        return Ok(());
+    }
+    if BITCODE.iter().any(|magic| data.starts_with(magic)) {
+        bail!(
+            "archive member {name:?} holds LLVM bitcode rather than machine code, so \
+             there are no compiled splices in it to read. That is what \
+             `-C linker-plugin-lto` produces -- it leaves the crate's code for the \
+             linker's LTO plugin to compile -- so build the replacement crate without \
+             it (a plain `cargo build --release` does)"
+        )
+    }
+    bail!(
+        "failed to parse archive member {name:?} of the rlib: {err}. Skipping it would \
+         leave every `#[Splice]` compiled into it, and every helper and `static` the \
+         other members reference in it, out of the link -- so the splices that do \
+         resolve would be patched and reported as a successful run, with the rest of \
+         the crate silently missing. Rebuild the rlib"
+    )
+}
+
 /// A splice that has been applied to the target, for reporting.
 #[derive(Debug)]
 pub struct Applied {
@@ -133,9 +187,15 @@ pub fn link_rlib(binary: &mut Binary, rlib_path: &Path) -> Result<Vec<Applied>> 
         let member = member.context("failed to read archive member")?;
         let member_data = member.data(&*data).context("failed to read member data")?;
 
-        // Skip members that are not object files (e.g. the rmeta blob).
-        if let Ok(obj) = object::File::parse(member_data) {
-            objs.push(obj);
+        match object::File::parse(member_data) {
+            Ok(obj) => objs.push(obj),
+            // Not every member of an rlib is an object file, so a parse
+            // failure is only an error for one that was meant to be: see
+            // [`unparseable_member`].
+            Err(e) => {
+                let name = String::from_utf8_lossy(member.name()).into_owned();
+                unparseable_member(&name, member_data, e)?;
+            }
         }
     }
 
@@ -2151,6 +2211,58 @@ mod tests {
         let msg = link_err("rlib_unreadable", &ar_wrap("splice.o", &member));
         assert!(msg.contains("failed to read the contents"), "message was {msg:?}");
         assert!(msg.contains(".rspl.401000.401020"), "message was {msg:?}");
+    }
+
+    /// An archive member `object` cannot parse must be an error when it is one
+    /// resplice was supposed to read, and skipped only when it is not an object
+    /// file at all.
+    ///
+    /// Every unparseable member used to be skipped, which hid a damaged one:
+    /// the splices compiled into it, and the helpers its siblings reference in
+    /// it, were simply absent from the link. resplice patched whatever the
+    /// members that did parse carried, reported exactly that many as applied,
+    /// and exited successfully -- so a damaged rlib left the target partly
+    /// unpatched with nothing anywhere saying so.
+    #[test]
+    fn test_link_rlib_rejects_unparseable_member() {
+        // A member that really is an ELF object, with a splice in it, whose
+        // section-header table points past its end: a truncated member's
+        // damage. Its container format is still recognizable, so the failure is
+        // in its contents rather than in what it claims to be.
+        let mut damaged = build_obj_sym_value(0);
+        damaged[0x28..0x30].copy_from_slice(&u64::MAX.to_le_bytes()); // e_shoff
+        assert!(object::File::parse(&*damaged).is_err(), "member still parses");
+
+        let msg = link_err("rlib_bad_member", &ar_wrap("splice.o", &damaged));
+        assert!(msg.contains("failed to parse archive member"), "message was {msg:?}");
+        assert!(msg.contains("\"splice.o\""), "message was {msg:?}");
+
+        // The same member alongside one that links: refused all the same, since
+        // a run that patches only the splices that survived is the thing being
+        // refused.
+        let good = build_obj_sym_value(0);
+        let rlib = ar_wrap_many(&[("good.o", &good), ("splice.o", &damaged)]);
+        let msg = link_err("rlib_bad_member_2", &rlib);
+        assert!(msg.contains("\"splice.o\""), "message was {msg:?}");
+
+        // LLVM bitcode in a `*.o` member -- what `-C linker-plugin-lto`
+        // produces -- is a container `object` does not read at all, so only the
+        // member's name says it was meant to hold compiled splices.
+        let mut bitcode = Vec::from(&b"BC\xc0\xde"[..]);
+        bitcode.extend_from_slice(&[0u8; 64]);
+        let msg = link_err("rlib_bitcode", &ar_wrap("splice.o", &bitcode));
+        assert!(msg.contains("LLVM bitcode"), "message was {msg:?}");
+        assert!(msg.contains("linker-plugin-lto"), "message was {msg:?}");
+
+        // A member that is neither an object file nor named like one is still
+        // skipped: rustc's metadata member is exactly that, and refusing it
+        // would refuse every rlib.
+        let mut rmeta = Vec::from(&b"rust\0\0\0\0"[..]);
+        rmeta.extend_from_slice(&[0xab; 64]);
+        let rlib = ar_wrap_many(&[("lib.rmeta", &rmeta), ("splice.o", &good)]);
+        let (bin, applied) = run_link_on(&crafted_target(), "rlib_rmeta", &rlib);
+        assert_eq!(applied.len(), 1);
+        assert_eq!(lea_target(&bin), INJECT_BASE);
     }
 
     /// An rlib whose splice reads a `TABLE` through
