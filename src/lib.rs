@@ -1,6 +1,6 @@
 pub use anyhow::Result;
 
-use anyhow::{anyhow, Context};
+use anyhow::{anyhow, bail};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -162,6 +162,65 @@ impl TargetSymbols<'_> {
     }
 }
 
+/// The NUL-terminated string at `off` in a string table, read straight out of
+/// its bytes.
+///
+/// A preparsed index of the table's entries is the obvious alternative and the
+/// wrong one twice over. It costs a pass over the whole table (and an owned
+/// entry per string) to answer a question that is a NUL scan from `off`, and it
+/// cannot answer it correctly: a string table may *suffix-merge* its entries,
+/// so `printf` can exist only as the tail of `sprintf` and a symbol naming it
+/// points into the middle of that entry. Looking `off` up in an index of entry
+/// starts then has to find the entry it lands inside and take a substring of
+/// it, which is what `goblin`'s `Strtab::get_at` binary-searches for — ~16
+/// cache-missing probes into a megabyte of index, per symbol, where this reads
+/// the bytes the offset already names.
+fn strtab_str(strtab: &[u8], off: usize) -> Option<&str> {
+    let rest = strtab.get(off..)?;
+    let end = rest.iter().position(|&b| b == 0)?;
+    std::str::from_utf8(&rest[..end]).ok()
+}
+
+/// The entry in `bound` for the symbol named at `off` in `strtab`, or `None`
+/// when it is not one of the names [`Binary::target_symbols`] was asked about.
+///
+/// `first_bytes` is a 256-bit set of the first byte of every name asked about,
+/// and it is what makes this cheap enough to run per symbol of the *target*:
+/// patching a handful of functions into a 6MB binary asks two questions of a
+/// table of 60k symbols, so a symbol that cannot be an answer has to be
+/// rejected without decoding its name or hashing it. One byte load does it.
+///
+/// A nameless symbol — `st_name == 0`, which every section symbol has — names
+/// the empty string rather than nothing, because the first byte of a string
+/// table is the NUL terminating `""`. Binding that would make a reference with
+/// no name at all (one against `STN_UNDEF`, which `R_*_NONE` and a damaged
+/// object use) resolve to whichever section came first instead of being
+/// reported as unresolvable, so the empty name is dropped here.
+fn slot_for<'b>(
+    bound: &'b mut HashMap<&str, Option<Binding>>,
+    first_bytes: &[u64; 4],
+    strtab: &[u8],
+    off: usize,
+) -> Option<&'b mut Option<Binding>> {
+    let &first = strtab.get(off)?;
+    if first == 0 || first_bytes[(first >> 6) as usize] >> (first & 63) & 1 == 0 {
+        return None;
+    }
+    bound.get_mut(strtab_str(strtab, off)?)
+}
+
+/// One entry of the target's section-header table.
+#[derive(Debug, Clone, Copy)]
+struct Shdr {
+    sh_name: u32,
+    sh_type: u32,
+    sh_addr: u64,
+    sh_offset: u64,
+    sh_size: u64,
+    sh_link: u32,
+    sh_entsize: u64,
+}
+
 /// One entry of the target's program-header table.
 #[derive(Debug)]
 struct Phdr {
@@ -239,31 +298,60 @@ impl Binary {
     /// Every operation this crate performs on a target — translating virtual
     /// addresses, reading its symbol table, injecting a segment — is ELF-only,
     /// so non-ELF inputs are rejected here rather than later.
+    ///
+    /// All three answers live in `e_ident` and `e_machine`, at fixed offsets in
+    /// the first 20 bytes of the image, so this reads them rather than parsing
+    /// the image to be told them. A full parse here cost 1.5ms of a 20ms run on
+    /// a 6MB target, all of it spent indexing string tables and reading
+    /// relocation sections that nothing then asked about; everything the rest
+    /// of this file reads out of a target it reads (and bounds-checks) itself.
     fn detect_arch(data: &[u8]) -> Result<(Architecture, Endian)> {
-        let elf = goblin::elf::Elf::parse(data).context("target is not an ELF binary")?;
-        let arch = match elf.header.e_machine {
-            goblin::elf::header::EM_386 => Architecture::X86,
-            goblin::elf::header::EM_X86_64 => Architecture::X86_64,
-            goblin::elf::header::EM_ARM => Architecture::Arm,
-            goblin::elf::header::EM_AARCH64 => Architecture::Arm64,
-            goblin::elf::header::EM_MIPS if elf.is_64 => Architecture::Mips64,
-            goblin::elf::header::EM_MIPS => Architecture::Mips,
+        use goblin::elf::header::{EM_386, EM_AARCH64, EM_ARM, EM_MIPS, EM_X86_64};
+
+        if data.len() < 0x14 || data[..4] != [0x7f, b'E', b'L', b'F'] {
+            bail!("target is not an ELF binary");
+        }
+        // `EI_CLASS` and `EI_DATA`, the two bytes every later read depends on:
+        // they fix the width of the header fields and the order of their
+        // bytes, so a value neither standard class nor standard byte order has
+        // to be refused rather than guessed at.
+        let is_64 = match data[4] {
+            1 => false,
+            2 => true,
+            other => bail!("target has unsupported ELF class {other}"),
+        };
+        let endian = match data[5] {
+            1 => Endian::Little,
+            2 => Endian::Big,
+            other => bail!("target has unsupported ELF byte order {other}"),
+        };
+        // An image too short for its class's header is not one anything here
+        // can read: the program-header table's location alone lives past the
+        // end of it.
+        let ehsize = if is_64 { 64 } else { 52 };
+        if data.len() < ehsize {
+            bail!(
+                "image is {} bytes, too short to hold an ELF header",
+                data.len()
+            );
+        }
+
+        let machine = endian.read_uint(data, 0x12, 2) as u16;
+        let arch = match machine {
+            EM_386 => Architecture::X86,
+            EM_X86_64 => Architecture::X86_64,
+            EM_ARM => Architecture::Arm,
+            EM_AARCH64 => Architecture::Arm64,
+            EM_MIPS if is_64 => Architecture::Mips64,
+            EM_MIPS => Architecture::Mips,
             other => return Err(anyhow!("unsupported ELF machine type {other}")),
         };
         // The machine type implies the pointer width everywhere except MIPS,
         // which is resolved above; a header that disagrees with itself would
         // make every subsequent header field be read at the wrong width.
-        if arch.is_64() != elf.is_64 {
-            return Err(anyhow!(
-                "ELF class contradicts machine type {}",
-                elf.header.e_machine
-            ));
+        if arch.is_64() != is_64 {
+            return Err(anyhow!("ELF class contradicts machine type {machine}"));
         }
-        let endian = if elf.little_endian {
-            Endian::Little
-        } else {
-            Endian::Big
-        };
         Ok((arch, endian))
     }
 
@@ -466,21 +554,135 @@ impl Binary {
         Ok(self.endian.read_uint(&self.data, 0x10, 2) == ET_DYN as u64)
     }
 
-    /// Parse this binary as an ELF image (errors for non-ELF targets).
-    fn elf(&self) -> Result<goblin::elf::Elf<'_>> {
-        match goblin::Object::parse(&self.data)? {
-            goblin::Object::Elf(elf) => Ok(elf),
-            _ => Err(anyhow!(
-                "relocation-aware splicing is only supported for ELF targets"
-            )),
+    /// Read the section-header table straight out of the image, for the same
+    /// reason [`program_headers`](Self::program_headers) does: the symbol
+    /// lookup that needs it wants four of the target's sections, while a full
+    /// parse of the image preparses every string table it has — each into an
+    /// owned index of all its entries, with the whole table validated as UTF-8
+    /// — and reads every relocation section, none of which any caller here
+    /// looks at.
+    ///
+    /// Entries whose declared size is not this ELF class's are refused rather
+    /// than read at the wrong stride, and a table the header places outside the
+    /// image is refused rather than read past the end of it.
+    fn section_headers(&self) -> Result<Vec<Shdr>> {
+        let endian = self.endian;
+        let is_64 = self.is_64();
+        let (shoff_off, shentsize_off, shnum_off, shentsize, ehsize) = if is_64 {
+            (0x28, 0x3a, 0x3c, 64usize, 64usize)
+        } else {
+            (0x20, 0x2e, 0x30, 40usize, 52usize)
+        };
+        // ELF32 has no 8-byte `sh_flags`, so every field after it sits 4 bytes
+        // earlier and is half as wide.
+        let (o_addr, o_offset, o_size, o_link, o_entsize) = if is_64 {
+            (16, 24, 32, 40, 56)
+        } else {
+            (12, 16, 20, 24, 36)
+        };
+        let word = if is_64 { 8 } else { 4 };
+
+        if self.data.len() < ehsize {
+            return Err(anyhow!(
+                "image is {} bytes, too short for an ELF header",
+                self.data.len()
+            ));
         }
+        let shoff = endian.read_uint(&self.data, shoff_off, word) as usize;
+        let got_shentsize = endian.read_uint(&self.data, shentsize_off, 2) as usize;
+        let mut shnum = endian.read_uint(&self.data, shnum_off, 2) as usize;
+        if shoff == 0 {
+            // No section-header table at all: a stripped image, which has no
+            // symbol tables to read either.
+            return Ok(Vec::new());
+        }
+        if got_shentsize != shentsize {
+            return Err(anyhow!("unexpected section-header entry size {got_shentsize}"));
+        }
+        let outside = |entries: usize, end: Option<usize>| {
+            end.is_none_or(|end| end > self.data.len()).then(|| {
+                anyhow!(
+                    "section-header table at {shoff:#x} ({entries} entries of {shentsize} \
+                     bytes) runs past the end of the {}-byte image",
+                    self.data.len()
+                )
+            })
+        };
+        // `e_shnum` is 16 bits wide, so an image with more sections than it can
+        // express keeps the real count in the null section header's `sh_size`
+        // and leaves the field zero. The null header has to be in the image to
+        // be asked.
+        if shnum == 0 {
+            if let Some(err) = outside(1, shoff.checked_add(shentsize)) {
+                return Err(err);
+            }
+            shnum = endian.read_uint(&self.data, shoff + o_size, word) as usize;
+            if shnum == 0 {
+                return Ok(Vec::new());
+            }
+        }
+        let end = shnum.checked_mul(shentsize).and_then(|n| shoff.checked_add(n));
+        if let Some(err) = outside(shnum, end) {
+            return Err(err);
+        }
+
+        Ok((0..shnum)
+            .map(|i| {
+                let off = shoff + i * shentsize;
+                Shdr {
+                    sh_name: endian.read_uint(&self.data, off, 4) as u32,
+                    sh_type: endian.read_uint(&self.data, off + 4, 4) as u32,
+                    sh_addr: endian.read_uint(&self.data, off + o_addr, word),
+                    sh_offset: endian.read_uint(&self.data, off + o_offset, word),
+                    sh_size: endian.read_uint(&self.data, off + o_size, word),
+                    sh_link: endian.read_uint(&self.data, off + o_link, 4) as u32,
+                    sh_entsize: endian.read_uint(&self.data, off + o_entsize, word),
+                }
+            })
+            .collect())
+    }
+
+    /// The bytes of `sh`, or `None` when the file range it claims is not
+    /// wholly inside the image.
+    fn section_bytes(&self, sh: &Shdr) -> Option<&[u8]> {
+        let start = usize::try_from(sh.sh_offset).ok()?;
+        let len = usize::try_from(sh.sh_size).ok()?;
+        self.data.get(start..start.checked_add(len)?)
+    }
+
+    /// The bytes of the section `idx` names, or `None` for an index outside the
+    /// table or a section the image does not back.
+    fn section_bytes_at(&self, shdrs: &[Shdr], idx: usize) -> Option<&[u8]> {
+        self.section_bytes(shdrs.get(idx)?)
+    }
+
+    /// Find the section named `name`.
+    ///
+    /// The section names live in a string table of their own, named by
+    /// `e_shstrndx` — or, when the index does not fit that 16-bit field, by the
+    /// `sh_link` of the null section header that `SHN_XINDEX` defers to.
+    fn section_by_name(&self, shdrs: &[Shdr], name: &str) -> Option<Shdr> {
+        use goblin::elf::section_header::SHN_XINDEX;
+        if shdrs.is_empty() {
+            return None;
+        }
+        let off = if self.is_64() { 0x3e } else { 0x32 };
+        let mut idx = self.endian.read_uint(&self.data, off, 2) as usize;
+        if idx == SHN_XINDEX as usize {
+            idx = shdrs.first()?.sh_link as usize;
+        }
+        let names = self.section_bytes_at(shdrs, idx)?;
+        shdrs
+            .iter()
+            .find(|sh| strtab_str(names, sh.sh_name as usize) == Some(name))
+            .copied()
     }
 
     /// Read the program-header table straight out of the image.
     ///
-    /// This is deliberately not a full [`elf`](Self::elf) parse: the table is a
-    /// dozen fixed-layout entries, while parsing the whole image walks its
-    /// section headers, symbol tables and string tables. Address translation
+    /// This is deliberately not a full ELF parse: the table is a dozen
+    /// fixed-layout entries, while parsing the whole image walks its section
+    /// headers, symbol tables and string tables. Address translation
     /// needs nothing but this table and is called once per splice, so paying
     /// for the rest of the parse each time dominated the tool's runtime.
     ///
@@ -709,11 +911,19 @@ impl Binary {
     ///
     /// Asking for nothing parses nothing, which is the whole cost for a
     /// replacement that reaches none of the target's own symbols.
+    ///
+    /// What the pass costs per symbol matters as much as there being one of
+    /// them, because the table it walks is the target's: a 6MB binary has 60k
+    /// symbols whatever the rlib asks about. So the tables are read straight
+    /// out of the image ([`section_headers`](Self::section_headers)), each
+    /// name is read from the string table at the offset the symbol gives
+    /// ([`strtab_str`]), and a symbol whose name cannot be one of the names
+    /// asked about is rejected by a single byte load ([`slot_for`]).
     pub fn target_symbols<'n>(
         &self,
         names: impl IntoIterator<Item = &'n str>,
     ) -> Result<TargetSymbols<'n>> {
-        use goblin::elf::section_header::SHN_UNDEF;
+        use goblin::elf::section_header::{SHN_UNDEF, SHT_DYNSYM, SHT_RELA, SHT_SYMTAB};
         use goblin::elf::sym::{STT_GNU_IFUNC, STT_TLS};
 
         let mut bound: HashMap<&'n str, Option<Binding>> =
@@ -721,69 +931,140 @@ impl Binary {
         if bound.is_empty() {
             return Ok(TargetSymbols { bound });
         }
-        let elf = self.elf()?;
+
+        // A 256-bit set of the first byte of every name asked about, which is
+        // what keeps the per-symbol test to a byte load. See [`slot_for`].
+        let mut first_bytes = [0u64; 4];
+        for name in bound.keys() {
+            if let Some(&first) = name.as_bytes().first() {
+                first_bytes[(first >> 6) as usize] |= 1 << (first & 63);
+            }
+        }
+
+        let endian = self.endian;
+        let is_64 = self.is_64();
+        let shdrs = self.section_headers()?;
+        // `Elf64_Sym` reorders its fields relative to `Elf32_Sym` rather than
+        // just widening them: the 32-bit form puts `st_value`/`st_size` before
+        // `st_info`/`st_other`/`st_shndx`, the 64-bit one after.
+        let (sym_size, o_value, o_info, o_shndx) = if is_64 {
+            (24usize, 8, 4, 6)
+        } else {
+            (16, 4, 12, 14)
+        };
+        let word = if is_64 { 8 } else { 4 };
 
         // 1 & 2: symbols the target defines itself.
-        for (syms, strtab) in [(&elf.syms, &elf.strtab), (&elf.dynsyms, &elf.dynstrtab)] {
-            for sym in syms.iter() {
-                if sym.st_shndx as u32 == SHN_UNDEF || sym.st_value == 0 {
+        for kind in [SHT_SYMTAB, SHT_DYNSYM] {
+            let Some(sh) = shdrs.iter().rfind(|sh| sh.sh_type == kind) else {
+                continue;
+            };
+            // `sh_link` of a symbol table names the string table its names
+            // live in. A table the image does not back, or one whose names are
+            // nowhere, is skipped rather than read out of bounds.
+            let (Some(table), Some(strtab)) = (
+                self.section_bytes(sh),
+                self.section_bytes_at(&shdrs, sh.sh_link as usize),
+            ) else {
+                continue;
+            };
+            // `sh_entsize` is the stride between entries, which is this
+            // class's entry size in every real image. A larger one (padded
+            // entries) is honoured; a smaller or absent one would make entries
+            // overlap, so the real size is used instead.
+            let stride = (sh.sh_entsize as usize).max(sym_size);
+            for entry in (0..).map_while(|i| {
+                let at = i * stride;
+                table.get(at..at.checked_add(sym_size)?)
+            }) {
+                // Only `st_shndx` and `st_name` are read for every symbol of
+                // the target; the rest of the entry is read for the few that
+                // name something the link asked about.
+                if endian.read_uint(entry, o_shndx, 2) as u32 == SHN_UNDEF {
                     continue;
                 }
-                let Some(name) = strtab.get_at(sym.st_name) else {
+                let name_off = endian.read_uint(entry, 0, 4) as usize;
+                let Some(slot) = slot_for(&mut bound, &first_bytes, strtab, name_off) else {
                     continue;
                 };
-                // A nameless symbol -- a section symbol, which every object
-                // carries one of per section -- has `st_name == 0`, and the
-                // first byte of a string table is the NUL terminating the empty
-                // string, so it does not name nothing: it names `""`. Binding
-                // that made a reference with no name at all (one against
-                // `STN_UNDEF`, which `R_*_NONE` and a damaged object use)
-                // resolve to whichever section came first instead of being
-                // reported as unresolvable.
-                if name.is_empty() {
+                let value = endian.read_uint(entry, o_value, word);
+                if value == 0 {
                     continue;
                 }
-                let Some(slot) = bound.get_mut(name) else {
-                    continue;
-                };
+                let st_type = entry[o_info] & 0xf;
                 bind(
                     slot,
-                    match sym.st_type() {
-                        STT_GNU_IFUNC => Binding::Ifunc(sym.st_value),
-                        STT_TLS => Binding::Tls(sym.st_value),
-                        _ => Binding::Addr(sym.st_value),
+                    match st_type {
+                        STT_GNU_IFUNC => Binding::Ifunc(value),
+                        STT_TLS => Binding::Tls(value),
+                        _ => Binding::Addr(value),
                     },
                 );
             }
         }
 
-        // 3: functions the target imports through the PLT. The i-th `.rela.plt`
-        // entry maps to the `.plt` stub at `plt_base + header + i * entry`, whose
-        // sizes are architecture-specific. (MIPS classically uses `.MIPS.stubs`
-        // rather than a `.plt` of this shape; its import binding is best-effort
-        // and target-*defined* symbols above are the reliable path there.)
+        // 3: functions the target imports through the PLT. The i-th
+        // `.rela.plt` entry maps to the `.plt` stub at
+        // `plt_base + header + i * entry`, whose sizes are
+        // architecture-specific. (MIPS classically uses `.MIPS.stubs` rather
+        // than a `.plt` of this shape; its import binding is best-effort and
+        // target-*defined* symbols above are the reliable path there.)
         let (plt_header, plt_entry) = match self.arch {
             Architecture::X86 | Architecture::X86_64 => (16, 16),
             Architecture::Arm64 => (32, 16),
             Architecture::Arm => (20, 12),
             Architecture::Mips | Architecture::Mips64 => (32, 16),
         };
-        let plt_addr = elf
-            .section_headers
-            .iter()
-            .find(|sh| elf.shdr_strtab.get_at(sh.sh_name) == Some(".plt"))
-            .map(|sh| sh.sh_addr);
-        if let Some(plt_addr) = plt_addr {
-            for (i, reloc) in elf.pltrelocs.iter().enumerate() {
-                if let Some(sym) = elf.dynsyms.get(reloc.r_sym) {
-                    if let Some(name) = elf.dynstrtab.get_at(sym.st_name) {
-                        if name.is_empty() {
-                            continue;
-                        }
-                        if let Some(slot) = bound.get_mut(name) {
-                            let stub = plt_addr + plt_header + i as u64 * plt_entry;
-                            bind(slot, Binding::Addr(stub));
-                        }
+        let plt = self.section_by_name(&shdrs, ".plt");
+        // The PLT's own relocations, which both name the imported function and
+        // fix the order of the stubs. `.rela.plt`/`.rel.plt` is the section
+        // `DT_JMPREL` points into, and finding it by name asks no more of the
+        // image than finding `.plt` by name already does.
+        let jmprel = self
+            .section_by_name(&shdrs, ".rela.plt")
+            .or_else(|| self.section_by_name(&shdrs, ".rel.plt"));
+        if let (Some(plt), Some(jmprel)) = (plt, jmprel) {
+            let dynsym = shdrs.iter().rfind(|sh| sh.sh_type == SHT_DYNSYM);
+            let rels = self.section_bytes(&jmprel);
+            let syms = dynsym.and_then(|sh| self.section_bytes(sh));
+            let names = dynsym.and_then(|sh| self.section_bytes_at(&shdrs, sh.sh_link as usize));
+            if let (Some(rels), Some(syms), Some(names)) = (rels, syms, names) {
+                // A `Rela` carries an addend the `Rel` form leaves in the
+                // field; only its `r_info`, which holds the symbol index in
+                // its high bits, is read here.
+                let rela = jmprel.sh_type == SHT_RELA;
+                let rel_size = match (is_64, rela) {
+                    (true, true) => 24usize,
+                    (true, false) => 16,
+                    (false, true) => 12,
+                    (false, false) => 8,
+                };
+                let stride = (jmprel.sh_entsize as usize).max(rel_size);
+                let sym_stride =
+                    dynsym.map_or(sym_size, |sh| (sh.sh_entsize as usize).max(sym_size));
+                for (i, rel) in (0..)
+                    .map_while(|i| {
+                        let at = i * stride;
+                        rels.get(at..at.checked_add(rel_size)?)
+                    })
+                    .enumerate()
+                {
+                    let r_info = endian.read_uint(rel, word, word);
+                    let sym = if is_64 { r_info >> 32 } else { r_info >> 8 } as usize;
+                    let at = sym.saturating_mul(sym_stride);
+                    let Some(entry) = at
+                        .checked_add(sym_size)
+                        .and_then(|end| syms.get(at..end))
+                    else {
+                        continue;
+                    };
+                    let name_off = endian.read_uint(entry, 0, 4) as usize;
+                    if let Some(slot) = slot_for(&mut bound, &first_bytes, names, name_off) {
+                        let stub = plt
+                            .sh_addr
+                            .saturating_add(plt_header)
+                            .saturating_add(i as u64 * plt_entry);
+                        bind(slot, Binding::Addr(stub));
                     }
                 }
             }
@@ -1644,89 +1925,234 @@ mod tests {
     /// output, and so the value its nameless section symbol carries.
     const TEXT_ADDR: u64 = 0x0040_1000;
 
-    /// Build a goblin-parseable ELF64 LE executable whose `.symtab` holds
-    /// `syms`, each given as `(name, st_type, st_value)` and defined in `.text`.
+    /// Address of the `.plt` [`craft_elf`] writes, and so the base its stub
+    /// addresses are measured from.
+    const PLT_ADDR: u64 = 0x0040_2000;
+
+    /// Offsets of the section-header and symbol-table fields [`craft_elf`]
+    /// writes, for the given ELF class. Both structures reorder their fields
+    /// between the classes rather than just widening them.
+    struct TabLayout {
+        shentsize: usize,
+        shoff_off: usize,
+        shentsize_off: usize,
+        shnum_off: usize,
+        shstrndx_off: usize,
+        sh_addr: usize,
+        sh_offset: usize,
+        sh_size: usize,
+        sh_link: usize,
+        sh_entsize: usize,
+        symsize: usize,
+        st_value: usize,
+        st_info: usize,
+        st_shndx: usize,
+        relasize: usize,
+        word: usize,
+    }
+
+    fn tab_layout(is_64: bool) -> TabLayout {
+        if is_64 {
+            TabLayout {
+                shentsize: 64,
+                shoff_off: 0x28,
+                shentsize_off: 0x3a,
+                shnum_off: 0x3c,
+                shstrndx_off: 0x3e,
+                sh_addr: 16,
+                sh_offset: 24,
+                sh_size: 32,
+                sh_link: 40,
+                sh_entsize: 56,
+                symsize: 24,
+                st_value: 8,
+                st_info: 4,
+                st_shndx: 6,
+                relasize: 24,
+                word: 8,
+            }
+        } else {
+            TabLayout {
+                shentsize: 40,
+                shoff_off: 0x20,
+                shentsize_off: 0x2e,
+                shnum_off: 0x30,
+                shstrndx_off: 0x32,
+                sh_addr: 12,
+                sh_offset: 16,
+                sh_size: 20,
+                sh_link: 24,
+                sh_entsize: 36,
+                symsize: 16,
+                st_value: 4,
+                st_info: 12,
+                st_shndx: 14,
+                relasize: 12,
+                word: 4,
+            }
+        }
+    }
+
+    /// Build a goblin-parseable ELF executable, in the class and byte order
+    /// `arch`/`endian` imply, whose `.symtab` holds `syms` — each given as
+    /// `(name, st_type, st_value)` and defined in `.text` — and whose
+    /// `.dynsym`/`.rela.plt`/`.plt` trio names `imports` as functions reached
+    /// through the PLT, in that order.
     ///
-    /// Every entry is `STB_GLOBAL`, and a nameless `STT_SECTION` symbol for
-    /// `.text` precedes them, as a real target's symbol table has.
-    fn craft_with_symtab(syms: &[(&str, u8, u64)]) -> Binary {
-        use goblin::elf::sym::STT_SECTION;
-        let le = Endian::Little;
+    /// Every `.symtab` entry is `STB_GLOBAL`, and a nameless `STT_SECTION`
+    /// symbol for `.text` precedes them, as a real target's symbol table has.
+    /// Each import is an undefined `.dynsym` entry, which is what a real one
+    /// is, so only its `.rela.plt` entry says where its stub is.
+    fn craft_elf(
+        arch: Architecture,
+        endian: Endian,
+        syms: &[(&str, u8, u64)],
+        imports: &[&str],
+    ) -> Binary {
+        use goblin::elf::sym::{STT_FUNC, STT_SECTION};
+        let is_64 = arch.is_64();
+        let l = tab_layout(is_64);
 
-        // `.strtab` opens with the NUL that terminates the empty string, which
-        // is what `st_name == 0` points at.
-        let mut strtab = vec![0u8];
-        let mut name_offs = Vec::new();
-        for (name, _, _) in syms {
-            name_offs.push(strtab.len() as u64);
-            strtab.extend_from_slice(name.as_bytes());
-            strtab.push(0);
-        }
+        // A string table opens with the NUL that terminates the empty string,
+        // which is what `st_name == 0` points at.
+        let strings = |names: &[&str]| {
+            let mut tab = vec![0u8];
+            let offs: Vec<u64> = names
+                .iter()
+                .map(|name| {
+                    let at = tab.len() as u64;
+                    tab.extend_from_slice(name.as_bytes());
+                    tab.push(0);
+                    at
+                })
+                .collect();
+            (tab, offs)
+        };
 
-        fn push_sym(out: &mut Vec<u8>, name: u64, st_type: u8, value: u64) {
-            let le = Endian::Little;
-            let mut e = vec![0u8; 24];
-            le.write_uint(&mut e, 0, 4, name);
-            e[4] = (1 << 4) | st_type; // STB_GLOBAL
-            le.write_uint(&mut e, 6, 2, 1); // st_shndx = .text
-            le.write_uint(&mut e, 8, 8, value);
+        let push_sym = |out: &mut Vec<u8>, name: u64, st_type: u8, value: u64, shndx: u64| {
+            let mut e = vec![0u8; l.symsize];
+            endian.write_uint(&mut e, 0, 4, name);
+            e[l.st_info] = (1 << 4) | st_type; // STB_GLOBAL
+            endian.write_uint(&mut e, l.st_shndx, 2, shndx);
+            endian.write_uint(&mut e, l.st_value, l.word, value);
             out.extend_from_slice(&e);
-        }
+        };
 
-        let mut symtab = vec![0u8; 24]; // the mandatory STN_UNDEF entry
-        push_sym(&mut symtab, 0, STT_SECTION, TEXT_ADDR);
+        let (strtab, name_offs) = strings(&syms.iter().map(|s| s.0).collect::<Vec<_>>());
+        let mut symtab = vec![0u8; l.symsize]; // the mandatory STN_UNDEF entry
+        push_sym(&mut symtab, 0, STT_SECTION, TEXT_ADDR, 1);
         for (i, &(_, st_type, value)) in syms.iter().enumerate() {
-            push_sym(&mut symtab, name_offs[i], st_type, value);
+            push_sym(&mut symtab, name_offs[i], st_type, value, 1);
         }
 
-        let shstrtab = b"\0.text\0.symtab\0.strtab\0.shstrtab\0";
+        // An import is undefined (`st_shndx == SHN_UNDEF`) with no value, so
+        // the PLT pass is the only thing that can bind it.
+        let (dynstr, import_offs) = strings(imports);
+        let mut dynsym = vec![0u8; l.symsize];
+        for &off in &import_offs {
+            push_sym(&mut dynsym, off, STT_FUNC, 0, 0);
+        }
+        // One `R_*_JUMP_SLOT` per import, in stub order; only the symbol index
+        // in `r_info` is read, and the i-th entry's stub is the i-th one.
+        let mut relaplt = Vec::new();
+        for i in 0..imports.len() {
+            let mut e = vec![0u8; l.relasize];
+            let sym = (i + 1) as u64; // entry 0 of `.dynsym` is STN_UNDEF
+            let r_info = if is_64 { sym << 32 } else { sym << 8 };
+            endian.write_uint(&mut e, l.word, l.word, r_info);
+            relaplt.extend_from_slice(&e);
+        }
+
+        let shstrtab = b"\0.text\0.symtab\0.strtab\0.shstrtab\0.dynsym\0.dynstr\0.rela.plt\0.plt\0";
         let align8 = |x: usize| (x + 7) & !7;
-        let off_str = 64;
+        let off_str = align8(if is_64 { 64 } else { 52 });
         let off_sym = align8(off_str + strtab.len());
-        let off_shstr = off_sym + symtab.len();
+        let off_dynstr = align8(off_sym + symtab.len());
+        let off_dynsym = align8(off_dynstr + dynstr.len());
+        let off_rela = align8(off_dynsym + dynsym.len());
+        let off_shstr = align8(off_rela + relaplt.len());
         let shoff = align8(off_shstr + shstrtab.len());
 
-        let mut d = vec![0u8; shoff + 5 * 64];
-        d[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
-        d[4] = 2; // ELFCLASS64
-        d[5] = 1; // ELFDATA2LSB
-        d[6] = 1; // EV_CURRENT
-        le.write_uint(&mut d, 0x10, 2, 2); // e_type = ET_EXEC
-        le.write_uint(&mut d, 0x12, 2, 0x3e); // e_machine = EM_X86_64
-        le.write_uint(&mut d, 0x14, 4, 1); // e_version
-        le.write_uint(&mut d, 0x20, 8, 64); // e_phoff
-        le.write_uint(&mut d, 0x28, 8, shoff as u64); // e_shoff
-        le.write_uint(&mut d, 0x34, 2, 64); // e_ehsize
-        le.write_uint(&mut d, 0x36, 2, 56); // e_phentsize
-        le.write_uint(&mut d, 0x3a, 2, 64); // e_shentsize
-        le.write_uint(&mut d, 0x3c, 2, 5); // e_shnum
-        le.write_uint(&mut d, 0x3e, 2, 4); // e_shstrndx
-        d[off_str..off_str + strtab.len()].copy_from_slice(&strtab);
-        d[off_sym..off_sym + symtab.len()].copy_from_slice(&symtab);
-        d[off_shstr..off_shstr + shstrtab.len()].copy_from_slice(shstrtab);
-
+        /// One section header's fields, in the order [`craft_elf`] writes them.
+        type Fields = (u64, u64, u64, usize, usize, u64, usize);
         // `(sh_name, sh_type, sh_addr, sh_offset, sh_size, sh_link, sh_entsize)`
-        // for the null section and the four real ones.
-        let shdrs: [(u64, u64, u64, usize, usize, u64, u64); 5] = [
+        // for the null section and the seven real ones. `sh_name` is an offset
+        // into `shstrtab` above.
+        let shdrs: [Fields; 8] = [
             (0, 0, 0, 0, 0, 0, 0),
             (1, 1, TEXT_ADDR, off_str, 0, 0, 0), // .text, PROGBITS
-            (7, 2, 0, off_sym, symtab.len(), 3, 24), // .symtab, sh_link = .strtab
+            (7, 2, 0, off_sym, symtab.len(), 3, l.symsize), // .symtab -> .strtab
             (15, 3, 0, off_str, strtab.len(), 0, 0), // .strtab
-            (23, 3, 0, off_shstr, shstrtab.len(), 0, 0), // .shstrtab
+            (33, 11, 0, off_dynsym, dynsym.len(), 5, l.symsize), // .dynsym -> .dynstr
+            (41, 3, 0, off_dynstr, dynstr.len(), 0, 0), // .dynstr
+            (49, 4, 0, off_rela, relaplt.len(), 4, l.relasize), // .rela.plt, SHT_RELA
+            (59, 1, PLT_ADDR, off_str, 0, 0, 0),  // .plt
+            // 23 is `.shstrtab`, written as the last header below.
         ];
-        for (i, &(name, kind, addr, off, size, link, entsize)) in shdrs.iter().enumerate() {
-            let sh = shoff + i * 64;
-            le.write_uint(&mut d, sh, 4, name);
-            le.write_uint(&mut d, sh + 4, 4, kind);
-            le.write_uint(&mut d, sh + 16, 8, addr);
-            le.write_uint(&mut d, sh + 24, 8, off as u64);
-            le.write_uint(&mut d, sh + 32, 8, size as u64);
-            le.write_uint(&mut d, sh + 40, 4, link);
-            le.write_uint(&mut d, sh + 56, 8, entsize);
+        let shnum = shdrs.len() + 1;
+
+        let mut d = vec![0u8; shoff + shnum * l.shentsize];
+        d[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        d[4] = if is_64 { 2 } else { 1 };
+        d[5] = match endian {
+            Endian::Little => 1,
+            Endian::Big => 2,
+        };
+        d[6] = 1; // EV_CURRENT
+        let machine = match arch {
+            Architecture::X86 => 3,
+            Architecture::X86_64 => 0x3e,
+            Architecture::Arm => 40,
+            Architecture::Arm64 => 183,
+            Architecture::Mips | Architecture::Mips64 => 8,
+        };
+        let (etype_off, machine_off, ehsize_off, phentsize_off) =
+            if is_64 { (0x10, 0x12, 0x34, 0x36) } else { (0x10, 0x12, 0x28, 0x2a) };
+        endian.write_uint(&mut d, etype_off, 2, 2); // e_type = ET_EXEC
+        endian.write_uint(&mut d, machine_off, 2, machine);
+        endian.write_uint(&mut d, 0x14, 4, 1); // e_version
+        endian.write_uint(&mut d, ehsize_off, 2, if is_64 { 64 } else { 52 });
+        endian.write_uint(&mut d, phentsize_off, 2, if is_64 { 56 } else { 32 });
+        endian.write_uint(&mut d, l.shoff_off, l.word, shoff as u64);
+        endian.write_uint(&mut d, l.shentsize_off, 2, l.shentsize as u64);
+        endian.write_uint(&mut d, l.shnum_off, 2, shnum as u64);
+        endian.write_uint(&mut d, l.shstrndx_off, 2, (shnum - 1) as u64);
+        for (at, bytes) in [
+            (off_str, &strtab[..]),
+            (off_sym, &symtab),
+            (off_dynstr, &dynstr),
+            (off_dynsym, &dynsym),
+            (off_rela, &relaplt),
+            (off_shstr, &shstrtab[..]),
+        ] {
+            d[at..at + bytes.len()].copy_from_slice(bytes);
         }
 
-        let (arch, endian) = Binary::detect_arch(&d).expect("crafted target must parse");
+        let write_shdr =
+            |d: &mut Vec<u8>, i: usize, (name, kind, addr, off, size, link, entsize): Fields| {
+                let sh = shoff + i * l.shentsize;
+                endian.write_uint(d, sh, 4, name);
+                endian.write_uint(d, sh + 4, 4, kind);
+                endian.write_uint(d, sh + l.sh_addr, l.word, addr);
+                endian.write_uint(d, sh + l.sh_offset, l.word, off as u64);
+                endian.write_uint(d, sh + l.sh_size, l.word, size as u64);
+                endian.write_uint(d, sh + l.sh_link, 4, link);
+                endian.write_uint(d, sh + l.sh_entsize, l.word, entsize as u64);
+            };
+        for (i, &shdr) in shdrs.iter().enumerate() {
+            write_shdr(&mut d, i, shdr);
+        }
+        write_shdr(&mut d, shnum - 1, (23, 3, 0, off_shstr, shstrtab.len(), 0, 0));
+
+        let (got_arch, got_endian) = Binary::detect_arch(&d).expect("crafted target must parse");
+        assert_eq!((got_arch, got_endian), (arch, endian));
         Binary::new(d, arch, endian)
+    }
+
+    /// [`craft_elf`] for the ELF64 LE target most of these tests want, with no
+    /// PLT imports.
+    fn craft_with_symtab(syms: &[(&str, u8, u64)]) -> Binary {
+        craft_elf(Architecture::X86_64, Endian::Little, syms, &[])
     }
 
     /// `st_value` is an address only for some symbol types, and a target that
@@ -1805,6 +2231,221 @@ mod tests {
                 "{syms:?}"
             );
         }
+    }
+
+    /// The class/byte-order combinations a crafted target can be built in, and
+    /// which this crate supports.
+    const CLASSES: [(Architecture, Endian); 4] = [
+        (Architecture::X86_64, Endian::Little),
+        (Architecture::X86, Endian::Little),
+        (Architecture::Mips64, Endian::Big),
+        (Architecture::Mips, Endian::Big),
+    ];
+
+    /// The section-header table is read out of the image directly rather than
+    /// through a full parse, which preparses every string table the image has
+    /// and reads every relocation section -- so that reader has to agree with a
+    /// real ELF parse, in both classes and both byte orders. Their
+    /// section-header layouts differ by more than field width: ELF32 has no
+    /// 8-byte `sh_flags`, so everything after it sits 4 bytes earlier.
+    #[test]
+    fn section_headers_match_a_full_elf_parse() {
+        use goblin::elf::sym::STT_FUNC;
+        for (arch, endian) in CLASSES {
+            let bin = craft_elf(arch, endian, &[("f", STT_FUNC, 0x40_1100)], &["printf"]);
+            let elf = goblin::elf::Elf::parse(bin.data()).unwrap();
+            let ours = bin.section_headers().unwrap();
+
+            assert_eq!(ours.len(), elf.section_headers.len(), "{arch:?}");
+            for (i, (o, g)) in ours.iter().zip(&elf.section_headers).enumerate() {
+                assert_eq!(
+                    (
+                        o.sh_name as u64,
+                        o.sh_type as u64,
+                        o.sh_addr,
+                        o.sh_offset,
+                        o.sh_size,
+                        o.sh_link as u64,
+                        o.sh_entsize
+                    ),
+                    (
+                        g.sh_name as u64,
+                        g.sh_type as u64,
+                        g.sh_addr,
+                        g.sh_offset,
+                        g.sh_size,
+                        g.sh_link as u64,
+                        g.sh_entsize
+                    ),
+                    "{arch:?} section header {i}"
+                );
+            }
+            // The names come out of the table `e_shstrndx` points at, which is
+            // the other thing a full parse would have handed over.
+            assert_eq!(
+                bin.section_by_name(&ours, ".plt").map(|sh| sh.sh_addr),
+                Some(PLT_ADDR),
+                "{arch:?}"
+            );
+            assert!(bin.section_by_name(&ours, ".absent").is_none(), "{arch:?}");
+        }
+    }
+
+    /// A header claiming a section-header table the file does not hold must be
+    /// refused rather than read past the end of the image, and a table of
+    /// entries of the wrong size must not be read at that stride.
+    #[test]
+    fn section_headers_refuse_a_table_the_image_cannot_back() {
+        use goblin::elf::sym::STT_FUNC;
+        let good = craft_elf(
+            Architecture::X86_64,
+            Endian::Little,
+            &[("f", STT_FUNC, 0x40_1100)],
+            &[],
+        );
+
+        let mut bin = Binary::new(good.data.clone(), Architecture::X86_64, Endian::Little);
+        bin.endian.write_uint(&mut bin.data, 0x3c, 2, 1000); // e_shnum
+        let err = bin.section_headers().unwrap_err().to_string();
+        assert!(err.contains("runs past the end"), "{err}");
+        // Reported by the lookup that needs the table, rather than panicking.
+        assert!(bin.target_symbols(["f"]).is_err(), "{err}");
+
+        let mut bin = Binary::new(good.data.clone(), Architecture::X86_64, Endian::Little);
+        bin.endian.write_uint(&mut bin.data, 0x3a, 2, 48); // e_shentsize
+        let err = bin.section_headers().unwrap_err().to_string();
+        assert!(err.contains("entry size 48"), "{err}");
+
+        // A stripped image has no table and no symbols to find in one, which is
+        // not an error: the splice may need nothing from the target.
+        let mut bin = Binary::new(good.data, Architecture::X86_64, Endian::Little);
+        bin.endian.write_uint(&mut bin.data, 0x28, 8, 0); // e_shoff
+        assert!(bin.section_headers().unwrap().is_empty());
+        assert_eq!(bin.target_symbols(["f"]).unwrap().resolve("f").unwrap(), None);
+    }
+
+    /// `e_shnum` is 16 bits wide, so an image with more sections than it can
+    /// express leaves the field zero and keeps the real count in the null
+    /// section header's `sh_size`. Reading the field as it stands would find no
+    /// sections, and so no symbol tables: every reference into the target would
+    /// be reported as a name it does not define.
+    #[test]
+    fn section_headers_read_a_count_too_large_for_its_field() {
+        use goblin::elf::sym::STT_FUNC;
+        let bin = craft_with_symtab(&[("helper", STT_FUNC, 0x0040_1100)]);
+        let shnum = bin.section_headers().unwrap().len();
+
+        let mut bin = Binary::new(bin.data, Architecture::X86_64, Endian::Little);
+        let shoff = bin.endian.read_uint(&bin.data, 0x28, 8) as usize;
+        bin.endian.write_uint(&mut bin.data, 0x3c, 2, 0); // e_shnum
+        bin.endian.write_uint(&mut bin.data, shoff + 32, 8, shnum as u64); // sh_size of [0]
+
+        assert_eq!(bin.section_headers().unwrap().len(), shnum);
+        assert_eq!(goblin::elf::Elf::parse(bin.data()).unwrap().section_headers.len(), shnum);
+        let found = bin.target_symbols(["helper"]).unwrap();
+        assert_eq!(found.resolve("helper").unwrap(), Some(0x0040_1100));
+
+        // A count that the image cannot hold is still refused, not trusted
+        // because of where it was read from.
+        bin.endian.write_uint(&mut bin.data, shoff + 32, 8, u64::MAX);
+        let err = bin.section_headers().unwrap_err().to_string();
+        assert!(err.contains("runs past the end"), "{err}");
+    }
+
+    /// `Elf64_Sym` reorders its fields relative to `Elf32_Sym` rather than just
+    /// widening them, and the symbol tables are read out of the image directly,
+    /// so a definition has to be found in either class and either byte order.
+    /// Each is cross-checked against a real ELF parse of the same image.
+    #[test]
+    fn target_symbols_read_both_classes_and_byte_orders() {
+        use goblin::elf::sym::STT_FUNC;
+        for (arch, endian) in CLASSES {
+            let want = if arch.is_64() { 0x4000_1100 } else { 0x40_1100 };
+            let bin = craft_elf(arch, endian, &[("helper", STT_FUNC, want)], &[]);
+
+            // What a full parse makes of the same bytes, as an independent
+            // reading of the entry layout.
+            let elf = goblin::elf::Elf::parse(bin.data()).unwrap();
+            let sym = elf
+                .syms
+                .iter()
+                .find(|s| elf.strtab.get_at(s.st_name) == Some("helper"))
+                .unwrap_or_else(|| panic!("{arch:?}: crafted symbol not found by goblin"));
+            assert_eq!(sym.st_value, want, "{arch:?}");
+
+            let found = bin.target_symbols(["helper", "absent"]).unwrap();
+            assert_eq!(found.resolve("helper").unwrap(), Some(want), "{arch:?}");
+            assert_eq!(found.resolve("absent").unwrap(), None, "{arch:?}");
+        }
+    }
+
+    /// A function the target does not define but *imports* is reached through
+    /// its PLT, and the only thing that says which stub belongs to which name
+    /// is the order of the PLT's relocations: the i-th one's stub is the i-th,
+    /// at `plt + header + i * entry` for this architecture's stub sizes.
+    ///
+    /// This is how a splice calls libc in a dynamically linked target, and
+    /// binding the wrong stub would call a different library function with the
+    /// splice's arguments -- reported as a successful splice.
+    #[test]
+    fn target_symbols_bind_an_import_to_its_plt_stub() {
+        use goblin::elf::sym::STT_FUNC;
+        for (arch, endian) in CLASSES {
+            let imports = ["__libc_start_main", "getpid", "abort"];
+            let bin = craft_elf(arch, endian, &[("f", STT_FUNC, 0x40_1100)], &imports);
+            let (header, entry) = match arch {
+                Architecture::X86 | Architecture::X86_64 => (16, 16),
+                Architecture::Arm64 => (32, 16),
+                Architecture::Arm => (20, 12),
+                Architecture::Mips | Architecture::Mips64 => (32, 16),
+            };
+
+            let found = bin.target_symbols(imports).unwrap();
+            for (i, name) in imports.iter().enumerate() {
+                assert_eq!(
+                    found.resolve(name).unwrap(),
+                    Some(PLT_ADDR + header + i as u64 * entry),
+                    "{arch:?} import {name}"
+                );
+            }
+        }
+    }
+
+    /// A string table may *suffix-merge* its entries, so a name can exist only
+    /// as the tail of a longer one and a symbol naming it points into the
+    /// middle of that entry. Reading from the offset handles that for free,
+    /// which an index of entry starts does not.
+    #[test]
+    fn strtab_str_reads_a_name_the_table_only_holds_as_a_suffix() {
+        let tab = b"\0sprintf\0";
+        assert_eq!(strtab_str(tab, 1), Some("sprintf"));
+        assert_eq!(strtab_str(tab, 2), Some("printf"));
+        assert_eq!(strtab_str(tab, 8), Some(""));
+        // An offset outside the table, an unterminated tail, and bytes that are
+        // not a string are all "no name here" rather than a panic: the table is
+        // read out of a file nothing has vetted.
+        assert_eq!(strtab_str(tab, 9), None);
+        assert_eq!(strtab_str(b"printf", 0), None);
+        assert_eq!(strtab_str(b"\0\xff\xfe\0", 1), None);
+    }
+
+    /// Symbols are rejected by the first byte of their name before the name is
+    /// read, so names that share one must still be told apart: a prefix of a
+    /// name the target defines is not that name, and a longer name that starts
+    /// with one asked about is not it either.
+    #[test]
+    fn names_sharing_a_first_byte_are_not_confused() {
+        use goblin::elf::sym::STT_FUNC;
+        let bin = craft_with_symtab(&[
+            ("printf", STT_FUNC, 0x0040_1100),
+            ("print", STT_FUNC, 0x0040_1200),
+            ("puts", STT_FUNC, 0x0040_1300),
+        ]);
+        let found = bin.target_symbols(["print", "pr", "puts", "putsx"]).unwrap();
+        assert_eq!(found.resolve("print").unwrap(), Some(0x0040_1200));
+        assert_eq!(found.resolve("puts").unwrap(), Some(0x0040_1300));
+        assert_eq!(found.resolve("pr").unwrap(), None);
+        assert_eq!(found.resolve("putsx").unwrap(), None);
     }
 
     /// A nameless symbol names the empty string, not nothing: `st_name == 0`
