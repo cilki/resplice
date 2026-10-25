@@ -120,7 +120,7 @@ fn map_rlib(path: &Path) -> Result<Rlib> {
 /// - Failing that, its name: rustc names each codegen unit's member `*.o`,
 ///   while the metadata member is `lib.rmeta`. This catches a member whose
 ///   damage reaches the magic at its start, and LLVM bitcode (a container
-///   `object` does not read at all), which `-C linker-plugin-lto` puts in a
+///   `object` does not read at all), which link-time optimization puts in a
 ///   `*.o` member in place of machine code.
 fn unparseable_member(name: &str, data: &[u8], err: object::Error) -> Result<()> {
     /// Magic of a bare LLVM bitcode module, and of the wrapper form that
@@ -133,10 +133,12 @@ fn unparseable_member(name: &str, data: &[u8], err: object::Error) -> Result<()>
     if BITCODE.iter().any(|magic| data.starts_with(magic)) {
         bail!(
             "archive member {name:?} holds LLVM bitcode rather than machine code, so \
-             there are no compiled splices in it to read. That is what \
-             `-C linker-plugin-lto` produces -- it leaves the crate's code for the \
-             linker's LTO plugin to compile -- so build the replacement crate without \
-             it (a plain `cargo build --release` does)"
+             there are no compiled splices in it to read. A crate compiled with \
+             link-time optimization is left as bitcode for the linker's LTO plugin to \
+             compile, and `resplice` is the linker here -- it needs the machine code. \
+             Build the replacement crate with LTO off: `lto = false` in the Cargo \
+             profile you built it with (`lto = true`, `\"fat\"` and `\"thin\"` all \
+             produce this), and no `-C linker-plugin-lto` in `RUSTFLAGS`"
         )
     }
     bail!(
@@ -2254,14 +2256,20 @@ mod tests {
         let msg = link_err("rlib_bad_member_2", &rlib);
         assert!(msg.contains("\"splice.o\""), "message was {msg:?}");
 
-        // LLVM bitcode in a `*.o` member -- what `-C linker-plugin-lto`
+        // LLVM bitcode in a `*.o` member -- what link-time optimization
         // produces -- is a container `object` does not read at all, so only the
         // member's name says it was meant to hold compiled splices.
+        //
+        // What the message has to name is `lto` in the Cargo profile: that is
+        // how a user gets here (`lto = true` next to the `panic = "abort"` the
+        // README asks for), and blaming only `-C linker-plugin-lto` used to
+        // send them back to the `cargo build --release` that produced the rlib.
         let mut bitcode = Vec::from(&b"BC\xc0\xde"[..]);
         bitcode.extend_from_slice(&[0u8; 64]);
         let msg = link_err("rlib_bitcode", &ar_wrap("splice.o", &bitcode));
         assert!(msg.contains("LLVM bitcode"), "message was {msg:?}");
-        assert!(msg.contains("linker-plugin-lto"), "message was {msg:?}");
+        assert!(msg.contains("lto = false"), "message was {msg:?}");
+        assert!(!msg.contains("a plain `cargo build --release` does"), "message was {msg:?}");
 
         // A member that is neither an object file nor named like one is still
         // skipped: rustc's metadata member is exactly that, and refusing it

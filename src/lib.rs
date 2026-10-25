@@ -579,12 +579,27 @@ impl Binary {
         // out of the target's headers, which nothing has vetted, and a sum that
         // wrapped would make a segment appear to map addresses it does not.
         let mut truncated = None;
+        let mut zero_filled = None;
         for ph in self.program_headers()? {
             if ph.p_type != PT_LOAD {
                 continue;
             }
             let seg_end = ph.p_vaddr.saturating_add(ph.p_filesz);
-            if va < ph.p_vaddr || va >= seg_end {
+            // `p_memsz` is required to be at least `p_filesz`, but these fields
+            // are unvetted: clamping keeps a bogus one from making a
+            // file-backed address look unmapped.
+            let mem_end = seg_end.max(ph.p_vaddr.saturating_add(ph.p_memsz));
+            if va < ph.p_vaddr || va >= mem_end {
+                continue;
+            }
+            if va >= seg_end {
+                // Mapped, but by the segment's zero-filled tail -- `.bss`,
+                // which the loader creates out of nothing. There is no file
+                // byte at this address to patch, and saying "not mapped" sends
+                // the user to re-check an address `readelf -l` agrees is
+                // mapped. Another segment may still file-back it, so record it
+                // and keep looking.
+                zero_filled = Some((ph.p_vaddr, seg_end, mem_end));
                 continue;
             }
             if end > seg_end {
@@ -614,9 +629,20 @@ impl Binary {
                  padding, the next segment's content, the section headers)",
                 end - seg_end
             )),
-            None => Err(anyhow!(
-                "virtual address {va:#x} is not mapped by any PT_LOAD segment"
-            )),
+            None => match zero_filled {
+                Some((seg_start, seg_end, mem_end)) => Err(anyhow!(
+                    "{va:#x} is in the zero-filled tail (`.bss`) of the PT_LOAD at \
+                     {seg_start:#x}..{mem_end:#x}: that segment is backed by the file \
+                     only up to {seg_end:#x}, and the loader zeroes the rest out of \
+                     nothing, so there is no byte in the image at {va:#x} to patch. \
+                     A `.bss` address cannot be given an initializer by splicing -- \
+                     have a code splice write the value at run time, or splice an \
+                     address in `.data`/`.rodata` instead"
+                )),
+                None => Err(anyhow!(
+                    "virtual address {va:#x} is not mapped by any PT_LOAD segment"
+                )),
+            },
         }
     }
 
@@ -1520,6 +1546,53 @@ mod tests {
         // Unmapped addresses, and ranges that wrap, are still refused.
         assert!(bin.va_range_to_offset(0x450000, 1).is_err());
         assert!(bin.va_range_to_offset(0x400000, u64::MAX).is_err());
+    }
+
+    /// An address in a segment's zero-filled tail -- `.bss` -- has to be
+    /// reported as what it is, not as unmapped.
+    ///
+    /// Splicing a zero-initialized table is a reasonable thing to try, and
+    /// `readelf -l` says plainly that its address is mapped: the RW `PT_LOAD`'s
+    /// `p_memsz` covers it. Only `p_filesz` does not, because the loader zeroes
+    /// `.bss` out of nothing rather than reading it, so the image holds no byte
+    /// there to patch. Calling that "not mapped by any PT_LOAD segment" sends
+    /// the user to re-check a `begin`/`end` that was right all along.
+    #[test]
+    fn va_range_to_offset_names_the_bss_tail_rather_than_calling_it_unmapped() {
+        use goblin::elf::program_header::PT_LOAD;
+        // One R+X segment, and an RW one shaped like a real `.data` + `.bss`:
+        // 0x40 bytes of file-backed data at 0x420000, then 0x100 bytes that
+        // exist only in memory.
+        let phdrs: [Phdr; 2] = [
+            (PT_LOAD as u64, 0, 0x400000, 0x400, 5, 0x1000),
+            (PT_LOAD as u64, 0x400, 0x420000, 0x40, 6, 0x1000),
+        ];
+        let mut bin = craft_injectable(Endian::Little, Architecture::X86_64, 0x440, &phdrs);
+        let l = layout(true);
+        let memsz_off = l.phoff as usize + l.phentsize + l.p_filesz + l.word;
+        bin.endian.write_uint(&mut bin.data, memsz_off, l.word, 0x140);
+
+        // `.data` still translates, right up to the end of the file-backed part.
+        assert_eq!(bin.va_range_to_offset(0x420000, 0x40).unwrap(), 0x400);
+
+        // The `.bss` tail does not, and the error says why.
+        let err = bin.va_range_to_offset(0x420040, 8).unwrap_err().to_string();
+        assert!(err.contains("`.bss`"), "{err}");
+        assert!(err.contains("0x420000..0x420140"), "{err}");
+        assert!(err.contains("only up to 0x420040"), "{err}");
+        assert!(
+            !err.contains("not mapped by any PT_LOAD"),
+            "the address is mapped -- just not file-backed: {err}"
+        );
+
+        // A region straddling the boundary is still reported as the overshoot
+        // it is, which is the more specific of the two diagnoses.
+        let err = bin.va_range_to_offset(0x420038, 0x10).unwrap_err().to_string();
+        assert!(err.contains("file-backed data only for"), "{err}");
+
+        // Past `p_memsz` nothing maps the address at all, and that still says so.
+        let err = bin.va_range_to_offset(0x420140, 8).unwrap_err().to_string();
+        assert!(err.contains("not mapped by any PT_LOAD"), "{err}");
     }
 
     /// A segment claiming more file-backed data than the image holds, and one

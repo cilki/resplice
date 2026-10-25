@@ -28,7 +28,8 @@ fixture=target/splice-fixture
 ## instead of once per case.
 newFixture() {
 	mkdir -p "$fixture/src"
-	rm -f "$fixture/prog" "$fixture/prog.patched" "$fixture/prog.short"
+	rm -f "$fixture/prog" "$fixture/prog.patched" "$fixture/prog.short" \
+		"$fixture/prog.bss" "$fixture/prog.lto" "$fixture/err"
 	printf '%s\n' '[workspace]' '' '[package]' 'name = "fixture"' \
 		'version = "0.0.0"' 'edition = "2024"' 'publish = false' '' \
 		'[lib]' 'crate-type = ["rlib"]' '' '[dependencies]' \
@@ -417,4 +418,81 @@ testDataSpliceReplacesTableAndRefusesAMissizedOne() {
 	! target/release/resplice "$fixture/prog" target/release/libfixture.rlib \
 		"$fixture/prog.short"
 	[ ! -e "$fixture/prog.short" ]
+}
+
+## A data splice over a *zero-initialized* table has to be refused as the `.bss`
+## address it is, not as an unmapped one.
+##
+## `.bss` is the part of the RW segment that `p_memsz` covers and `p_filesz` does
+## not: the loader zeroes it rather than reading it, so the image holds no byte
+## at those addresses to replace. They are nonetheless mapped, and `readelf -l`
+## says so -- which is why reporting "not mapped by any PT_LOAD segment" was
+## worse than no explanation at all. It sent a reader back to a `begin`/`end`
+## read straight out of the symbol table, which was right.
+testDataSpliceRefusesABssRangeAsBssNotAsUnmapped() {
+	newFixture
+	printf '%s\n' '#include <stdio.h>' \
+		'unsigned int table[4];' \
+		'int main(int argc, char **argv){ (void)argv; printf("%u\n", table[argc & 3]); return 0; }' > "$fixture/prog.c"
+	buildTarget
+
+	[ "$("$fixture/prog")" = "0" ]
+
+	symRange table
+	[ "$size" = "16" ]
+
+	# Confirm the premise: `table` is past the end of its segment's file-backed
+	# data, and inside what `p_memsz` maps.
+	readelf -lW "$fixture/prog" | awk -v va="$va" '
+		$1=="LOAD" {
+			base = strtonum($3); filesz = strtonum($5); memsz = strtonum($6)
+			if (va >= base + filesz && va < base + memsz) found = 1
+		}
+		END { exit !found }'
+
+	printf 'use resplice_macros::Splice;\n#[Splice(begin = %d, end = %d)]\nstatic TABLE: [u32; 4] = [11, 22, 33, 44];\n' \
+		"$va" "$end" > "$fixture/src/lib.rs"
+	buildFixture
+
+	! target/release/resplice "$fixture/prog" target/release/libfixture.rlib \
+		"$fixture/prog.bss" 2> "$fixture/err"
+	[ ! -e "$fixture/prog.bss" ]
+	grep -q '`.bss`' "$fixture/err"
+	! grep -q 'not mapped by any PT_LOAD' "$fixture/err"
+}
+
+## An rlib built with link-time optimization carries LLVM bitcode instead of
+## machine code, and the refusal has to name `lto` in the Cargo profile.
+##
+## This is the one way a reader gets here: the README already asks them to add
+## `panic = "abort"` to `[profile.release]`, and `lto = true` is the next thing
+## anyone puts in that table. The message used to blame `-C linker-plugin-lto`
+## -- a flag they never passed -- and tell them to use "a plain `cargo build
+## --release`", which is exactly the command that produced the rlib.
+testRlibBuiltWithLtoIsRefusedNamingTheProfileSetting() {
+	newFixture
+	writeComputeAsm 32
+	printf '%s\n' '#include <stdio.h>' 'int compute(void);' \
+		'int main(void){ printf("%d\n", compute()); return 0; }' > "$fixture/prog.c"
+	buildTarget "$fixture/compute.s"
+
+	symRange compute
+	printf 'use resplice_macros::Splice;\n#[Splice(begin = %d, end = %d)]\npub extern "C" fn compute() -> i32 { 42 }\n' \
+		"$va" "$end" > "$fixture/src/lib.rs"
+
+	# The same crate, the same command: without LTO it splices.
+	buildFixture
+	applySplices
+	[ "$("$fixture/prog.patched")" = "42" ]
+
+	# With `lto = true` the rlib holds bitcode, and the refusal has to point at
+	# the setting that put it there.
+	printf '%s\n' '' '[profile.release]' 'lto = true' >> "$fixture/Cargo.toml"
+	buildFixture
+
+	! target/release/resplice "$fixture/prog" target/release/libfixture.rlib \
+		"$fixture/prog.lto" 2> "$fixture/err"
+	[ ! -e "$fixture/prog.lto" ]
+	grep -q 'LLVM bitcode' "$fixture/err"
+	grep -q 'lto = false' "$fixture/err"
 }
