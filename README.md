@@ -100,6 +100,20 @@ replacement — itself a call into `core`:
 panic = "abort"
 ```
 
+Leave `lto` out of that profile, though. With link-time optimization on, rustc
+stops compiling the crate and writes LLVM bitcode into the rlib instead, for the
+linker's plugin to compile later — and `resplice` *is* the linker here, so there
+is no machine code left for it to splice. It says so rather than reporting an
+unpatched binary as a successful run:
+
+```
+error: archive member "mycrate-...-cgu.0.rcgu.o" holds LLVM bitcode rather than
+machine code, so there are no compiled splices in it to read. [...] Build the
+replacement crate with LTO off: `lto = false` in the Cargo profile you built it
+with (`lto = true`, `"fat"` and `"thin"` all produce this), and no
+`-C linker-plugin-lto` in `RUSTFLAGS`
+```
+
 When a replacement is **larger than `[begin, end)`**, it does not have to fit:
 the full function is relocated into the injected segment and a jump (trampoline)
 is written at `begin` to reach it, so `[begin, end)` only needs room for the
@@ -173,6 +187,21 @@ jump written at `begin`, leaving a branch instruction where the target expects a
 table; an undersized one would have the rest of its range filled with NOP
 *instructions*. Any other kind of item is a compile error — `#[Splice]` accepts
 only `fn` and `static`.
+
+The range also has to be one the image actually holds bytes for. A
+zero-initialized table lives in `.bss`, which the loader creates out of nothing
+rather than reading — so its addresses are mapped (the RW segment's `p_memsz`
+covers them, which is what `readelf -l` shows) but not file-backed, and there is
+nothing there to replace:
+
+```
+error: 0x420040 is in the zero-filled tail (`.bss`) of the PT_LOAD at
+0x41fdc8..0x420140: that segment is backed by the file only up to 0x420038, and
+the loader zeroes the rest out of nothing, so there is no byte in the image at
+0x420040 to patch. [...]
+```
+
+Give such a table its values from a code splice instead.
 
 ### Placing the injected segment
 
