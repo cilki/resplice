@@ -891,6 +891,36 @@ impl Binary {
     /// `.dynamic` and `.got`, producing a binary that segfaults in the loader —
     /// both reported as a successful splice.
     pub fn va_range_to_offset(&self, va: u64, len: u64) -> Result<usize> {
+        self.translate(&self.program_headers()?, va, len)
+    }
+
+    /// Translate every range in `ranges`, reading the program-header table once
+    /// instead of once per range.
+    ///
+    /// The table cannot be cached in the `Binary`: [`patch_bytes`](Self::patch_bytes)
+    /// may rewrite the very bytes it is read from, so nothing derived from it
+    /// survives a patch. A caller with a few thousand splices to place therefore
+    /// re-read it once per splice, which is most of what translating them cost.
+    /// The ranges are all known before any of them is written, so they are
+    /// translated in one go against a single read of the table.
+    ///
+    /// The outer `Result` is the one read of the table; each range then gets a
+    /// `Result` of its own, so the caller can name whichever of *its* ranges
+    /// failed rather than only the address in the message.
+    pub fn va_range_to_offsets(
+        &self,
+        ranges: impl IntoIterator<Item = (u64, u64)>,
+    ) -> Result<Vec<Result<usize>>> {
+        let phdrs = self.program_headers()?;
+        Ok(ranges
+            .into_iter()
+            .map(|(va, len)| self.translate(&phdrs, va, len))
+            .collect())
+    }
+
+    /// [`va_range_to_offset`](Self::va_range_to_offset) against an
+    /// already-read program-header table.
+    fn translate(&self, phdrs: &[Phdr], va: u64, len: u64) -> Result<usize> {
         use goblin::elf::program_header::PT_LOAD;
 
         let end = va
@@ -902,7 +932,7 @@ impl Binary {
         // wrapped would make a segment appear to map addresses it does not.
         let mut truncated = None;
         let mut zero_filled = None;
-        for ph in self.program_headers()? {
+        for ph in phdrs {
             if ph.p_type != PT_LOAD {
                 continue;
             }
@@ -1967,6 +1997,50 @@ mod tests {
         let bin = craft_injectable(Endian::Little, Architecture::X86_64, 0x400, &phdrs);
         assert!(bin.va_range_to_offset(0x1000, 1).is_err());
         assert!(bin.va_range_to_offset(u64::MAX - 0xff, 0x100).is_err());
+    }
+
+    /// Translating a batch against one read of the program-header table has to
+    /// give exactly what translating each range on its own gives -- the same
+    /// offsets, and the same refusal for the same reason -- or the speedup is
+    /// paid for in behaviour. A batch is also what the linker hands over, so an
+    /// empty one (an rlib whose splices all trampoline) must not be an error.
+    #[test]
+    fn va_range_to_offsets_agrees_with_translating_one_at_a_time() {
+        use goblin::elf::program_header::PT_LOAD;
+        let phdrs: [Phdr; 2] = [
+            (PT_LOAD as u64, 0, 0x400000, 0x400, 5, 0x1000),
+            (PT_LOAD as u64, 0x400, 0x401000, 0x40, 6, 0x1000),
+        ];
+        let bin = craft_injectable(Endian::Little, Architecture::X86_64, 0x440, &phdrs);
+
+        assert!(bin.va_range_to_offsets(std::iter::empty()).unwrap().is_empty());
+
+        let ranges = [
+            (0x400000, 1),     // start of the first segment
+            (0x4003ff, 1),     // its last file-backed byte
+            (0x401000, 0x40),  // the whole of the second segment's file data
+            (0x400000, 0x401), // runs off the end of the segment mapping it
+            (0x500000, 1),     // mapped by nothing
+            (u64::MAX, 2),     // wraps the address space
+        ];
+        let batch = bin.va_range_to_offsets(ranges).unwrap();
+        assert_eq!(batch.len(), ranges.len());
+        for (got, &(va, len)) in batch.iter().zip(&ranges) {
+            match (got, bin.va_range_to_offset(va, len)) {
+                (Ok(a), Ok(b)) => assert_eq!(*a, b, "{va:#x}..+{len:#x}"),
+                (Err(a), Err(b)) => {
+                    assert_eq!(format!("{a:#}"), format!("{b:#}"), "{va:#x}..+{len:#x}")
+                }
+                (a, b) => panic!("{va:#x}..+{len:#x}: batch {a:?} vs single {b:?}"),
+            }
+        }
+        // Not vacuously equal: the batch really does translate and really does
+        // refuse.
+        assert_eq!(*batch[0].as_ref().unwrap(), 0);
+        assert_eq!(*batch[2].as_ref().unwrap(), 0x400);
+        assert!(batch[3].as_ref().unwrap_err().to_string().contains("file-backed"));
+        assert!(batch[4].as_ref().unwrap_err().to_string().contains("not mapped"));
+        assert!(batch[5].as_ref().unwrap_err().to_string().contains("wraps"));
     }
 
     /// Address translation must see a segment that was just injected: nothing
