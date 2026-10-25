@@ -1,7 +1,6 @@
 pub use anyhow::Result;
 
 use anyhow::{anyhow, Context};
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -65,14 +64,6 @@ pub struct Binary {
     /// Operator-supplied virtual address for the injected segment, overriding
     /// [`Binary::injected_base`]'s default. See [`Binary::set_injected_base`].
     inject_base: Option<u64>,
-    /// Every name the target defines, built on first use by
-    /// [`Binary::build_symbol_map`] and dropped whenever `data` changes.
-    ///
-    /// A splice typically calls several functions the target already defines, so
-    /// this is consulted once per relocation. Scanning `.symtab`/`.dynsym` for
-    /// each of those is quadratic in a real target's symbol count, which is
-    /// where this tool spent nearly all of its time before the map existed.
-    symbols: RefCell<Option<HashMap<String, Binding>>>,
 }
 
 /// What a name the target defines resolves to.
@@ -81,7 +72,7 @@ pub struct Binary {
 /// `st_value` means something else entirely for two symbol types a real target
 /// genuinely has, and binding it as an address produces a patched binary that
 /// is wrong with nothing to say so. Both are recorded here and refused by
-/// [`Binary::resolve_target_symbol`] instead.
+/// [`TargetSymbols::resolve`] instead.
 #[derive(Debug, Clone, Copy)]
 enum Binding {
     /// A virtual address, which is what every usable definition is.
@@ -92,23 +83,81 @@ enum Binding {
     Tls(u64),
 }
 
-/// Record `binding` for `name` in the map [`Binary::build_symbol_map`] builds.
+/// What the target has to offer for each of the names a link asked about,
+/// built by [`Binary::target_symbols`].
+///
+/// Only the names asked for are in here. A reference to a name that was not —
+/// which nothing in this crate can produce, because the same set drives both
+/// calls — is an error rather than a silent "the target does not define it".
+pub struct TargetSymbols<'n> {
+    /// One entry per name asked about, `None` for a name the target neither
+    /// defines nor imports.
+    bound: HashMap<&'n str, Option<Binding>>,
+}
+
+/// Record `binding` for a name in the map [`Binary::target_symbols`] builds.
 ///
 /// The first binding seen for a name wins, which is where that function's
 /// documented precedence comes from. A usable one is the exception: it replaces
 /// an unusable binding recorded earlier, whichever table that came from, so an
 /// ifunc or thread-local definition cannot shadow a plain address the target
 /// also offers for the same name.
-fn bind(map: &mut HashMap<String, Binding>, name: &str, binding: Binding) {
-    use std::collections::hash_map::Entry;
-    match map.entry(name.to_owned()) {
-        Entry::Vacant(slot) => {
-            slot.insert(binding);
-        }
-        Entry::Occupied(mut slot) => {
-            if matches!(binding, Binding::Addr(_)) && !matches!(slot.get(), Binding::Addr(_)) {
-                slot.insert(binding);
+fn bind(slot: &mut Option<Binding>, binding: Binding) {
+    match slot {
+        None => *slot = Some(binding),
+        Some(prev) => {
+            if matches!(binding, Binding::Addr(_)) && !matches!(prev, Binding::Addr(_)) {
+                *slot = Some(binding);
             }
+        }
+    }
+}
+
+impl TargetSymbols<'_> {
+    /// What the target offers for `name`: its address, `None` when the target
+    /// neither defines nor imports it, or an error when what it defines is not
+    /// something a reference can be pointed at (see [`Binding`]).
+    ///
+    /// `name` must be one of the names [`Binary::target_symbols`] was asked
+    /// about; anything else is a bug in the caller rather than a name the
+    /// target lacks, and saying so beats resolving a real reference to nothing.
+    pub fn resolve(&self, name: &str) -> Result<Option<u64>> {
+        let Some(slot) = self.bound.get(name) else {
+            return Err(anyhow!(
+                "internal error: {name:?} was not among the names the target's \
+                 symbol tables were searched for"
+            ));
+        };
+        match *slot {
+            Some(Binding::Addr(va)) => Ok(Some(va)),
+            None => Ok(None),
+            // An IFUNC's `st_value` is the address of the *resolver*: a
+            // function the loader calls once, with no arguments, to be told
+            // which implementation this machine should use. A static glibc
+            // defines `memcpy`, `memmove`, `memset`, `strlen` and friends that
+            // way, so this is what a splice that copies a slice or formats a
+            // string used to bind to -- the resolver ran with the splice's own
+            // arguments and its return value, a function pointer, was used as
+            // the result.
+            Some(Binding::Ifunc(va)) => Err(anyhow!(
+                "the target defines {name:?} as an ifunc (STT_GNU_IFUNC), whose \
+                 address {va:#x} is its *resolver*: calling it would run the \
+                 resolver with this reference's arguments and use the \
+                 implementation pointer it returns as the result. Resolving an \
+                 ifunc takes the target's own IRELATIVE slot, which resplice does \
+                 not read; provide the function from the rlib instead"
+            )),
+            // A TLS symbol's `st_value` is an offset within the thread-local
+            // block, meaningless until a thread pointer is added to it. glibc's
+            // `errno` is 0x30, which fits every relocation field there is, so
+            // binding it as an address was silent: the splice read or wrote
+            // absolute address 0x30.
+            Some(Binding::Tls(va)) => Err(anyhow!(
+                "the target defines {name:?} as a thread-local (STT_TLS), whose \
+                 value {va:#x} is an offset into the thread-local block rather \
+                 than an address; reaching it takes the thread pointer and the \
+                 target's own TLS relocations, which resplice does not emit"
+            )),
         }
     }
 }
@@ -162,13 +211,7 @@ impl Binary {
             arch,
             endian,
             inject_base: None,
-            symbols: RefCell::new(None),
         }
-    }
-
-    /// Drop everything derived from `data`, after `data` has been changed.
-    fn invalidate_caches(&mut self) {
-        *self.symbols.get_mut() = None;
     }
 
     /// Pin the injected segment to `base` instead of the default.
@@ -260,7 +303,6 @@ impl Binary {
             }
         }
 
-        self.invalidate_caches();
         Ok(())
     }
 
@@ -646,64 +688,40 @@ impl Binary {
         Ok(align_up(self.max_vaddr()?, align) + align)
     }
 
-    /// Resolve a symbol name against the target binary's own symbols.
+    /// Resolve `names` against the target binary's own symbols, in one pass
+    /// over its symbol tables.
     ///
-    /// Tries, in order: a defined symbol in `.symtab`, a defined symbol in
-    /// `.dynsym`, then a function the target imports through its PLT (the stub's
-    /// address). Returns `None` if the target provides no such symbol.
+    /// Each name is tried, in order, against: a defined symbol in `.symtab`, a
+    /// defined symbol in `.dynsym`, then a function the target imports through
+    /// its PLT (the stub's address). A usable definition is the exception to
+    /// that precedence: it replaces an unusable one recorded earlier (see
+    /// [`bind`]). [`TargetSymbols::resolve`] reports what each name got.
     ///
-    /// A name the target *does* define, but not as something a reference can be
-    /// resolved to, is an error rather than either of those: see [`Binding`].
-    pub fn resolve_target_symbol(&self, name: &str) -> Result<Option<u64>> {
-        let mut cached = self.symbols.borrow_mut();
-        if cached.is_none() {
-            *cached = Some(self.build_symbol_map()?);
-        }
-        match cached.as_ref().and_then(|map| map.get(name)).copied() {
-            Some(Binding::Addr(va)) => Ok(Some(va)),
-            None => Ok(None),
-            // An IFUNC's `st_value` is the address of the *resolver*: a
-            // function the loader calls once, with no arguments, to be told
-            // which implementation this machine should use. A static glibc
-            // defines `memcpy`, `memmove`, `memset`, `strlen` and friends that
-            // way, so this is what a splice that copies a slice or formats a
-            // string used to bind to -- the resolver ran with the splice's own
-            // arguments and its return value, a function pointer, was used as
-            // the result.
-            Some(Binding::Ifunc(va)) => Err(anyhow!(
-                "the target defines {name:?} as an ifunc (STT_GNU_IFUNC), whose \
-                 address {va:#x} is its *resolver*: calling it would run the \
-                 resolver with this reference's arguments and use the \
-                 implementation pointer it returns as the result. Resolving an \
-                 ifunc takes the target's own IRELATIVE slot, which resplice does \
-                 not read; provide the function from the rlib instead"
-            )),
-            // A TLS symbol's `st_value` is an offset within the thread-local
-            // block, meaningless until a thread pointer is added to it. glibc's
-            // `errno` is 0x30, which fits every relocation field there is, so
-            // binding it as an address was silent: the splice read or wrote
-            // absolute address 0x30.
-            Some(Binding::Tls(va)) => Err(anyhow!(
-                "the target defines {name:?} as a thread-local (STT_TLS), whose \
-                 value {va:#x} is an offset into the thread-local block rather \
-                 than an address; reaching it takes the thread pointer and the \
-                 target's own TLS relocations, which resplice does not emit"
-            )),
-        }
-    }
-
-    /// Collect every name [`resolve_target_symbol`](Self::resolve_target_symbol)
-    /// can bind, with what it resolves to.
+    /// The names a link needs are known before any of them is looked up — they
+    /// are what the rlib leaves undefined — so they are all asked for at once.
+    /// Resolving them one at a time is what this used to do, and it has no
+    /// cheap implementation: `.symtab` carries no index to look a name up in,
+    /// so each query is a scan, and the whole-table map that avoided
+    /// re-scanning cost an owned `String` and a hash insert for every symbol
+    /// the *target* defines. That is the wrong size entirely: patching a
+    /// handful of functions into a 6MB binary of 60k symbols spent two thirds
+    /// of the run building 60k map entries to answer two questions.
     ///
-    /// Earlier insertions win, which is what gives that function its documented
-    /// precedence: `.symtab` over `.dynsym` over the PLT, and within one table
-    /// the first matching entry. A usable definition is the exception: it
-    /// replaces an unusable one recorded earlier (see [`bind`]).
-    fn build_symbol_map(&self) -> Result<HashMap<String, Binding>> {
+    /// Asking for nothing parses nothing, which is the whole cost for a
+    /// replacement that reaches none of the target's own symbols.
+    pub fn target_symbols<'n>(
+        &self,
+        names: impl IntoIterator<Item = &'n str>,
+    ) -> Result<TargetSymbols<'n>> {
         use goblin::elf::section_header::SHN_UNDEF;
         use goblin::elf::sym::{STT_GNU_IFUNC, STT_TLS};
+
+        let mut bound: HashMap<&'n str, Option<Binding>> =
+            names.into_iter().map(|name| (name, None)).collect();
+        if bound.is_empty() {
+            return Ok(TargetSymbols { bound });
+        }
         let elf = self.elf()?;
-        let mut map: HashMap<String, Binding> = HashMap::new();
 
         // 1 & 2: symbols the target defines itself.
         for (syms, strtab) in [(&elf.syms, &elf.strtab), (&elf.dynsyms, &elf.dynstrtab)] {
@@ -725,12 +743,17 @@ impl Binary {
                 if name.is_empty() {
                     continue;
                 }
-                let binding = match sym.st_type() {
-                    STT_GNU_IFUNC => Binding::Ifunc(sym.st_value),
-                    STT_TLS => Binding::Tls(sym.st_value),
-                    _ => Binding::Addr(sym.st_value),
+                let Some(slot) = bound.get_mut(name) else {
+                    continue;
                 };
-                bind(&mut map, name, binding);
+                bind(
+                    slot,
+                    match sym.st_type() {
+                        STT_GNU_IFUNC => Binding::Ifunc(sym.st_value),
+                        STT_TLS => Binding::Tls(sym.st_value),
+                        _ => Binding::Addr(sym.st_value),
+                    },
+                );
             }
         }
 
@@ -757,14 +780,16 @@ impl Binary {
                         if name.is_empty() {
                             continue;
                         }
-                        let stub = plt_addr + plt_header + i as u64 * plt_entry;
-                        bind(&mut map, name, Binding::Addr(stub));
+                        if let Some(slot) = bound.get_mut(name) {
+                            let stub = plt_addr + plt_header + i as u64 * plt_entry;
+                            bind(slot, Binding::Addr(stub));
+                        }
                     }
                 }
             }
         }
 
-        Ok(map)
+        Ok(TargetSymbols { bound })
     }
 
     /// Verify that `[base, base + len)` does not collide with the target's own
@@ -942,7 +967,6 @@ impl Binary {
             endian.write_uint(d, note_off + 28, 4, align);
         }
 
-        self.invalidate_caches();
         Ok(())
     }
 }
@@ -1725,18 +1749,44 @@ mod tests {
             ("errno", STT_TLS, 0x30),
         ]);
 
+        let found = bin
+            .target_symbols(["plain", "absent", "strlen", "errno"])
+            .unwrap();
+
         // An ordinary definition still resolves, and an absent name is still
         // left to the caller to report.
-        assert_eq!(bin.resolve_target_symbol("plain").unwrap(), Some(0x0040_1100));
-        assert_eq!(bin.resolve_target_symbol("absent").unwrap(), None);
+        assert_eq!(found.resolve("plain").unwrap(), Some(0x0040_1100));
+        assert_eq!(found.resolve("absent").unwrap(), None);
 
-        let err = bin.resolve_target_symbol("strlen").unwrap_err().to_string();
+        let err = found.resolve("strlen").unwrap_err().to_string();
         assert!(err.contains("ifunc") && err.contains("resolver"), "{err}");
         assert!(err.contains("0x40adf6"), "{err}");
 
-        let err = bin.resolve_target_symbol("errno").unwrap_err().to_string();
+        let err = found.resolve("errno").unwrap_err().to_string();
         assert!(err.contains("thread-local"), "{err}");
         assert!(err.contains("0x30"), "{err}");
+    }
+
+    /// Only the names asked for are searched for, so a name that was not is a
+    /// caller's mistake rather than a name the target lacks. Reporting it as
+    /// the latter would resolve a real reference to nothing.
+    #[test]
+    fn a_name_that_was_not_asked_for_is_an_error() {
+        let bin = craft_with_symtab(&[("plain", goblin::elf::sym::STT_FUNC, 0x0040_1100)]);
+        let found = bin.target_symbols(["other"]).unwrap();
+        let err = found.resolve("plain").unwrap_err().to_string();
+        assert!(err.contains("not among the names"), "{err}");
+    }
+
+    /// Asking for nothing is not a reason to walk the target's symbol tables,
+    /// and must not be a reason to refuse an image whose tables cannot be
+    /// parsed either: a replacement that reaches none of the target's own
+    /// symbols needs neither.
+    #[test]
+    fn asking_for_no_names_reads_nothing() {
+        let bin = Binary::new(vec![], Architecture::X86_64, Endian::Little);
+        let found = bin.target_symbols([]).unwrap();
+        assert!(found.resolve("anything").is_err());
     }
 
     /// An unusable definition must not shadow a usable one for the same name,
@@ -1750,7 +1800,7 @@ mod tests {
         ] {
             let bin = craft_with_symtab(&syms);
             assert_eq!(
-                bin.resolve_target_symbol("memcpy").unwrap(),
+                bin.target_symbols(["memcpy"]).unwrap().resolve("memcpy").unwrap(),
                 Some(0x0040_b000),
                 "{syms:?}"
             );
@@ -1766,6 +1816,6 @@ mod tests {
     #[test]
     fn the_empty_name_binds_nothing() {
         let bin = craft_with_symtab(&[("plain", goblin::elf::sym::STT_FUNC, 0x0040_1100)]);
-        assert_eq!(bin.resolve_target_symbol("").unwrap(), None);
+        assert_eq!(bin.target_symbols([""]).unwrap().resolve("").unwrap(), None);
     }
 }

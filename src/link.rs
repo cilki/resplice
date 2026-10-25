@@ -862,6 +862,15 @@ fn link_objects<'d>(
         }
     }
 
+    // Everything the closure leaves undefined has to come from the target
+    // itself, and that is the whole list: `syms` holds exactly the symbols the
+    // included sections' relocations reference, and `extract_relocs` has
+    // already rebound the ones another member of the rlib defines. Asking for
+    // them in one go is what keeps the target's symbol tables to a single pass
+    // -- see [`Binary::target_symbols`].
+    let target_syms =
+        target.target_symbols(syms.values().filter(|s| s.undefined).map(|s| s.name))?;
+
     // Resolve a symbol index to its final virtual address.
     let resolve = |sym: SymId| -> Result<u64> {
         let s = syms
@@ -902,7 +911,7 @@ fn link_objects<'d>(
             }
             Ok(base_va + s.value)
         } else if s.undefined {
-            target.resolve_target_symbol(s.name)?.ok_or_else(|| {
+            target_syms.resolve(s.name)?.ok_or_else(|| {
                 anyhow!(
                     "unresolved external symbol {:?}: no member of the rlib defines \
                      it, and the target neither defines nor imports it. A splice can \
