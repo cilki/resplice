@@ -298,6 +298,10 @@ struct Sec<'d> {
     bytes: Vec<u8>,
     /// The section's relocations; empty until the closure reaches the section.
     relocs: Vec<Rel>,
+    /// Whether any of `relocs` is a GOT-style reference, noted while they are
+    /// read so the GOT layout does not have to walk them all again to find
+    /// out. Almost always false.
+    has_got: bool,
     /// `Some((begin, end))` for a pinned `.rspl.*` section.
     splice: Option<(u64, u64)>,
 }
@@ -406,8 +410,16 @@ fn splice_range(name: &str) -> Result<Option<(u64, u64)>> {
 /// The symbols are walked once per member that carries a splice at all, which
 /// is a member the linker has to read anyway; members with no splice section
 /// are not touched.
-fn check_one_item_per_splice(obj: &object::File, splices: &HashSet<usize>) -> Result<()> {
-    let mut owners: HashMap<usize, Vec<&str>> = HashMap::new();
+///
+/// `splices` flags this member's splice sections by section index, and the
+/// count of items landing in each goes into an array indexed the same way.
+/// The walk sees every symbol the member has -- 70k of them for a crate of a
+/// few thousand splices -- so it reads no symbol's *name* until a count says
+/// there is a collision to report: collecting the owners as a map of name
+/// vectors cost a hash and a heap allocation per splice to discover that
+/// almost every one of them holds the single item it should.
+fn check_one_item_per_splice(obj: &object::File, splices: &[bool]) -> Result<()> {
+    let mut owners = vec![0u32; splices.len()];
     for sym in obj.symbols() {
         // One global definition per `#[Splice]` item: the macro adds
         // `no_mangle`, and the local symbols sharing the section (its section
@@ -416,25 +428,32 @@ fn check_one_item_per_splice(obj: &object::File, splices: &HashSet<usize>) -> Re
         if sym.is_undefined() || !sym.is_global() {
             continue;
         }
-        let (Some(si), Ok(name)) = (sym.section_index(), sym.name()) else {
+        let Some(si) = sym.section_index() else {
             continue;
         };
-        if name.is_empty() || !splices.contains(&si.0) {
+        if !splices.get(si.0).copied().unwrap_or(false) {
             continue;
         }
-        owners.entry(si.0).or_default().push(name);
+        // All this asks is whether the symbol is named at all, which does not
+        // need the name decoded.
+        if !matches!(sym.name_bytes(), Ok(n) if !n.is_empty()) {
+            continue;
+        }
+        owners[si.0] += 1;
     }
 
     // The lowest-numbered collision, and its items named in sorted order, so
-    // the diagnostic does not depend on `HashMap` iteration order (nor, for the
-    // names, on the symbol table's).
-    let Some((si, mut names)) = owners
-        .into_iter()
-        .filter(|(_, items)| items.len() > 1)
-        .min_by_key(|&(si, _)| si)
-    else {
+    // the diagnostic does not depend on the symbol table's order.
+    let Some(si) = owners.iter().position(|&n| n > 1) else {
         return Ok(());
     };
+    let mut names: Vec<&str> = obj
+        .symbols()
+        .filter(|sym| !sym.is_undefined() && sym.is_global())
+        .filter(|sym| sym.section_index().is_some_and(|i| i.0 == si))
+        .filter_map(|sym| sym.name().ok())
+        .filter(|name| !name.is_empty())
+        .collect();
     names.sort_unstable();
 
     let sec_name = obj
@@ -497,8 +516,8 @@ fn verify_arch(obj: &object::File, target: &Binary) -> Result<()> {
 /// free.
 fn exports_for<'d, 'c>(
     objs: &[object::File<'d>],
-    cache: &'c mut Option<HashMap<&'d str, (SecId, u64)>>,
-) -> &'c HashMap<&'d str, (SecId, u64)> {
+    cache: &'c mut Option<HashMap<&'d str, Def>>,
+) -> &'c HashMap<&'d str, Def> {
     cache.get_or_insert_with(|| {
         if objs.len() < 2 {
             // One member has nothing to resolve across members.
@@ -521,10 +540,10 @@ fn exports_for<'d, 'c>(
 /// are left out; their names are not unique across members anyway. Between two
 /// definitions of a name a strong one wins over a weak one, as in a static
 /// link, and between two of equal strength the earlier member keeps it.
-fn build_exports<'d>(objs: &[object::File<'d>]) -> HashMap<&'d str, (SecId, u64)> {
+fn build_exports<'d>(objs: &[object::File<'d>]) -> HashMap<&'d str, Def> {
     use std::collections::hash_map::Entry;
 
-    let mut defs: HashMap<&'d str, (SecId, u64, bool)> = HashMap::new();
+    let mut defs: HashMap<&'d str, Def> = HashMap::new();
     for (mi, obj) in objs.iter().enumerate() {
         for sym in obj.symbols() {
             if sym.is_undefined() || !sym.is_global() {
@@ -536,21 +555,38 @@ fn build_exports<'d>(objs: &[object::File<'d>]) -> HashMap<&'d str, (SecId, u64)
             if name.is_empty() {
                 continue;
             }
-            let def = ((mi, si.0), sym.address(), sym.is_weak());
+            let def = Def {
+                sec: (mi, si.0),
+                value: sym.address(),
+                weak: sym.is_weak(),
+            };
             match defs.entry(name) {
                 Entry::Vacant(slot) => {
                     slot.insert(def);
                 }
-                Entry::Occupied(mut slot) if slot.get().2 && !def.2 => {
+                Entry::Occupied(mut slot) if slot.get().weak && !def.weak => {
                     slot.insert(def);
                 }
                 Entry::Occupied(_) => {}
             }
         }
     }
-    defs.into_iter()
-        .map(|(name, (sec, value, _))| (name, (sec, value)))
-        .collect()
+    defs
+}
+
+/// One definition in the index [`build_exports`] returns.
+///
+/// `weak` is only read while the index is being built, but it stays in the
+/// entry rather than being projected away afterwards: the index holds a row
+/// per global definition in the whole rlib -- 8000 of them for a crate of as
+/// many splices, against the handful of names a link looks up in it -- and
+/// rebuilding the map to narrow its value cost a second hash and insert of
+/// every one of those names.
+#[derive(Clone, Copy)]
+struct Def {
+    sec: SecId,
+    value: u64,
+    weak: bool,
 }
 
 /// Read one section's header into a [`Sec`].
@@ -565,15 +601,23 @@ fn read_sec<'d>(objs: &[object::File<'d>], id: SecId) -> Result<Sec<'d>> {
     let section = objs[mi]
         .section_by_index(object::SectionIndex(si))
         .map_err(|e| anyhow!("bad section index {si} in archive member {mi}: {e}"))?;
+    sec_header(&section)
+}
+
+/// [`read_sec`] for a section the caller already has in hand, which the splice
+/// scan in [`link_objects`] does: it is walking the member's sections to find
+/// them, so looking each match back up by index read the header twice.
+fn sec_header<'d, S: ObjectSection<'d>>(section: &S) -> Result<Sec<'d>> {
     let name = section.name().unwrap_or("");
     Ok(Sec {
         splice: splice_range(name)?,
         name,
         align: section.align().max(1),
-        writable: is_runtime_writable(&section),
+        writable: is_runtime_writable(section),
         code: matches!(section.kind(), SectionKind::Text),
         bytes: Vec::new(),
         relocs: Vec::new(),
+        has_got: false,
     })
 }
 
@@ -590,11 +634,14 @@ fn read_sec<'d>(objs: &[object::File<'d>], id: SecId) -> Result<Sec<'d>> {
 /// most expensive thing linking did.
 fn extract_relocs<'d>(
     objs: &[object::File<'d>],
+    arch: Architecture,
     id: SecId,
     name: &str,
     syms: &mut HashMap<SymId, SymInfo<'d>>,
-    exports: &mut Option<HashMap<&'d str, (SecId, u64)>>,
-) -> Result<Vec<Rel>> {
+    exports: &mut Option<HashMap<&'d str, Def>>,
+    referenced: &mut Vec<SecId>,
+) -> Result<(Vec<Rel>, bool)> {
+    referenced.clear();
     let (mi, index) = id;
     let obj = &objs[mi];
     let section = obj
@@ -602,6 +649,7 @@ fn extract_relocs<'d>(
         .map_err(|e| anyhow!("bad section index {index} ({name}): {e}"))?;
 
     let mut relocs = Vec::new();
+    let mut has_got = false;
     for (offset, reloc) in section.relocations() {
         let r_type = match reloc.flags() {
             RelocationFlags::Elf { r_type } => r_type,
@@ -611,6 +659,7 @@ fn extract_relocs<'d>(
             RelocationTarget::Symbol(i) => i,
             other => return Err(anyhow!("unsupported relocation target {other:?} in {name}")),
         };
+        has_got |= arch::needs_got(arch, r_type);
         relocs.push(Rel {
             offset,
             r_type,
@@ -635,11 +684,24 @@ fn extract_relocs<'d>(
             // exactly as if it had been defined here; only what the archive
             // cannot supply is left to the target's own symbols.
             if undefined {
-                if let Some(&(def_sec, def_value)) = exports_for(objs, exports).get(sym_name) {
-                    section = Some(def_sec);
-                    value = def_value;
+                if let Some(def) = exports_for(objs, exports).get(sym_name) {
+                    section = Some(def.sec);
+                    value = def.value;
                     undefined = false;
                 }
+            }
+
+            // The section this reference reaches, for the closure to pull in.
+            // Reported from here, where the symbol is being recorded for the
+            // first time, rather than re-read per relocation afterwards: a
+            // symbol's section does not change, so every later reference to
+            // it names a section the closure has already taken, and a section
+            // is referenced several times over -- ten relocations per distinct
+            // symbol in a crate of a few thousand splices, each of which cost
+            // a lookup in `syms` and another in the closure's seen-set to
+            // learn nothing new.
+            if let Some(secj) = section {
+                referenced.push(secj);
             }
 
             slot.insert(SymInfo {
@@ -651,7 +713,7 @@ fn extract_relocs<'d>(
             });
         }
     }
-    Ok(relocs)
+    Ok((relocs, has_got))
 }
 
 /// The paired `R_MIPS_LO16` addend for an `R_MIPS_HI16`, read from the original
@@ -711,15 +773,27 @@ fn link_objects<'d>(
 
     for (mi, obj) in objs.iter().enumerate() {
         verify_arch(obj, target)?;
-        let mut mine: HashSet<usize> = HashSet::new();
+        // This member's splice sections, flagged by section index for
+        // [`check_one_item_per_splice`].
+        let mut mine: Vec<bool> = Vec::new();
         for section in obj.sections() {
-            if !matches!(section.name(), Ok(n) if n.starts_with(".rspl.")) {
+            // `name_bytes`, not `name`: every section of every member reaches
+            // this test, and a crate that reimplements a few thousand
+            // functions has tens of thousands of them -- rustc gives each
+            // helper and each constant a section of its own. Validating all
+            // of those names as UTF-8 to compare six bytes of them is work
+            // the few that match do not need, and the matches have their name
+            // decoded by `sec_header` anyway.
+            if !matches!(section.name_bytes(), Ok(n) if n.starts_with(b".rspl.")) {
                 continue;
             }
             let id = (mi, section.index().0);
             splice_idxs.push(id);
-            secs.insert(id, read_sec(objs, id)?);
-            mine.insert(id.1);
+            secs.insert(id, sec_header(&section)?);
+            if mine.len() <= id.1 {
+                mine.resize(id.1 + 1, false);
+            }
+            mine[id.1] = true;
         }
         // Two items given the same range share a section name, which rustc
         // merges within a codegen unit; only this member's symbol table still
@@ -735,7 +809,7 @@ fn link_objects<'d>(
 
     // Index of what the rlib's members define, for references that are
     // undefined in the member carrying them. See [`exports_for`].
-    let mut exports: Option<HashMap<&str, (SecId, u64)>> = None;
+    let mut exports: Option<HashMap<&str, Def>> = None;
 
     // Transitive closure: starting from the splice sections, pull in every
     // section reachable through a relocation, in any member. Splice sections
@@ -755,19 +829,31 @@ fn link_objects<'d>(
     // each helper and `.rodata` constant in its own section.
     let mut seen: HashSet<SecId> = splice_idxs.iter().copied().collect();
     let mut work: Vec<SecId> = splice_idxs.clone();
+    // Scratch for the sections each visited section turns out to reference,
+    // reused across the walk rather than allocated per section: a crate of a
+    // few thousand splices visits tens of thousands of them.
+    let mut referenced: Vec<SecId> = Vec::new();
     while let Some(si) = work.pop() {
-        let relocs = extract_relocs(objs, si, secs[&si].name, &mut syms, &mut exports)?;
-        for r in &relocs {
-            if let Some(secj) = syms.get(&r.sym).and_then(|s| s.section) {
-                if seen.insert(secj) {
-                    secs.insert(secj, read_sec(objs, secj)?);
-                    included.push(secj);
-                    inject_order.push(secj);
-                    work.push(secj);
-                }
+        let (relocs, has_got) = extract_relocs(
+            objs,
+            arch,
+            si,
+            secs[&si].name,
+            &mut syms,
+            &mut exports,
+            &mut referenced,
+        )?;
+        for &secj in &referenced {
+            if seen.insert(secj) {
+                secs.insert(secj, read_sec(objs, secj)?);
+                included.push(secj);
+                inject_order.push(secj);
+                work.push(secj);
             }
         }
-        secs.get_mut(&si).unwrap().relocs = relocs;
+        let sec = secs.get_mut(&si).unwrap();
+        sec.relocs = relocs;
+        sec.has_got = has_got;
     }
 
     // The closure is settled, so now read the contents of just those sections.
@@ -782,13 +868,29 @@ fn link_objects<'d>(
     // successful splice. A referenced helper read that way is injected as zero
     // bytes, and the calls to it land on whichever section follows it in the
     // blob.
+    //
+    // The symbols reached through a GOT-style relocation are collected on the
+    // way past, in the order the slots are to be laid out in. That used to be
+    // a pass of its own over the same sections in the same order, and it is
+    // the relocations it had to walk to find them: a crate of a few thousand
+    // splices reaches tens of thousands of sections and ten times as many
+    // relocations, while the GOT it ends up with is usually empty.
+    let mut got_syms: Vec<SymId> = Vec::new();
     for &si in &included {
-        let name = secs[&si].name;
-        let bytes = objs[si.0]
+        let sec = secs.get_mut(&si).unwrap();
+        let name = sec.name;
+        sec.bytes = objs[si.0]
             .section_by_index(object::SectionIndex(si.1))
             .and_then(|s| s.data().map(<[u8]>::to_vec))
             .map_err(|e| anyhow!("failed to read the contents of section {name:?}: {e}"))?;
-        secs.get_mut(&si).unwrap().bytes = bytes;
+        if sec.has_got {
+            got_syms.extend(
+                sec.relocs
+                    .iter()
+                    .filter(|r| arch::needs_got(arch, r.r_type))
+                    .map(|r| r.sym),
+            );
+        }
     }
 
     // A splice whose code fits its `[begin, end)` region is pinned there and
@@ -853,14 +955,12 @@ fn link_objects<'d>(
     // relocation, so an indirect load through the GOT reaches a real pointer.
     let got_width = arch::got_slot_width(is_64);
     let mut got: HashMap<SymId, (u64, usize)> = HashMap::new();
-    for &si in &included {
-        for r in &secs[&si].relocs {
-            if arch::needs_got(arch, r.r_type) && !got.contains_key(&r.sym) {
-                pad_to(blob, got_width as u64);
-                let va = base + blob.len() as u64;
-                got.insert(r.sym, (va, blob.len()));
-                blob.resize(blob.len() + got_width, 0);
-            }
+    for sym in got_syms {
+        if let std::collections::hash_map::Entry::Vacant(slot) = got.entry(sym) {
+            pad_to(blob, got_width as u64);
+            let va = base + blob.len() as u64;
+            slot.insert((va, blob.len()));
+            blob.resize(blob.len() + got_width, 0);
         }
     }
 
@@ -1043,7 +1143,15 @@ fn link_objects<'d>(
             // A symbol that is not an address at all is exempt: an `SHN_ABS`
             // symbol (no section, not undefined) is a link-time constant and
             // means the same wherever the image lands.
-            if pie && (syms[&r.sym].section.is_some() || syms[&r.sym].undefined) {
+            // One lookup for both halves of the test, and none at all unless
+            // the target is position-independent: `syms` is the linker's
+            // hottest table, and a PIE target -- what `cc` and every other
+            // mainstream toolchain produce by default -- used to ask it for
+            // the same symbol twice more for every relocation in the closure.
+            if pie && {
+                let sym = &syms[&r.sym];
+                sym.section.is_some() || sym.undefined
+            } {
                 if arch::writes_absolute_address(arch, r.r_type) {
                     return Err(absolute_in_pie(
                         &format!(
@@ -1932,6 +2040,62 @@ mod tests {
             Ok(applied) => panic!("expected an error, linked {} splice(s)", applied.len()),
             Err(e) => format!("{e:#}"),
         }
+    }
+
+    /// Two `#[Splice]` items given the same `begin`/`end` ask for the same
+    /// section name, which rustc merges within a codegen unit: one section
+    /// holding both bodies end to end, and only the member's symbol table left
+    /// to show that there were two. Spliced, the target runs the first item
+    /// with the second sitting dead behind it, reported as one success.
+    ///
+    /// Built here as rustc leaves it -- one `.rspl.*` section with two global
+    /// definitions in it -- because that is the only shape
+    /// [`check_one_item_per_splice`] can see the mistake in.
+    fn build_rlib_two_items() -> Vec<u8> {
+        use object::write::{Object, Symbol, SymbolSection as WSection};
+        use object::{
+            Architecture, BinaryFormat, Endianness, SectionKind, SymbolFlags, SymbolKind,
+            SymbolScope,
+        };
+
+        let mut obj = Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+        let name = format!(".rspl.{SPLICE_VA:x}.{:x}", SPLICE_VA + 0x20).into_bytes();
+        let rspl = obj.add_section(vec![], name, SectionKind::Text);
+        // The merge: `beta`'s body appended to `alpha`'s, in one section.
+        obj.append_section_data(rspl, &HELPER_CODE, 16);
+        obj.append_section_data(rspl, &HELPER_CODE, 1);
+        // Named out of alphabetical order, so the sorted report is visibly not
+        // just the symbol table's own order.
+        for (sym_name, value) in [(&b"beta"[..], 0u64), (&b"alpha"[..], HELPER_CODE.len() as u64)] {
+            obj.add_symbol(Symbol {
+                name: sym_name.to_vec(),
+                value,
+                size: HELPER_CODE.len() as u64,
+                kind: SymbolKind::Text,
+                scope: SymbolScope::Linkage,
+                weak: false,
+                section: WSection::Section(rspl),
+                flags: SymbolFlags::None,
+            });
+        }
+        ar_wrap("splice.o", &obj.write().unwrap())
+    }
+
+    #[test]
+    fn test_link_rlib_rejects_two_items_sharing_a_splice_section() {
+        let msg = link_err("rlib_two_items", &build_rlib_two_items());
+        assert!(msg.contains("2 `#[Splice]` items"), "message was {msg:?}");
+        assert!(msg.contains("alpha, beta"), "message was {msg:?}");
+        assert!(msg.contains("0x401000..0x401020"), "message was {msg:?}");
+    }
+
+    /// A single item in a splice section is not a collision, however many local
+    /// symbols rustc leaves pointing into it -- the section symbol, and the
+    /// `$x`/`$d` mapping symbols an aarch64 object carries.
+    #[test]
+    fn test_link_rlib_accepts_one_item_with_local_symbols() {
+        let (_, applied) = run_link(&build_rlib(SPLICE_VA + 0x20));
+        assert_eq!(applied.len(), 1);
     }
 
     /// `end - begin` is used as the length of the replaced region throughout, so
