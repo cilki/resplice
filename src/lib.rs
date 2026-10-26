@@ -382,7 +382,8 @@ impl Binary {
 
         // If the new code is smaller than the region, fill the rest with NOPs.
         if end_pos < region_end {
-            let nop_insn = self.get_nop_instruction();
+            let (nop, nop_len) = self.get_nop_instruction();
+            let nop_insn = &nop[..nop_len];
             let mut pos = end_pos;
             while pos < region_end {
                 let n = std::cmp::min(nop_insn.len(), region_end - pos);
@@ -395,19 +396,24 @@ impl Binary {
     }
 
     /// Get the NOP instruction bytes for the current architecture, encoded in
-    /// the target's byte order.
-    fn get_nop_instruction(&self) -> Vec<u8> {
+    /// the target's byte order: a four-byte buffer and the length of it the
+    /// instruction occupies.
+    ///
+    /// By value rather than as a `Vec`: the NOP fill runs once per splice, and
+    /// a crate that reimplements a few thousand functions has as many, so
+    /// returning it on the heap was an allocation per splice for four bytes.
+    fn get_nop_instruction(&self) -> ([u8; 4], usize) {
         match self.arch {
-            Architecture::X86 | Architecture::X86_64 => vec![0x90],
-            Architecture::Arm => self.encode_insn(0xe1a0_0000), // mov r0, r0
-            Architecture::Arm64 => self.encode_insn(0xd503_201f), // nop
-            Architecture::Mips | Architecture::Mips64 => vec![0, 0, 0, 0],
+            Architecture::X86 | Architecture::X86_64 => ([0x90, 0, 0, 0], 1),
+            Architecture::Arm => (self.encode_insn(0xe1a0_0000), 4), // mov r0, r0
+            Architecture::Arm64 => (self.encode_insn(0xd503_201f), 4), // nop
+            Architecture::Mips | Architecture::Mips64 => ([0; 4], 4),
         }
     }
 
     /// Encode a 32-bit instruction word in the target's byte order.
-    fn encode_insn(&self, insn: u32) -> Vec<u8> {
-        let mut b = vec![0u8; 4];
+    fn encode_insn(&self, insn: u32) -> [u8; 4] {
+        let mut b = [0u8; 4];
         self.endian.write_uint(&mut b, 0, 4, insn as u64);
         b
     }
@@ -450,14 +456,14 @@ impl Binary {
                 let pc = from + 8; // ARM PC is 2 instructions ahead
                 let offset = branch_offset(from, to, pc, 0x80_0000, "`b` (24-bit imm)")?;
                 let insn = 0xEA000000u32 | ((offset as u32) & 0x00FFFFFF);
-                Ok(self.encode_insn(insn))
+                Ok(self.encode_insn(insn).to_vec())
             }
             Architecture::Arm64 => {
                 // ARM64 branch instruction: B <offset>
                 // Encoding: 0x14000000 | ((offset >> 2) & 0x03FFFFFF)
                 let offset = branch_offset(from, to, from, 0x200_0000, "`b` (26-bit imm)")?;
                 let insn = 0x14000000u32 | ((offset as u32) & 0x03FFFFFF);
-                Ok(self.encode_insn(insn))
+                Ok(self.encode_insn(insn).to_vec())
             }
             Architecture::Mips | Architecture::Mips64 => {
                 // MIPS J instruction: J <address>
@@ -483,7 +489,7 @@ impl Binary {
                     ));
                 }
                 let addr_bits = ((to >> 2) & 0x03FFFFFF) as u32;
-                let mut out = self.encode_insn(0x08000000u32 | addr_bits);
+                let mut out = self.encode_insn(0x08000000u32 | addr_bits).to_vec();
                 out.extend_from_slice(&self.encode_insn(0)); // delay slot: nop
                 Ok(out)
             }
