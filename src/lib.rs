@@ -381,14 +381,30 @@ impl Binary {
         self.data[offset..end_pos].copy_from_slice(code);
 
         // If the new code is smaller than the region, fill the rest with NOPs.
+        //
+        // A reimplementation is usually well short of the function it replaces,
+        // so most of a region is this fill, and a crate of a few thousand
+        // splices fills a megabyte or two of it. Written one instruction at a
+        // time through a bounds-checked slice copy of a length the compiler
+        // could not see, that was a `memcpy` call per four bytes; a whole-tail
+        // `fill` for a one-byte NOP and a fixed-width store per word for a
+        // four-byte one are a fraction of that. The tail may end mid-word, in
+        // which case it holds as much of the instruction as fits, as before.
         if end_pos < region_end {
             let (nop, nop_len) = self.get_nop_instruction();
-            let nop_insn = &nop[..nop_len];
-            let mut pos = end_pos;
-            while pos < region_end {
-                let n = std::cmp::min(nop_insn.len(), region_end - pos);
-                self.data[pos..pos + n].copy_from_slice(&nop_insn[..n]);
-                pos += n;
+            let tail = &mut self.data[end_pos..region_end];
+            if nop_len == 1 {
+                tail.fill(nop[0]);
+            } else {
+                // The only other width is the whole buffer, which is what
+                // lets the copy below be a fixed-width store.
+                debug_assert_eq!(nop_len, nop.len());
+                let mut words = tail.chunks_exact_mut(nop.len());
+                for word in &mut words {
+                    word.copy_from_slice(&nop);
+                }
+                let rest = words.into_remainder();
+                rest.copy_from_slice(&nop[..rest.len()]);
             }
         }
 
@@ -1369,6 +1385,32 @@ mod tests {
         assert_eq!(binary.data[10], 0xAA);
         assert_eq!(binary.data[19], 0xAA);
         assert_eq!(binary.data[20], 0x00); // untouched
+    }
+
+    /// The four-byte NOP of the fixed-width architectures is written a whole
+    /// instruction at a time, in the target's byte order, and a tail that does
+    /// not end on an instruction boundary holds as much of one as fits -- the
+    /// same bytes the one-instruction-at-a-time fill produced.
+    #[test]
+    fn test_patch_bytes_nop_fill_keeps_word_alignment_and_a_partial_tail() {
+        let nop_le = 0xd503_201fu32.to_le_bytes();
+        let nop_be = 0xd503_201fu32.to_be_bytes();
+        for (endian, nop) in [(Endian::Little, nop_le), (Endian::Big, nop_be)] {
+            let mut binary = Binary::new(vec![0xcc; 64], Architecture::Arm64, endian);
+
+            // Two bytes of code, then a 13-byte tail: three whole NOPs and the
+            // first byte of a fourth.
+            binary.patch_bytes(8, 15, &[0xAA, 0xBB]).unwrap();
+
+            let mut want = vec![0xAA, 0xBB];
+            want.extend_from_slice(&nop);
+            want.extend_from_slice(&nop);
+            want.extend_from_slice(&nop);
+            want.push(nop[0]);
+            assert_eq!(&binary.data[8..23], &want[..], "{endian:?}");
+            assert_eq!(binary.data[7], 0xcc, "{endian:?}: before the region");
+            assert_eq!(binary.data[23], 0xcc, "{endian:?}: past the region");
+        }
     }
 
     #[test]
