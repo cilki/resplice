@@ -29,6 +29,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use object::read::archive::ArchiveFile;
+use object::read::elf::{ElfFile, FileHeader, SectionHeader};
 use object::elf::RelocationType;
 use object::{
     Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget, SectionKind,
@@ -282,12 +283,12 @@ type SymId = (usize, usize);
 /// so they stay empty until the closure in [`link_objects`] reaches the
 /// section. See [`extract_relocs`].
 ///
-/// `name` is borrowed from the archive rather than copied: a crate that
-/// reimplements a few thousand functions has rustc put each helper and each
-/// constant in a section of its own, in whichever codegen unit got it, so this
-/// is read for tens of thousands of sections to find the handful that matter.
-struct Sec<'d> {
-    name: &'d str,
+/// The section's name is not here. Nothing after the splice scan reads one
+/// except to report an error, and decoding it for every section the closure
+/// reaches -- a string-table read and a UTF-8 check apiece, for tens of
+/// thousands of helpers and constants in a crate of a few thousand splices --
+/// was a measurable share of the closure. See [`sec_name`].
+struct Sec {
     align: u64,
     writable: bool,
     /// Whether the section holds machine code (`SHF_EXECINSTR`). A `#[Splice]`
@@ -296,8 +297,11 @@ struct Sec<'d> {
     code: bool,
     /// The section's contents; empty until the closure reaches the section.
     bytes: Vec<u8>,
-    /// The section's relocations; empty until the closure reaches the section.
-    relocs: Vec<Rel>,
+    /// The section's relocations, as a range of the one [`Rel`] list the link
+    /// keeps (see [`link_objects`]); empty until the closure reaches the
+    /// section. Every section had a `Vec` of its own, which was an allocation
+    /// or three per section reached, for two or three relocations each.
+    relocs: std::ops::Range<usize>,
     /// Whether any of `relocs` is a GOT-style reference, noted while they are
     /// read so the GOT layout does not have to walk them all again to find
     /// out. Almost always false.
@@ -359,6 +363,66 @@ fn is_runtime_writable<'a, S: ObjectSection<'a>>(section: &S) -> bool {
         ),
         _ => false,
     }
+}
+
+/// What `#[Splice]` names the section it emits a function into, ahead of the
+/// `<begin>.<end>` range.
+const SPLICE_PREFIX: &[u8] = b".rspl.";
+
+/// The sections of one member whose name starts with [`SPLICE_PREFIX`], as far
+/// as the raw section table can tell.
+///
+/// Every section of every member is looked at to find the splices, and a crate
+/// that reimplements a few thousand functions has tens of thousands of them:
+/// rustc gives each helper and each constant a section of its own, and each of
+/// those a relocation section. Asking `object` for each one's name is a string
+/// table read per section -- bounds checks, a scan for the terminator, the
+/// format dispatch around it -- to compare six bytes, and that walk cost more
+/// than reading the splices it found.
+///
+/// For an ELF member the section headers and `.shstrtab` are read as they lie
+/// in the file instead: one six-byte comparison at each header's `sh_name`.
+/// That is a prefilter, not the decision: the caller decodes each candidate's
+/// name in full and parses the range out of it, so this only has to return a
+/// superset of the sections whose name starts with the prefix, which a plain
+/// comparison on the same bytes is. A member in another format keeps the
+/// generic walk.
+fn splice_candidates(obj: &object::File) -> Vec<object::SectionIndex> {
+    fn in_elf<Elf: FileHeader>(file: &ElfFile<Elf>) -> Option<Vec<object::SectionIndex>> {
+        let endian = file.endian();
+        let data = file.data();
+        let sections = file.elf_section_table();
+        let shstrtab = file.elf_header().shstrndx(endian, data).ok()?;
+        let names = sections
+            .section(object::SectionIndex(shstrtab as usize))
+            .ok()?
+            .data(endian, data)
+            .ok()?;
+        Some(
+            sections
+                .enumerate()
+                // The null section, which `sections()` leaves out too.
+                .skip(1)
+                .filter(|(_, header)| {
+                    let at = header.sh_name(endian) as usize;
+                    names.get(at..at + SPLICE_PREFIX.len()) == Some(SPLICE_PREFIX)
+                })
+                .map(|(index, _)| index)
+                .collect(),
+        )
+    }
+
+    let raw = match obj {
+        object::File::Elf32(file) => in_elf(file),
+        object::File::Elf64(file) => in_elf(file),
+        _ => None,
+    };
+    raw.unwrap_or_else(|| {
+        obj.sections()
+            .filter(|s| matches!(s.name_bytes(), Ok(n) if n.starts_with(SPLICE_PREFIX)))
+            .map(|s| s.index())
+            .collect()
+    })
 }
 
 /// Parse a `.rspl.<begin>.<end>` section name into its `(begin, end)` range.
@@ -596,29 +660,43 @@ struct Def {
 /// rustc put every helper and every constant in a section of its own, in
 /// whichever codegen unit got it, and only a handful of those are reachable
 /// from a splice.
-fn read_sec<'d>(objs: &[object::File<'d>], id: SecId) -> Result<Sec<'d>> {
+///
+/// Reached, not scanned: every `.rspl.*` section is entered by the splice
+/// scan before the closure starts (or refused by it, for a malformed name), so
+/// a section first met here is never a splice and its name is not looked at.
+fn read_sec(objs: &[object::File], id: SecId) -> Result<Sec> {
     let (mi, si) = id;
     let section = objs[mi]
         .section_by_index(object::SectionIndex(si))
         .map_err(|e| anyhow!("bad section index {si} in archive member {mi}: {e}"))?;
-    sec_header(&section)
+    Ok(sec_header(&section, None))
 }
 
 /// [`read_sec`] for a section the caller already has in hand, which the splice
 /// scan in [`link_objects`] does: it is walking the member's sections to find
 /// them, so looking each match back up by index read the header twice.
-fn sec_header<'d, S: ObjectSection<'d>>(section: &S) -> Result<Sec<'d>> {
-    let name = section.name().unwrap_or("");
-    Ok(Sec {
-        splice: splice_range(name)?,
-        name,
+fn sec_header<'d, S: ObjectSection<'d>>(section: &S, splice: Option<(u64, u64)>) -> Sec {
+    Sec {
+        splice,
         align: section.align().max(1),
         writable: is_runtime_writable(section),
         code: matches!(section.kind(), SectionKind::Text),
         bytes: Vec::new(),
-        relocs: Vec::new(),
+        relocs: 0..0,
         has_got: false,
-    })
+    }
+}
+
+/// The name of section `id`, for a diagnostic.
+///
+/// Read from the archive on demand rather than kept in [`Sec`]: see there. A
+/// section whose name cannot be read is reported as having none, as it would
+/// have been recorded.
+fn sec_name<'d>(objs: &[object::File<'d>], id: SecId) -> &'d str {
+    objs[id.0]
+        .section_by_index(object::SectionIndex(id.1))
+        .and_then(|s| s.name())
+        .unwrap_or("")
 }
 
 /// Read the relocations of one section, recording every symbol they reference
@@ -632,35 +710,44 @@ fn sec_header<'d, S: ObjectSection<'d>>(section: &S) -> Result<Sec<'d>> {
 /// 2000 splices, 98k of the object's 110k relocations were debug info. Reading
 /// those, and interning the name of every symbol they mention, was the single
 /// most expensive thing linking did.
+///
+/// The relocations are appended to `rels`, and the range of it they occupy is
+/// returned with whether any of them is a GOT-style reference.
 fn extract_relocs<'d>(
     objs: &[object::File<'d>],
     arch: Architecture,
     id: SecId,
-    name: &str,
+    rels: &mut Vec<Rel>,
     syms: &mut HashMap<SymId, SymInfo<'d>>,
     exports: &mut Option<HashMap<&'d str, Def>>,
     referenced: &mut Vec<SecId>,
-) -> Result<(Vec<Rel>, bool)> {
+) -> Result<(std::ops::Range<usize>, bool)> {
     referenced.clear();
     let (mi, index) = id;
     let obj = &objs[mi];
+    let name = || sec_name(objs, id);
     let section = obj
         .section_by_index(object::SectionIndex(index))
-        .map_err(|e| anyhow!("bad section index {index} ({name}): {e}"))?;
+        .map_err(|e| anyhow!("bad section index {index} ({}): {e}", name()))?;
 
-    let mut relocs = Vec::new();
+    let start = rels.len();
     let mut has_got = false;
     for (offset, reloc) in section.relocations() {
         let r_type = match reloc.flags() {
             RelocationFlags::Elf { r_type } => r_type,
-            _ => return Err(anyhow!("non-ELF relocation in {name}")),
+            _ => return Err(anyhow!("non-ELF relocation in {}", name())),
         };
         let sym = match reloc.target() {
             RelocationTarget::Symbol(i) => i,
-            other => return Err(anyhow!("unsupported relocation target {other:?} in {name}")),
+            other => {
+                return Err(anyhow!(
+                    "unsupported relocation target {other:?} in {}",
+                    name()
+                ))
+            }
         };
         has_got |= arch::needs_got(arch, r_type);
-        relocs.push(Rel {
+        rels.push(Rel {
             offset,
             r_type,
             sym: (mi, sym.0),
@@ -672,7 +759,7 @@ fn extract_relocs<'d>(
         if let std::collections::hash_map::Entry::Vacant(slot) = syms.entry((mi, sym.0)) {
             let s = obj
                 .symbol_by_index(sym)
-                .map_err(|e| anyhow!("bad symbol index {} in {name}: {e}", sym.0))?;
+                .map_err(|e| anyhow!("bad symbol index {} in {}: {e}", sym.0, name()))?;
             let sym_name = s.name().unwrap_or("");
             let mut section = s.section_index().map(|i| (mi, i.0));
             let mut value = s.address();
@@ -713,13 +800,20 @@ fn extract_relocs<'d>(
             });
         }
     }
-    Ok((relocs, has_got))
+    Ok((start..rels.len(), has_got))
 }
 
 /// The paired `R_MIPS_LO16` addend for an `R_MIPS_HI16`, read from the original
 /// section bytes (the low half of the first matching-symbol LO16 instruction).
-fn find_pair_lo(arch: Architecture, sec: &Sec, sym: SymId, endian: Endian) -> Option<i64> {
-    sec.relocs
+/// `relocs` are the section's own relocations.
+fn find_pair_lo(
+    arch: Architecture,
+    sec: &Sec,
+    relocs: &[Rel],
+    sym: SymId,
+    endian: Endian,
+) -> Option<i64> {
+    relocs
         .iter()
         .find(|r| {
             arch::is_mips_lo16(arch, r.r_type)
@@ -767,7 +861,7 @@ fn link_objects<'d>(
 
     // The splice sections, across every member. Everything else goes into
     // `secs` only once the closure below reaches it; see [`read_sec`].
-    let mut secs: HashMap<SecId, Sec<'d>> = HashMap::new();
+    let mut secs: HashMap<SecId, Sec> = HashMap::new();
     let mut syms: HashMap<SymId, SymInfo<'d>> = HashMap::new();
     let mut splice_idxs: Vec<SecId> = Vec::new();
 
@@ -776,20 +870,29 @@ fn link_objects<'d>(
         // This member's splice sections, flagged by section index for
         // [`check_one_item_per_splice`].
         let mut mine: Vec<bool> = Vec::new();
-        for section in obj.sections() {
-            // `name_bytes`, not `name`: every section of every member reaches
-            // this test, and a crate that reimplements a few thousand
-            // functions has tens of thousands of them -- rustc gives each
-            // helper and each constant a section of its own. Validating all
-            // of those names as UTF-8 to compare six bytes of them is work
-            // the few that match do not need, and the matches have their name
-            // decoded by `sec_header` anyway.
-            if !matches!(section.name_bytes(), Ok(n) if n.starts_with(b".rspl.")) {
+        for index in splice_candidates(obj) {
+            let section = obj.section_by_index(index).map_err(|e| {
+                anyhow!("bad section index {} in archive member {mi}: {e}", index.0)
+            })?;
+            // A candidate is only a prefix match on the raw string table;
+            // the name decoded in full is what decides. One that cannot be
+            // decoded -- not UTF-8, or unterminated -- cannot name a range,
+            // and a `.rspl.` section without one used to be entered as a
+            // splice anyway, which nothing downstream expects.
+            let name = match section.name() {
+                Ok(name) => name,
+                Err(e) => bail!(
+                    "splice section {:?} in archive member {mi} has a name that could \
+                     not be read ({e}), so it does not name a `.rspl.<begin>.<end>` range",
+                    String::from_utf8_lossy(section.name_bytes().unwrap_or(b""))
+                ),
+            };
+            let Some(splice) = splice_range(name)? else {
                 continue;
-            }
-            let id = (mi, section.index().0);
+            };
+            let id = (mi, index.0);
             splice_idxs.push(id);
-            secs.insert(id, sec_header(&section)?);
+            secs.insert(id, sec_header(&section, Some(splice)));
             if mine.len() <= id.1 {
                 mine.resize(id.1 + 1, false);
             }
@@ -833,12 +936,15 @@ fn link_objects<'d>(
     // reused across the walk rather than allocated per section: a crate of a
     // few thousand splices visits tens of thousands of them.
     let mut referenced: Vec<SecId> = Vec::new();
+    // Every included section's relocations, end to end; each `Sec` holds its
+    // own range of this. See [`Sec::relocs`].
+    let mut rels: Vec<Rel> = Vec::new();
     while let Some(si) = work.pop() {
         let (relocs, has_got) = extract_relocs(
             objs,
             arch,
             si,
-            secs[&si].name,
+            &mut rels,
             &mut syms,
             &mut exports,
             &mut referenced,
@@ -878,14 +984,18 @@ fn link_objects<'d>(
     let mut got_syms: Vec<SymId> = Vec::new();
     for &si in &included {
         let sec = secs.get_mut(&si).unwrap();
-        let name = sec.name;
         sec.bytes = objs[si.0]
             .section_by_index(object::SectionIndex(si.1))
             .and_then(|s| s.data().map(<[u8]>::to_vec))
-            .map_err(|e| anyhow!("failed to read the contents of section {name:?}: {e}"))?;
+            .map_err(|e| {
+                anyhow!(
+                    "failed to read the contents of section {:?}: {e}",
+                    sec_name(objs, si)
+                )
+            })?;
         if sec.has_got {
             got_syms.extend(
-                sec.relocs
+                rels[sec.relocs.clone()]
                     .iter()
                     .filter(|r| arch::needs_got(arch, r.r_type))
                     .map(|r| r.sym),
@@ -941,7 +1051,7 @@ fn link_objects<'d>(
             return Err(anyhow!(
                 "splice references writable section {:?}; injecting writable data \
                  (mutable statics/.bss) is not yet supported",
-                sec.name
+                sec_name(objs, si)
             ));
         }
         pad_to(blob, sec.align);
@@ -1008,7 +1118,7 @@ fn link_objects<'d>(
                      altogether",
                     s.name,
                     s.value,
-                    secs[&secj].name,
+                    sec_name(objs, secj),
                 )
             }
             Ok(base_va + s.value)
@@ -1105,8 +1215,9 @@ fn link_objects<'d>(
         let is_fit_splice = sec.splice.is_some() && bo.is_none();
 
         let mut out = if is_fit_splice { sec.bytes.clone() } else { Vec::new() };
+        let relocs = &rels[sec.relocs.clone()];
 
-        for r in &sec.relocs {
+        for r in relocs {
             // Both the resolution and the encoding below can fail, and neither
             // message is actionable without knowing which splice (or which of
             // its helpers) carries the reference.
@@ -1120,12 +1231,13 @@ fn link_objects<'d>(
                 // fall back to naming the section it resolves into.
                 let what = if sym.name.is_empty() {
                     sym.section
-                        .and_then(|secj| secs.get(&secj).map(|s| s.name))
+                        .filter(|secj| secs.contains_key(secj))
+                        .map(|secj| sec_name(objs, secj))
                         .unwrap_or("<unnamed symbol>")
                 } else {
                     sym.name
                 };
-                format!("relocation against {what:?} in {:?}", sec.name)
+                format!("relocation against {what:?} in {:?}", sec_name(objs, si))
             };
             let s = resolve(r.sym).with_context(context)?;
             let p = site_base + r.offset;
@@ -1187,7 +1299,7 @@ fn link_objects<'d>(
                 }
             }
             let pair_lo = if arch::is_mips_hi16(arch, r.r_type) && r.has_implicit {
-                find_pair_lo(arch, sec, r.sym, endian)
+                find_pair_lo(arch, sec, relocs, r.sym, endian)
             } else {
                 None
             };
@@ -2079,6 +2191,57 @@ mod tests {
             });
         }
         ar_wrap("splice.o", &obj.write().unwrap())
+    }
+
+    /// The raw section-table scan has to find exactly what the generic walk
+    /// finds: the sections whose name *starts* with `.rspl.`, and nothing
+    /// that merely contains it or shares a shorter prefix with it.
+    #[test]
+    fn splice_candidates_agree_with_the_generic_walk() {
+        use object::write::Object;
+        use object::{Architecture, BinaryFormat, Endianness, SectionKind};
+
+        let mut obj = Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+        let names: [&[u8]; 6] = [
+            b".text.rspl.401000.401020", // contains, does not start with
+            b".rspl.401000.401020",
+            b".rspl",            // the prefix minus its dot
+            b".rspl_401000",     // a different sixth byte
+            b".rspl.",           // nothing but the prefix
+            b".rodata.rspl.table",
+        ];
+        for name in names {
+            let sec = obj.add_section(vec![], name.to_vec(), SectionKind::Text);
+            obj.append_section_data(sec, &[0x90; 4], 1);
+        }
+        let bytes = obj.write().unwrap();
+        let file = object::File::parse(&*bytes).unwrap();
+
+        let generic: Vec<object::SectionIndex> = file
+            .sections()
+            .filter(|s| matches!(s.name_bytes(), Ok(n) if n.starts_with(b".rspl.")))
+            .map(|s| s.index())
+            .collect();
+        assert_eq!(generic.len(), 2, "the crafted object should hold two matches");
+        assert_eq!(splice_candidates(&file), generic);
+    }
+
+    /// A `.rspl.` section whose name is not UTF-8 cannot name a range, and is
+    /// refused rather than entered as a splice without one (which used to
+    /// panic once the layout asked for the range).
+    #[test]
+    fn test_link_rlib_rejects_non_utf8_splice_name() {
+        use object::write::Object;
+        use object::{Architecture, BinaryFormat, Endianness, SectionKind};
+
+        let mut obj = Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+        let sec = obj.add_section(vec![], b".rspl.401000.4010\xff0".to_vec(), SectionKind::Text);
+        obj.append_section_data(sec, &[0x90; 4], 1);
+        let rlib = ar_wrap("splice.o", &obj.write().unwrap());
+
+        let msg = link_err("rlib_non_utf8", &rlib);
+        assert!(msg.contains("could not be read"), "message was {msg:?}");
+        assert!(msg.contains(".rspl.401000.4010\u{fffd}0"), "message was {msg:?}");
     }
 
     #[test]
