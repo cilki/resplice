@@ -1144,6 +1144,24 @@ fn link_objects<'d>(
                 sec.bytes.len()
             );
         }
+        // A code splice is executed from `begin`, and its NOP fill (or the
+        // trampoline's) runs up to `end`. On a fixed-width architecture both
+        // have to be instruction boundaries: a `begin` off one has the CPU
+        // fetch the replacement's first instruction from a misaligned address
+        // (SIGILL/SIGBUS on aarch64), and an `end` off one leaves the fill
+        // writing the head of a NOP over the head of the instruction that
+        // follows, which the target then decodes as garbage. Either way the
+        // patch was reported as applied. A `static` can sit anywhere, so data
+        // splices are exempt.
+        let align = arch.insn_align();
+        if sec.code && (begin % align != 0 || end % align != 0) {
+            bail!(
+                "code splice {begin:#x}..{end:#x} does not start and end on an \
+                 instruction boundary; every {arch:?} instruction is {align} bytes \
+                 on a {align}-byte boundary, so `begin` and `end` must both be \
+                 multiples of {align}"
+            );
+        }
         if sec.bytes.len() <= region {
             sec_va.insert(si, begin)?;
         } else {
@@ -1928,6 +1946,10 @@ mod tests {
     ];
 
     fn build_rlib_aarch64(splice_end: u64) -> Vec<u8> {
+        build_rlib_aarch64_at(SPLICE_VA, splice_end)
+    }
+
+    fn build_rlib_aarch64_at(splice_begin: u64, splice_end: u64) -> Vec<u8> {
         use object::write::{Object, Relocation, Symbol, SymbolSection as WSection};
         use object::{
             Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolFlags,
@@ -1954,7 +1976,7 @@ mod tests {
             flags: SymbolFlags::None,
         });
 
-        let name = format!(".rspl.{SPLICE_VA:x}.{splice_end:x}").into_bytes();
+        let name = format!(".rspl.{splice_begin:x}.{splice_end:x}").into_bytes();
         let rspl = obj.add_section(vec![], name, SectionKind::Text);
         obj.append_section_data(rspl, &A64_SPLICE, 16);
         for (offset, symbol, r_type) in [
@@ -2014,6 +2036,31 @@ mod tests {
         assert!(table_va >= INJECT_BASE, "table not injected");
         let toff = bin.va_to_offset(table_va).unwrap();
         assert_eq!(&bin.data()[toff..toff + table_data().len()], &table_data());
+    }
+
+    /// Every aarch64 instruction is a 4-byte word on a 4-byte boundary. A code
+    /// splice whose `begin` is off one was written there anyway and reported as
+    /// applied, and the patched program died with SIGILL on its first call; one
+    /// whose `end` is off one has its NOP fill write half an instruction over
+    /// the head of the next. Both must be refused before anything is written.
+    #[test]
+    fn test_link_rlib_aarch64_rejects_misaligned_code_splice() {
+        for (begin, end) in [
+            (SPLICE_VA + 2, SPLICE_VA + 0x22),
+            (SPLICE_VA, SPLICE_VA + 0x1e),
+        ] {
+            let rlib_path = temp_path("rlib_a64_misaligned");
+            fs::write(&rlib_path, build_rlib_aarch64_at(begin, end)).unwrap();
+            let original = crafted_target_aarch64();
+            let mut bin = load(&original);
+            let err = link_rlib(&mut bin, &rlib_path).unwrap_err();
+            fs::remove_file(&rlib_path).ok();
+
+            let msg = format!("{err:#}");
+            assert!(msg.contains("instruction boundary"), "message was {msg:?}");
+            assert!(msg.contains(&format!("{begin:#x}..{end:#x}")), "message was {msg:?}");
+            assert_eq!(bin.data(), &original[..], "{begin:#x}..{end:#x}: target was modified");
+        }
     }
 
     #[test]
