@@ -203,6 +203,68 @@ the loader zeroes the rest out of nothing, so there is no byte in the image at
 
 Give such a table its values from a code splice instead.
 
+### Callers that rely on more than the calling convention
+
+`extern "C"` gives a replacement the platform's calling convention, and that is
+all a caller is normally entitled to assume. GCC's callers can assume more. With
+`-fipa-ra`, which is on at `-O2`, a caller that can see the body of the function
+it calls keeps values in the registers that body happens not to touch, even the
+ones the convention says a call may overwrite. That applies whenever the callee
+is defined in the same source file as its caller (or anywhere, under LTO). The
+one exception is an exported function of a shared library, which can be
+interposed. A replacement that uses one of those registers, as compiled
+Rust is free to, overwrites a value its caller still needs. The splice applies
+without an error, and the patched program crashes or misbehaves later in the
+*caller*:
+
+```
+00400680 <main>:
+  400680:  mov  x8, x1          // argv, kept in x8 across the call ...
+  4006b0:  bl   400840 <sum>    // ... because the original `sum` never writes x8
+  4006c0:  ldr  x0, [x8, #8]    // segfaults once the replacement has used x8
+```
+
+`resplice` cannot detect this, because it never sees the callers. If a splice
+breaks its caller this way, check the caller's disassembly for registers that it
+sets before the call and reads after it. Then put a naked wrapper at `begin` that
+saves those registers around a call to the real implementation. The wrapper
+leaves the argument registers alone, so the arguments reach `sum_impl` as they
+arrived. Here, on aarch64:
+
+```rust
+use resplice_macros::Splice;
+
+#[inline(never)]
+extern "C" fn sum_impl(a: *const i32, n: i32) -> i32 { /* ... */ }
+
+#[Splice(begin = 0x400840, end = 0x40089c)]
+#[unsafe(naked)]
+pub extern "C" fn sum() {
+    core::arch::naked_asm!(
+        "stp x29, x30, [sp, #-96]!",
+        "mov x29, sp",
+        "stp x8, x9, [sp, #16]",   // x8-x17: the registers a call may
+        "stp x10, x11, [sp, #32]", // overwrite, other than the argument
+        "stp x12, x13, [sp, #48]", // registers x0-x7
+        "stp x14, x15, [sp, #64]",
+        "stp x16, x17, [sp, #80]",
+        "bl {imp}",
+        "ldp x8, x9, [sp, #16]",
+        "ldp x10, x11, [sp, #32]",
+        "ldp x12, x13, [sp, #48]",
+        "ldp x14, x15, [sp, #64]",
+        "ldp x16, x17, [sp, #80]",
+        "ldp x29, x30, [sp], #96",
+        "ret",
+        imp = sym sum_impl,
+    )
+}
+```
+
+The wrapper does not save the argument registers. Under `-fipa-ra` the caller
+may still expect them back unchanged if the original never wrote them, so save
+them too when the caller's disassembly reads them after the call.
+
 ### Placing the injected segment
 
 By default the injected segment is mapped one page past the end of the target's

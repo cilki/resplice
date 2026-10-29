@@ -496,3 +496,42 @@ testRlibBuiltWithLtoIsRefusedNamingTheProfileSetting() {
 	grep -q 'LLVM bitcode' "$fixture/err"
 	grep -q 'lto = false' "$fixture/err"
 }
+
+## The attributes written on a spliced `fn` have to survive `#[Splice]`.
+##
+## `#[Splice]` used to rebuild the function from its visibility, signature and
+## body alone, dropping every other attribute. `#[unsafe(naked)]` is the one
+## that shows it: a naked function's body is a `naked_asm!`, which only
+## compiles inside one, so the crate failed to build at all. That is the way to
+## write a replacement whose every instruction -- every register it touches --
+## is chosen by hand, which is what a caller that relies on more than the
+## calling convention needs.
+testSpliceKeepsFunctionAttributes() {
+	newFixture
+	writeComputeAsm 32
+	printf '%s\n' '#include <stdio.h>' 'int compute(void);' \
+		'int main(void){ printf("%d\n", compute()); return 0; }' > "$fixture/prog.c"
+	buildTarget "$fixture/compute.s"
+
+	[ "$("$fixture/prog")" = "41" ]
+
+	symRange compute
+
+	local ret42
+	case "$(uname -m)" in
+	x86_64 | i?86) ret42='mov eax, 42' ;;
+	*) ret42='mov w0, #42' ;;
+	esac
+	{
+		printf 'use resplice_macros::Splice;\n'
+		printf '#[Splice(begin = %d, end = %d)]\n' "$va" "$end"
+		printf '#[unsafe(naked)]\n'
+		printf 'pub extern "C" fn compute() -> i32 {\n'
+		printf '    core::arch::naked_asm!("%s", "ret")\n' "$ret42"
+		printf '}\n'
+	} > "$fixture/src/lib.rs"
+	buildFixture
+
+	applySplices
+	[ "$("$fixture/prog.patched")" = "42" ]
+}
