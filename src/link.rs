@@ -1032,15 +1032,17 @@ fn link_objects<'d>(
     // the order the sections were collected in.
     splice_idxs.sort_unstable();
 
+    // The sections the walk reaches beyond the splices, in the order it reaches
+    // them, which is the order they are laid out in the blob. Every section the
+    // link includes is a splice or one of these; see `included` below.
     let mut inject_order: Vec<SecId> = Vec::new();
-    let mut included: Vec<SecId> = splice_idxs.clone();
     // `secs`' own keys are the membership test for the walk: a section is in it
-    // exactly when it has been reached. `included` cannot serve, because it has
-    // to keep its insertion order (it is what the layout and relocation passes
-    // iterate) and scanning it for every reference visited makes collecting the
-    // closure quadratic in the number of sections reached. A crate that
-    // reimplements a few thousand functions reaches tens of thousands of them,
-    // each helper and `.rodata` constant in its own section.
+    // exactly when it has been reached. `inject_order` cannot serve, because it
+    // has to keep its insertion order and scanning it for every reference
+    // visited makes collecting the closure quadratic in the number of sections
+    // reached. A crate that reimplements a few thousand functions reaches tens
+    // of thousands of them, each helper and `.rodata` constant in its own
+    // section.
     let mut work: Vec<SecId> = splice_idxs.clone();
     // Scratch for the sections each visited section turns out to reference,
     // reused across the walk rather than allocated per section: a crate of a
@@ -1062,7 +1064,6 @@ fn link_objects<'d>(
         for &secj in &referenced {
             if secs.get(secj).is_none() {
                 secs.insert(secj, read_sec(objs, secj)?)?;
-                included.push(secj);
                 inject_order.push(secj);
                 work.push(secj);
             }
@@ -1071,6 +1072,8 @@ fn link_objects<'d>(
         sec.relocs = relocs;
         sec.has_got = has_got;
     }
+    // Every section the link includes: the splices, then what they reach.
+    let included = || splice_idxs.iter().chain(&inject_order).copied();
 
     // The closure is settled, so now read the contents of just those sections.
     //
@@ -1092,7 +1095,7 @@ fn link_objects<'d>(
     // splices reaches tens of thousands of sections and ten times as many
     // relocations, while the GOT it ends up with is usually empty.
     let mut got_syms: Vec<SymId> = Vec::new();
-    for &si in &included {
+    for si in included() {
         let sec = secs.get_mut(si).expect("included section is in `secs`");
         sec.bytes = objs[si.0]
             .section_by_index(object::SectionIndex(si.1))
@@ -1334,13 +1337,13 @@ fn link_objects<'d>(
     // the only references that keep working are the ones whose field holds a
     // displacement rather than an address. See
     // [`Binary::is_position_independent`] and the refusal in the loop below.
-    let pie = target.is_position_independent()?;
+    let pie = target.is_position_independent();
 
     // Apply relocations for every included section. A splice that fits is
     // relocated into a private buffer and patched into `[begin, end)` later;
     // everything else (referenced sections, oversized splices) is relocated in
     // place inside the injected blob.
-    for &si in &included {
+    for si in included() {
         let sec = &secs[si];
         let site_base = sec_va[si];
         // Everything laid out into the blob above -- referenced sections and
@@ -1502,8 +1505,7 @@ fn link_objects<'d>(
 
 /// Pad `blob` with zeroes so its length is a multiple of `align`.
 fn pad_to(blob: &mut Vec<u8>, align: u64) {
-    let aligned = (blob.len() as u64 + align - 1) & !(align - 1);
-    blob.resize(aligned as usize, 0);
+    blob.resize(crate::align_up(blob.len() as u64, align) as usize, 0);
 }
 
 #[cfg(test)]

@@ -422,9 +422,10 @@ impl Binary {
         };
         // An image too short for its class's header is not one anything here
         // can read: the program-header table's location alone lives past the
-        // end of it.
-        let ehsize = if is_64 { 64 } else { 52 };
-        if data.len() < ehsize {
+        // end of it. Every `Binary` is built from an image that passed this,
+        // and an image only ever grows, so the header readers below index the
+        // ELF header without checking its length again.
+        if data.len() < Class::of(is_64).ehsize {
             bail!(
                 "image is {} bytes, too short to hold an ELF header",
                 data.len()
@@ -633,19 +634,12 @@ impl Binary {
     /// [`link_rlib`] therefore refuses the absolute references rather than
     /// reporting a successful splice whose binary faults. See
     /// `arch::writes_absolute_address`.
-    pub fn is_position_independent(&self) -> Result<bool> {
+    pub fn is_position_independent(&self) -> bool {
         use goblin::elf::header::ET_DYN;
         // `e_type` is the first field after the 16-byte identifier in both ELF
         // classes, so reading it needs nothing `detect_arch` has not already
-        // validated -- and reading it here rather than through `elf()` keeps
-        // this as cheap as `program_headers`.
-        if self.data.len() < 0x12 {
-            return Err(anyhow!(
-                "image is {} bytes, too short to hold an ELF header",
-                self.data.len()
-            ));
-        }
-        Ok(self.endian.read_uint(&self.data, 0x10, 2) == ET_DYN as u64)
+        // validated.
+        self.endian.read_uint(&self.data, 0x10, 2) == ET_DYN as u64
     }
 
     /// Read the section-header table straight out of the image, for the same
@@ -664,12 +658,6 @@ impl Binary {
         let c = self.class();
         let (word, shentsize) = (c.word, c.shentsize);
 
-        if self.data.len() < c.ehsize {
-            return Err(anyhow!(
-                "image is {} bytes, too short for an ELF header",
-                self.data.len()
-            ));
-        }
         let shoff = endian.read_uint(&self.data, c.e_shoff, word) as usize;
         let got_shentsize = endian.read_uint(&self.data, c.e_shentsize, 2) as usize;
         let mut shnum = endian.read_uint(&self.data, c.e_shnum, 2) as usize;
@@ -777,12 +765,6 @@ impl Binary {
         let c = self.class();
         let (word, phentsize) = (c.word, c.phentsize);
 
-        if self.data.len() < c.ehsize {
-            return Err(anyhow!(
-                "image is {} bytes, too short for an ELF header",
-                self.data.len()
-            ));
-        }
         let phoff = endian.read_uint(&self.data, c.e_phoff, word) as usize;
         let got_phentsize = endian.read_uint(&self.data, c.e_phentsize, 2) as usize;
         let phnum = endian.read_uint(&self.data, c.e_phnum, 2) as usize;
