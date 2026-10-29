@@ -237,9 +237,12 @@ width. A base further away than the field can express is rejected rather than
 written with its high bits dropped:
 
 ```
-error: trampoline at 0x401000 is 0xffbff01b bytes from its target 0x100000020,
-which does not fit the signed 32-bit displacement of a `jmp rel32`; choose an
---inject-base within 2GB of the splice
+error: trampoline at 0x401000 cannot reach its target 0x100000020; choose an
+--inject-base within reach of the splice: PC-relative displacement 0xffbff01b
+does not fit the signed 32-bit field this relocation writes; truncating it would
+leave the reference pointing at an unrelated address. The symbol is too far from
+the relocated site -- for a reference into the injected segment, choose an
+--inject-base closer to the splice
 ```
 
 Note that the segment is mapped read+execute, so referenced *writable* data

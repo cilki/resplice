@@ -161,6 +161,33 @@ fn does_not_fit(kind: &str, value: i128, field: &str) -> anyhow::Error {
     )
 }
 
+/// The immediate of a branch that counts 4-byte instructions in a signed
+/// `bits`-bit field, for a byte displacement `x` from the PC it resolves
+/// against.
+///
+/// Both conditions are checked on the full-width displacement, before it is
+/// narrowed to the field: a displacement far too large to encode would
+/// otherwise wrap into the permitted range and pass (16GB away on aarch64 is
+/// `0x1_0000_0000` instructions, which narrows to a branch to itself), and one
+/// that is not 4-byte aligned would silently round towards the branch and land
+/// somewhere else.
+fn branch_imm(x: i64, bits: u32, what: &str) -> Result<u32> {
+    if x & 3 != 0 {
+        bail!(
+            "{what} displacement {x:#x} is not 4-byte aligned; the immediate counts \
+             whole instructions"
+        );
+    }
+    let reach = 1i64 << (bits + 1);
+    if !(-reach..reach).contains(&x) {
+        bail!(
+            "{what} displacement {x:#x} is out of reach of its {bits}-bit immediate \
+             (±{reach:#x} bytes)"
+        );
+    }
+    Ok(((x >> 2) as u32) & ((1 << bits) - 1))
+}
+
 /// Width of the field the encoder for `r_type` reads and writes at the
 /// relocated offset: eight bytes for the handful of 64-bit relocations, and a
 /// four-byte instruction (or word) for everything else, including the types
@@ -337,11 +364,7 @@ fn apply_aarch64(
             endian.write_uint(buf, off, 4, v)
         }
         R_AARCH64_CALL26 | R_AARCH64_JUMP26 => {
-            let x = s as i64 + a - p as i64;
-            if x & 3 != 0 || !(-(1 << 27)..(1 << 27)).contains(&x) {
-                bail!("aarch64 branch target {x:#x} out of range");
-            }
-            let imm26 = ((x >> 2) as u32) & 0x03ff_ffff;
+            let imm26 = branch_imm(s as i64 + a - p as i64, 26, "aarch64 branch")?;
             patch_insn(endian, buf, off, 0x03ff_ffff, imm26);
         }
         // ADRP: page offset of (S + A) relative to the page of P, imm21 split
@@ -419,11 +442,7 @@ fn apply_arm(
         }
         R_ARM_CALL | R_ARM_JUMP24 | R_ARM_PC24 => {
             let a = (((insn & 0x00ff_ffff) << 8) as i32 >> 8) as i64 * 4; // sign-extend imm24<<2
-            let x = s as i64 + a - p as i64;
-            if x & 3 != 0 || !(-(1 << 25)..(1 << 25)).contains(&x) {
-                bail!("arm branch target {x:#x} out of range");
-            }
-            let imm24 = ((x >> 2) as u32) & 0x00ff_ffff;
+            let imm24 = branch_imm(s as i64 + a - p as i64, 24, "arm branch")?;
             patch_insn(endian, buf, off, 0x00ff_ffff, imm24);
         }
         R_ARM_MOVW_ABS_NC | R_ARM_MOVT_ABS => {
@@ -538,12 +557,8 @@ fn apply_mips(
             } else {
                 a
             };
-            let x = s as i64 + a - p as i64;
             // A signed 16-bit field scaled by four: ±128KB of instructions.
-            if x & 3 != 0 || !(-(1 << 17)..(1 << 17)).contains(&x) {
-                bail!("mips branch target {x:#x} out of range");
-            }
-            let field = ((x >> 2) as u32) & 0xffff;
+            let field = branch_imm(s as i64 + a - p as i64, 16, "mips branch")?;
             patch_insn(endian, buf, off, 0xffff, field);
         }
         R_MIPS_PC32 => {
@@ -692,7 +707,7 @@ mod tests {
         assert!(e.contains("4-byte aligned"), "message was {e:?}");
         // A 16-bit branch field reaches ±128KB.
         let e = err(R_MIPS_PC16, 0x0040_0000, 0, 0, Architecture::Mips);
-        assert!(e.contains("out of range"), "message was {e:?}");
+        assert!(e.contains("out of reach"), "message was {e:?}");
         // On mips64 a 32-bit field, and a HI16/LO16 pair, still span 32 bits.
         err(R_MIPS_32, far, 0, 0, Architecture::Mips64);
         err(R_MIPS_HI16, far, 0, 0, Architecture::Mips64);

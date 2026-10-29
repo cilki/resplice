@@ -2477,7 +2477,7 @@ mod tests {
         // written at `begin` to reach it has the same 32-bit displacement.
         let (bin, result) = link_at("rlib_far_tramp", &build_rlib(SPLICE_VA + 8), FAR);
         let msg = format!("{:#}", result.expect_err("expected an error"));
-        assert!(msg.contains("jmp rel32"), "message was {msg:?}");
+        assert!(msg.contains("does not fit"), "message was {msg:?}");
         assert!(msg.contains("trampoline at 0x401000"), "message was {msg:?}");
         assert_eq!(&bin.data()[0x1000..0x1008], &[0xcc; 8], "target was patched");
 
