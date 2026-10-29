@@ -327,6 +327,20 @@ pub enum Architecture {
 }
 
 impl Architecture {
+    /// The alignment every instruction has: 1 on x86, whose instructions are
+    /// variable-length, and 4 on the fixed-width architectures, where each one
+    /// is a 4-byte word on a 4-byte boundary. (`Arm` is the A32 encoding the
+    /// NOP and trampoline are written in, not Thumb.)
+    pub(crate) fn insn_align(self) -> u64 {
+        match self {
+            Architecture::X86 | Architecture::X86_64 => 1,
+            Architecture::Arm
+            | Architecture::Arm64
+            | Architecture::Mips
+            | Architecture::Mips64 => 4,
+        }
+    }
+
     /// Whether this architecture uses 64-bit pointers.
     fn is_64(self) -> bool {
         matches!(
