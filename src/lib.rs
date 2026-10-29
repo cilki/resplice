@@ -209,6 +209,123 @@ fn slot_for<'b>(
     bound.get_mut(strtab_str(strtab, off)?)
 }
 
+/// Where the fields resplice reads and writes sit in one ELF class.
+///
+/// The 32- and 64-bit structures do not just differ in width: ELF32 has no
+/// 8-byte `sh_flags`, keeps `p_flags` after `p_memsz` rather than after
+/// `p_type`, and `Elf64_Sym` moves `st_value` ahead of `st_info`/`st_shndx`.
+/// Every reader and writer of the target's headers takes its offsets from
+/// here, so that knowledge lives in one place. See [`ELF32`] and [`ELF64`].
+struct Class {
+    /// Width of an address or offset field.
+    word: usize,
+    /// Size of the ELF header.
+    ehsize: usize,
+    // ELF header fields.
+    e_phoff: usize,
+    e_shoff: usize,
+    e_phentsize: usize,
+    e_phnum: usize,
+    e_shentsize: usize,
+    e_shnum: usize,
+    e_shstrndx: usize,
+    // Program-header entry; `p_type` is at 0 in both classes.
+    phentsize: usize,
+    p_flags: usize,
+    p_offset: usize,
+    p_vaddr: usize,
+    p_paddr: usize,
+    p_filesz: usize,
+    p_memsz: usize,
+    p_align: usize,
+    // Section-header entry; `sh_name` and `sh_type` are at 0 and 4 in both.
+    shentsize: usize,
+    sh_addr: usize,
+    sh_offset: usize,
+    sh_size: usize,
+    sh_link: usize,
+    sh_entsize: usize,
+    // Symbol-table entry; `st_name` is at 0 in both.
+    symsize: usize,
+    st_value: usize,
+    st_info: usize,
+    st_shndx: usize,
+    // Relocation entries. `r_info` follows `r_offset` in both forms.
+    relsize: usize,
+    relasize: usize,
+}
+
+impl Class {
+    /// The layout of the 64-bit class if `is_64`, else of the 32-bit one.
+    fn of(is_64: bool) -> &'static Class {
+        if is_64 { &ELF64 } else { &ELF32 }
+    }
+}
+
+const ELF32: Class = Class {
+    word: 4,
+    ehsize: 52,
+    e_phoff: 0x1c,
+    e_shoff: 0x20,
+    e_phentsize: 0x2a,
+    e_phnum: 0x2c,
+    e_shentsize: 0x2e,
+    e_shnum: 0x30,
+    e_shstrndx: 0x32,
+    phentsize: 32,
+    p_offset: 4,
+    p_vaddr: 8,
+    p_paddr: 12,
+    p_filesz: 16,
+    p_memsz: 20,
+    p_flags: 24,
+    p_align: 28,
+    shentsize: 40,
+    sh_addr: 12,
+    sh_offset: 16,
+    sh_size: 20,
+    sh_link: 24,
+    sh_entsize: 36,
+    symsize: 16,
+    st_value: 4,
+    st_info: 12,
+    st_shndx: 14,
+    relsize: 8,
+    relasize: 12,
+};
+
+const ELF64: Class = Class {
+    word: 8,
+    ehsize: 64,
+    e_phoff: 0x20,
+    e_shoff: 0x28,
+    e_phentsize: 0x36,
+    e_phnum: 0x38,
+    e_shentsize: 0x3a,
+    e_shnum: 0x3c,
+    e_shstrndx: 0x3e,
+    phentsize: 56,
+    p_flags: 4,
+    p_offset: 8,
+    p_vaddr: 16,
+    p_paddr: 24,
+    p_filesz: 32,
+    p_memsz: 40,
+    p_align: 48,
+    shentsize: 64,
+    sh_addr: 16,
+    sh_offset: 24,
+    sh_size: 32,
+    sh_link: 40,
+    sh_entsize: 56,
+    symsize: 24,
+    st_info: 4,
+    st_shndx: 6,
+    st_value: 8,
+    relsize: 16,
+    relasize: 24,
+};
+
 /// One entry of the target's section-header table.
 #[derive(Debug, Clone, Copy)]
 struct Shdr {
@@ -538,6 +655,11 @@ impl Binary {
         self.endian
     }
 
+    /// The header layout of the target's ELF class.
+    fn class(&self) -> &'static Class {
+        Class::of(self.is_64())
+    }
+
     /// Whether the target is position-independent (`ET_DYN`) — a PIE
     /// executable, which is what every mainstream toolchain produces by
     /// default, or a shared library.
@@ -589,30 +711,18 @@ impl Binary {
     /// image is refused rather than read past the end of it.
     fn section_headers(&self) -> Result<Vec<Shdr>> {
         let endian = self.endian;
-        let is_64 = self.is_64();
-        let (shoff_off, shentsize_off, shnum_off, shentsize, ehsize) = if is_64 {
-            (0x28, 0x3a, 0x3c, 64usize, 64usize)
-        } else {
-            (0x20, 0x2e, 0x30, 40usize, 52usize)
-        };
-        // ELF32 has no 8-byte `sh_flags`, so every field after it sits 4 bytes
-        // earlier and is half as wide.
-        let (o_addr, o_offset, o_size, o_link, o_entsize) = if is_64 {
-            (16, 24, 32, 40, 56)
-        } else {
-            (12, 16, 20, 24, 36)
-        };
-        let word = if is_64 { 8 } else { 4 };
+        let c = self.class();
+        let (word, shentsize) = (c.word, c.shentsize);
 
-        if self.data.len() < ehsize {
+        if self.data.len() < c.ehsize {
             return Err(anyhow!(
                 "image is {} bytes, too short for an ELF header",
                 self.data.len()
             ));
         }
-        let shoff = endian.read_uint(&self.data, shoff_off, word) as usize;
-        let got_shentsize = endian.read_uint(&self.data, shentsize_off, 2) as usize;
-        let mut shnum = endian.read_uint(&self.data, shnum_off, 2) as usize;
+        let shoff = endian.read_uint(&self.data, c.e_shoff, word) as usize;
+        let got_shentsize = endian.read_uint(&self.data, c.e_shentsize, 2) as usize;
+        let mut shnum = endian.read_uint(&self.data, c.e_shnum, 2) as usize;
         if shoff == 0 {
             // No section-header table at all: a stripped image, which has no
             // symbol tables to read either.
@@ -638,7 +748,7 @@ impl Binary {
             if let Some(err) = outside(1, shoff.checked_add(shentsize)) {
                 return Err(err);
             }
-            shnum = endian.read_uint(&self.data, shoff + o_size, word) as usize;
+            shnum = endian.read_uint(&self.data, shoff + c.sh_size, word) as usize;
             if shnum == 0 {
                 return Ok(Vec::new());
             }
@@ -654,11 +764,11 @@ impl Binary {
                 Shdr {
                     sh_name: endian.read_uint(&self.data, off, 4) as u32,
                     sh_type: endian.read_uint(&self.data, off + 4, 4) as u32,
-                    sh_addr: endian.read_uint(&self.data, off + o_addr, word),
-                    sh_offset: endian.read_uint(&self.data, off + o_offset, word),
-                    sh_size: endian.read_uint(&self.data, off + o_size, word),
-                    sh_link: endian.read_uint(&self.data, off + o_link, 4) as u32,
-                    sh_entsize: endian.read_uint(&self.data, off + o_entsize, word),
+                    sh_addr: endian.read_uint(&self.data, off + c.sh_addr, word),
+                    sh_offset: endian.read_uint(&self.data, off + c.sh_offset, word),
+                    sh_size: endian.read_uint(&self.data, off + c.sh_size, word),
+                    sh_link: endian.read_uint(&self.data, off + c.sh_link, 4) as u32,
+                    sh_entsize: endian.read_uint(&self.data, off + c.sh_entsize, word),
                 }
             })
             .collect())
@@ -688,8 +798,9 @@ impl Binary {
         if shdrs.is_empty() {
             return None;
         }
-        let off = if self.is_64() { 0x3e } else { 0x32 };
-        let mut idx = self.endian.read_uint(&self.data, off, 2) as usize;
+        let mut idx = self
+            .endian
+            .read_uint(&self.data, self.class().e_shstrndx, 2) as usize;
         if idx == SHN_XINDEX as usize {
             idx = shdrs.first()?.sh_link as usize;
         }
@@ -713,31 +824,18 @@ impl Binary {
     /// here must see that edit.
     fn program_headers(&self) -> Result<Vec<Phdr>> {
         let endian = self.endian;
-        let is_64 = self.is_64();
-        // Header fields holding the table's location, and the entry layout of
-        // this ELF class. ELF32 has no `p_flags` between `p_type` and
-        // `p_offset`, so every field after the first sits elsewhere.
-        let (phoff_off, phentsize_off, phnum_off, phentsize, ehsize) = if is_64 {
-            (0x20, 0x36, 0x38, 56usize, 64usize)
-        } else {
-            (0x1c, 0x2a, 0x2c, 32usize, 52usize)
-        };
-        let (o_offset, o_vaddr, o_filesz, o_memsz, o_align) = if is_64 {
-            (8, 16, 32, 40, 48)
-        } else {
-            (4, 8, 16, 20, 28)
-        };
-        let word = if is_64 { 8 } else { 4 };
+        let c = self.class();
+        let (word, phentsize) = (c.word, c.phentsize);
 
-        if self.data.len() < ehsize {
+        if self.data.len() < c.ehsize {
             return Err(anyhow!(
                 "image is {} bytes, too short for an ELF header",
                 self.data.len()
             ));
         }
-        let phoff = endian.read_uint(&self.data, phoff_off, word) as usize;
-        let got_phentsize = endian.read_uint(&self.data, phentsize_off, 2) as usize;
-        let phnum = endian.read_uint(&self.data, phnum_off, 2) as usize;
+        let phoff = endian.read_uint(&self.data, c.e_phoff, word) as usize;
+        let got_phentsize = endian.read_uint(&self.data, c.e_phentsize, 2) as usize;
+        let phnum = endian.read_uint(&self.data, c.e_phnum, 2) as usize;
         if got_phentsize != phentsize {
             return Err(anyhow!("unexpected program-header entry size {got_phentsize}"));
         }
@@ -761,11 +859,11 @@ impl Binary {
                 Phdr {
                     entry_off: off,
                     p_type: endian.read_uint(&self.data, off, 4) as u32,
-                    p_offset: endian.read_uint(&self.data, off + o_offset, word),
-                    p_vaddr: endian.read_uint(&self.data, off + o_vaddr, word),
-                    p_filesz: endian.read_uint(&self.data, off + o_filesz, word),
-                    p_memsz: endian.read_uint(&self.data, off + o_memsz, word),
-                    p_align: endian.read_uint(&self.data, off + o_align, word),
+                    p_offset: endian.read_uint(&self.data, off + c.p_offset, word),
+                    p_vaddr: endian.read_uint(&self.data, off + c.p_vaddr, word),
+                    p_filesz: endian.read_uint(&self.data, off + c.p_filesz, word),
+                    p_memsz: endian.read_uint(&self.data, off + c.p_memsz, word),
+                    p_align: endian.read_uint(&self.data, off + c.p_align, word),
                 }
             })
             .collect())
@@ -991,16 +1089,9 @@ impl Binary {
 
         let endian = self.endian;
         let is_64 = self.is_64();
+        let c = self.class();
+        let (word, sym_size) = (c.word, c.symsize);
         let shdrs = self.section_headers()?;
-        // `Elf64_Sym` reorders its fields relative to `Elf32_Sym` rather than
-        // just widening them: the 32-bit form puts `st_value`/`st_size` before
-        // `st_info`/`st_other`/`st_shndx`, the 64-bit one after.
-        let (sym_size, o_value, o_info, o_shndx) = if is_64 {
-            (24usize, 8, 4, 6)
-        } else {
-            (16, 4, 12, 14)
-        };
-        let word = if is_64 { 8 } else { 4 };
 
         // 1 & 2: symbols the target defines itself.
         for kind in [SHT_SYMTAB, SHT_DYNSYM] {
@@ -1028,18 +1119,18 @@ impl Binary {
                 // Only `st_shndx` and `st_name` are read for every symbol of
                 // the target; the rest of the entry is read for the few that
                 // name something the link asked about.
-                if endian.read_uint(entry, o_shndx, 2) as u32 == SHN_UNDEF {
+                if endian.read_uint(entry, c.st_shndx, 2) as u32 == SHN_UNDEF {
                     continue;
                 }
                 let name_off = endian.read_uint(entry, 0, 4) as usize;
                 let Some(slot) = slot_for(&mut bound, &first_bytes, strtab, name_off) else {
                     continue;
                 };
-                let value = endian.read_uint(entry, o_value, word);
+                let value = endian.read_uint(entry, c.st_value, word);
                 if value == 0 {
                     continue;
                 }
-                let st_type = entry[o_info] & 0xf;
+                let st_type = entry[c.st_info] & 0xf;
                 bind(
                     slot,
                     match st_type {
@@ -1080,12 +1171,10 @@ impl Binary {
                 // A `Rela` carries an addend the `Rel` form leaves in the
                 // field; only its `r_info`, which holds the symbol index in
                 // its high bits, is read here.
-                let rela = jmprel.sh_type == SHT_RELA;
-                let rel_size = match (is_64, rela) {
-                    (true, true) => 24usize,
-                    (true, false) => 16,
-                    (false, true) => 12,
-                    (false, false) => 8,
+                let rel_size = if jmprel.sh_type == SHT_RELA {
+                    c.relasize
+                } else {
+                    c.relsize
                 };
                 let stride = (jmprel.sh_entsize as usize).max(rel_size);
                 let sym_stride =
@@ -1195,18 +1284,12 @@ impl Binary {
         }
         self.check_base_is_free(base, blob.len() as u64, align)?;
         let endian = self.endian;
-        let is_64 = self.is_64();
+        let c = self.class();
+        let phentsize = c.phentsize;
 
-        // Where the program-header table lives and how big its entries are, at
-        // class-dependent offsets in the ELF header. The no-PT_NOTE path below
+        // Where the program-header table lives. The no-PT_NOTE path below
         // appends an entry to the table and bumps the count.
-        let (phoff_off, phnum_off, phentsize) = if is_64 {
-            (0x20, 0x38, 56usize)
-        } else {
-            (0x1c, 0x2c, 32usize)
-        };
-        let word = if is_64 { 8 } else { 4 };
-        let phoff = endian.read_uint(&self.data, phoff_off, word) as usize;
+        let phoff = endian.read_uint(&self.data, c.e_phoff, c.word) as usize;
         let phdrs = self.program_headers()?;
         let phnum = phdrs.len();
 
@@ -1235,8 +1318,7 @@ impl Binary {
                     .unwrap_or(u64::MAX);
                 // Only the start of the section-header table matters here;
                 // its entry size and count are irrelevant to the padding gap.
-                let (eshoff_off, eshoff_w) = if is_64 { (0x28, 8) } else { (0x20, 4) };
-                let e_shoff = endian.read_uint(&self.data, eshoff_off, eshoff_w);
+                let e_shoff = endian.read_uint(&self.data, c.e_shoff, c.word);
                 if e_shoff > 0 {
                     first_claimed = first_claimed.min(e_shoff);
                 }
@@ -1261,7 +1343,7 @@ impl Binary {
                 if new_phnum > u16::MAX as usize {
                     return Err(anyhow!("program header count overflow"));
                 }
-                endian.write_uint(&mut self.data, phnum_off, 2, new_phnum as u64);
+                endian.write_uint(&mut self.data, c.e_phnum, 2, new_phnum as u64);
                 table_end as usize
             }
         };
@@ -1273,27 +1355,18 @@ impl Binary {
         let len = blob.len() as u64;
 
         // Rewrite the note phdr in place as a PT_LOAD covering the appended blob.
-        // The 32- and 64-bit program-header layouts differ in field order and
-        // width (notably `p_flags` moves from offset 4 to offset 24 in ELF32).
-        let flags = (PF_R | PF_X) as u64;
         let d = &mut self.data;
         endian.write_uint(d, note_off, 4, PT_LOAD as u64);
-        if is_64 {
-            endian.write_uint(d, note_off + 4, 4, flags);
-            endian.write_uint(d, note_off + 8, 8, file_off);
-            endian.write_uint(d, note_off + 16, 8, base);
-            endian.write_uint(d, note_off + 24, 8, base);
-            endian.write_uint(d, note_off + 32, 8, len);
-            endian.write_uint(d, note_off + 40, 8, len);
-            endian.write_uint(d, note_off + 48, 8, align);
-        } else {
-            endian.write_uint(d, note_off + 4, 4, file_off);
-            endian.write_uint(d, note_off + 8, 4, base);
-            endian.write_uint(d, note_off + 12, 4, base);
-            endian.write_uint(d, note_off + 16, 4, len);
-            endian.write_uint(d, note_off + 20, 4, len);
-            endian.write_uint(d, note_off + 24, 4, flags);
-            endian.write_uint(d, note_off + 28, 4, align);
+        endian.write_uint(d, note_off + c.p_flags, 4, (PF_R | PF_X) as u64);
+        for (field, value) in [
+            (c.p_offset, file_off),
+            (c.p_vaddr, base),
+            (c.p_paddr, base),
+            (c.p_filesz, len),
+            (c.p_memsz, len),
+            (c.p_align, align),
+        ] {
+            endian.write_uint(d, note_off + field, c.word, value);
         }
 
         Ok(())
@@ -1575,61 +1648,11 @@ mod tests {
     /// `(p_type, p_offset, p_vaddr, p_filesz, p_flags, p_align)`.
     type Phdr = (u64, u64, u64, u64, u64, u64);
 
-    /// Offsets and widths of the header fields the injection tests read and
-    /// write, for the given ELF class.
-    struct Layout {
-        phoff: u64,
-        phoff_off: usize,
-        phentsize_off: usize,
-        phnum_off: usize,
-        phentsize: usize,
-        word: usize,
-        /// Program-header field offsets. The field order differs between the
-        /// two classes (notably `p_flags`, which moves from 4 to 24 in ELF32).
-        p_offset: usize,
-        p_vaddr: usize,
-        p_filesz: usize,
-        p_flags: usize,
-        p_align: usize,
-    }
-
-    fn layout(is_64: bool) -> Layout {
-        if is_64 {
-            Layout {
-                phoff: 0x40,
-                phoff_off: 0x20,
-                phentsize_off: 0x36,
-                phnum_off: 0x38,
-                phentsize: 56,
-                word: 8,
-                p_offset: 8,
-                p_vaddr: 16,
-                p_filesz: 32,
-                p_flags: 4,
-                p_align: 48,
-            }
-        } else {
-            Layout {
-                phoff: 0x34,
-                phoff_off: 0x1c,
-                phentsize_off: 0x2a,
-                phnum_off: 0x2c,
-                phentsize: 32,
-                word: 4,
-                p_offset: 4,
-                p_vaddr: 8,
-                p_filesz: 16,
-                p_flags: 24,
-                p_align: 28,
-            }
-        }
-    }
-
     /// A `Binary` of `len` bytes carrying an ELF header of the class implied by
     /// `arch` plus `phdrs`, ready for `inject_segment`.
     fn craft_injectable(endian: Endian, arch: Architecture, len: usize, phdrs: &[Phdr]) -> Binary {
         let is_64 = arch.is_64();
-        let l = layout(is_64);
+        let l = Class::of(is_64);
         let mut d = vec![0u8; len];
         d[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
         d[4] = if is_64 { 2 } else { 1 };
@@ -1638,17 +1661,17 @@ mod tests {
             Endian::Big => 2,
         };
         d[6] = 1;
-        endian.write_uint(&mut d, l.phoff_off, l.word, l.phoff);
-        endian.write_uint(&mut d, l.phentsize_off, 2, l.phentsize as u64);
-        endian.write_uint(&mut d, l.phnum_off, 2, phdrs.len() as u64);
+        endian.write_uint(&mut d, l.e_phoff, l.word, l.ehsize as u64);
+        endian.write_uint(&mut d, l.e_phentsize, 2, l.phentsize as u64);
+        endian.write_uint(&mut d, l.e_phnum, 2, phdrs.len() as u64);
         for (i, &(p_type, p_off, p_vaddr, p_filesz, p_flags, p_align)) in phdrs.iter().enumerate() {
-            let po = l.phoff as usize + i * l.phentsize;
+            let po = l.ehsize + i * l.phentsize;
             endian.write_uint(&mut d, po, 4, p_type);
             endian.write_uint(&mut d, po + l.p_offset, l.word, p_off);
             endian.write_uint(&mut d, po + l.p_vaddr, l.word, p_vaddr);
-            endian.write_uint(&mut d, po + l.p_vaddr + l.word, l.word, p_vaddr); // p_paddr
+            endian.write_uint(&mut d, po + l.p_paddr, l.word, p_vaddr);
             endian.write_uint(&mut d, po + l.p_filesz, l.word, p_filesz);
-            endian.write_uint(&mut d, po + l.p_filesz + l.word, l.word, p_filesz); // p_memsz
+            endian.write_uint(&mut d, po + l.p_memsz, l.word, p_filesz);
             endian.write_uint(&mut d, po + l.p_flags, 4, p_flags);
             endian.write_uint(&mut d, po + l.p_align, l.word, p_align);
         }
@@ -1657,9 +1680,9 @@ mod tests {
 
     /// The file offset of every program header in `bin`.
     fn phdr_offsets(bin: &Binary) -> Vec<usize> {
-        let l = layout(bin.is_64());
-        let phoff = bin.endian().read_uint(bin.data(), l.phoff_off, l.word) as usize;
-        let phnum = bin.endian().read_uint(bin.data(), l.phnum_off, 2) as usize;
+        let l = bin.class();
+        let phoff = bin.endian().read_uint(bin.data(), l.e_phoff, l.word) as usize;
+        let phnum = bin.endian().read_uint(bin.data(), l.e_phnum, 2) as usize;
         (0..phnum).map(|i| phoff + i * l.phentsize).collect()
     }
 
@@ -1676,7 +1699,7 @@ mod tests {
     fn injected_phdr(bin: &Binary, base: u64, payload: &[u8]) -> usize {
         use goblin::elf::program_header::{PF_R, PF_X, PT_LOAD};
         let endian = bin.endian();
-        let l = layout(bin.is_64());
+        let l = bin.class();
 
         let mut found = None;
         for po in phdr_offsets(bin) {
@@ -1765,7 +1788,7 @@ mod tests {
 
         // The loader's constraints have to hold modulo the target's page size,
         // not 4K.
-        let l = layout(true);
+        let l = &ELF64;
         let po = injected_phdr(&bin, base, &PAYLOAD);
         let p_offset = bin.endian().read_uint(bin.data(), po + l.p_offset, l.word);
         assert_eq!(
@@ -1804,8 +1827,8 @@ mod tests {
 
             assert_eq!(ours.len(), elf.program_headers.len(), "{arch:?}");
             for (i, (o, g)) in ours.iter().zip(&elf.program_headers).enumerate() {
-                let layout = layout(arch.is_64());
-                assert_eq!(o.entry_off, layout.phoff as usize + i * layout.phentsize);
+                let layout = Class::of(arch.is_64());
+                assert_eq!(o.entry_off, layout.ehsize + i * layout.phentsize);
                 assert_eq!(
                     (o.p_type, o.p_offset, o.p_vaddr, o.p_filesz, o.p_memsz, o.p_align),
                     (
@@ -1830,8 +1853,8 @@ mod tests {
         use goblin::elf::program_header::PT_LOAD;
         let phdrs: [Phdr; 1] = [(PT_LOAD as u64, 0, 0x400000, 0x400, 5, 0x1000)];
         let mut bin = craft_injectable(Endian::Little, Architecture::X86_64, 0x400, &phdrs);
-        let l = layout(true);
-        bin.endian.write_uint(&mut bin.data, l.phnum_off, 2, 1000);
+        let l = &ELF64;
+        bin.endian.write_uint(&mut bin.data, l.e_phnum, 2, 1000);
 
         let err = bin.program_headers().unwrap_err().to_string();
         assert!(err.contains("runs past the end"), "{err}");
@@ -1897,8 +1920,8 @@ mod tests {
             (PT_LOAD as u64, 0x400, 0x420000, 0x40, 6, 0x1000),
         ];
         let mut bin = craft_injectable(Endian::Little, Architecture::X86_64, 0x440, &phdrs);
-        let l = layout(true);
-        let memsz_off = l.phoff as usize + l.phentsize + l.p_filesz + l.word;
+        let l = &ELF64;
+        let memsz_off = l.ehsize + l.phentsize + l.p_memsz;
         bin.endian.write_uint(&mut bin.data, memsz_off, l.word, 0x140);
 
         // `.data` still translates, right up to the end of the file-backed part.
@@ -2050,70 +2073,6 @@ mod tests {
     /// addresses are measured from.
     const PLT_ADDR: u64 = 0x0040_2000;
 
-    /// Offsets of the section-header and symbol-table fields [`craft_elf`]
-    /// writes, for the given ELF class. Both structures reorder their fields
-    /// between the classes rather than just widening them.
-    struct TabLayout {
-        shentsize: usize,
-        shoff_off: usize,
-        shentsize_off: usize,
-        shnum_off: usize,
-        shstrndx_off: usize,
-        sh_addr: usize,
-        sh_offset: usize,
-        sh_size: usize,
-        sh_link: usize,
-        sh_entsize: usize,
-        symsize: usize,
-        st_value: usize,
-        st_info: usize,
-        st_shndx: usize,
-        relasize: usize,
-        word: usize,
-    }
-
-    fn tab_layout(is_64: bool) -> TabLayout {
-        if is_64 {
-            TabLayout {
-                shentsize: 64,
-                shoff_off: 0x28,
-                shentsize_off: 0x3a,
-                shnum_off: 0x3c,
-                shstrndx_off: 0x3e,
-                sh_addr: 16,
-                sh_offset: 24,
-                sh_size: 32,
-                sh_link: 40,
-                sh_entsize: 56,
-                symsize: 24,
-                st_value: 8,
-                st_info: 4,
-                st_shndx: 6,
-                relasize: 24,
-                word: 8,
-            }
-        } else {
-            TabLayout {
-                shentsize: 40,
-                shoff_off: 0x20,
-                shentsize_off: 0x2e,
-                shnum_off: 0x30,
-                shstrndx_off: 0x32,
-                sh_addr: 12,
-                sh_offset: 16,
-                sh_size: 20,
-                sh_link: 24,
-                sh_entsize: 36,
-                symsize: 16,
-                st_value: 4,
-                st_info: 12,
-                st_shndx: 14,
-                relasize: 12,
-                word: 4,
-            }
-        }
-    }
-
     /// Build a goblin-parseable ELF executable, in the class and byte order
     /// `arch`/`endian` imply, whose `.symtab` holds `syms` — each given as
     /// `(name, st_type, st_value)` and defined in `.text` — and whose
@@ -2132,7 +2091,7 @@ mod tests {
     ) -> Binary {
         use goblin::elf::sym::{STT_FUNC, STT_SECTION};
         let is_64 = arch.is_64();
-        let l = tab_layout(is_64);
+        let l = Class::of(is_64);
 
         // A string table opens with the NUL that terminates the empty string,
         // which is what `st_name == 0` points at.
@@ -2234,10 +2193,10 @@ mod tests {
         endian.write_uint(&mut d, 0x14, 4, 1); // e_version
         endian.write_uint(&mut d, ehsize_off, 2, if is_64 { 64 } else { 52 });
         endian.write_uint(&mut d, phentsize_off, 2, if is_64 { 56 } else { 32 });
-        endian.write_uint(&mut d, l.shoff_off, l.word, shoff as u64);
-        endian.write_uint(&mut d, l.shentsize_off, 2, l.shentsize as u64);
-        endian.write_uint(&mut d, l.shnum_off, 2, shnum as u64);
-        endian.write_uint(&mut d, l.shstrndx_off, 2, (shnum - 1) as u64);
+        endian.write_uint(&mut d, l.e_shoff, l.word, shoff as u64);
+        endian.write_uint(&mut d, l.e_shentsize, 2, l.shentsize as u64);
+        endian.write_uint(&mut d, l.e_shnum, 2, shnum as u64);
+        endian.write_uint(&mut d, l.e_shstrndx, 2, (shnum - 1) as u64);
         for (at, bytes) in [
             (off_str, &strtab[..]),
             (off_sym, &symtab),
@@ -2426,21 +2385,22 @@ mod tests {
         );
 
         let mut bin = Binary::new(good.data.clone(), Architecture::X86_64, Endian::Little);
-        bin.endian.write_uint(&mut bin.data, 0x3c, 2, 1000); // e_shnum
+        bin.endian.write_uint(&mut bin.data, ELF64.e_shnum, 2, 1000);
         let err = bin.section_headers().unwrap_err().to_string();
         assert!(err.contains("runs past the end"), "{err}");
         // Reported by the lookup that needs the table, rather than panicking.
         assert!(bin.target_symbols(["f"]).is_err(), "{err}");
 
         let mut bin = Binary::new(good.data.clone(), Architecture::X86_64, Endian::Little);
-        bin.endian.write_uint(&mut bin.data, 0x3a, 2, 48); // e_shentsize
+        bin.endian
+            .write_uint(&mut bin.data, ELF64.e_shentsize, 2, 48);
         let err = bin.section_headers().unwrap_err().to_string();
         assert!(err.contains("entry size 48"), "{err}");
 
         // A stripped image has no table and no symbols to find in one, which is
         // not an error: the splice may need nothing from the target.
         let mut bin = Binary::new(good.data, Architecture::X86_64, Endian::Little);
-        bin.endian.write_uint(&mut bin.data, 0x28, 8, 0); // e_shoff
+        bin.endian.write_uint(&mut bin.data, ELF64.e_shoff, 8, 0);
         assert!(bin.section_headers().unwrap().is_empty());
         assert_eq!(bin.target_symbols(["f"]).unwrap().resolve("f").unwrap(), None);
     }
@@ -2457,9 +2417,9 @@ mod tests {
         let shnum = bin.section_headers().unwrap().len();
 
         let mut bin = Binary::new(bin.data, Architecture::X86_64, Endian::Little);
-        let shoff = bin.endian.read_uint(&bin.data, 0x28, 8) as usize;
-        bin.endian.write_uint(&mut bin.data, 0x3c, 2, 0); // e_shnum
-        bin.endian.write_uint(&mut bin.data, shoff + 32, 8, shnum as u64); // sh_size of [0]
+        let shoff = bin.endian.read_uint(&bin.data, ELF64.e_shoff, 8) as usize;
+        bin.endian.write_uint(&mut bin.data, ELF64.e_shnum, 2, 0);
+        bin.endian.write_uint(&mut bin.data, shoff + ELF64.sh_size, 8, shnum as u64); // of [0]
 
         assert_eq!(bin.section_headers().unwrap().len(), shnum);
         assert_eq!(goblin::elf::Elf::parse(bin.data()).unwrap().section_headers.len(), shnum);
@@ -2468,7 +2428,7 @@ mod tests {
 
         // A count that the image cannot hold is still refused, not trusted
         // because of where it was read from.
-        bin.endian.write_uint(&mut bin.data, shoff + 32, 8, u64::MAX);
+        bin.endian.write_uint(&mut bin.data, shoff + ELF64.sh_size, 8, u64::MAX);
         let err = bin.section_headers().unwrap_err().to_string();
         assert!(err.contains("runs past the end"), "{err}");
     }
