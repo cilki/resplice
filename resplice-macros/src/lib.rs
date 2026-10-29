@@ -21,6 +21,7 @@ use syn::{parse_macro_input, Expr, Item, Lit, Meta};
 /// replacement matches the calling convention the target's caller expects. Both
 /// are added automatically when absent, so the annotated function can be written
 /// as a plain `fn`; an explicitly written visibility or ABI is left untouched.
+/// Any other attribute on the item is kept as written.
 ///
 /// ```ignore
 /// #[Splice(begin = 0x1670, end = 0x1680)]
@@ -79,14 +80,17 @@ pub fn Splice(args: TokenStream, input: TokenStream) -> TokenStream {
                 input_fn.sig.abi = Some(syn::parse_quote!(extern "C"));
             }
 
-            let vis = &input_fn.vis;
-            let sig = &input_fn.sig;
-            let block = &input_fn.block;
-
+            // The function's own attributes are kept, like a `static`'s are.
+            // Rebuilding it from its visibility, signature and body alone used
+            // to drop every one of them without a word: `#[unsafe(naked)]`
+            // failed to compile ("`naked_asm!` can only be used in functions
+            // marked with `#[unsafe(naked)]`"), while `#[instruction_set]`,
+            // `#[target_feature]`, `#[inline(never)]` and doc comments
+            // compiled to a function without them.
             quote! {
                 #[unsafe(no_mangle)]
                 #[unsafe(link_section = #section)]
-                #vis #sig #block
+                #input_fn
             }
         }
         // A static is exported the same way so its initializer bytes land in
