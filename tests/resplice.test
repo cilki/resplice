@@ -4,21 +4,22 @@
 ## binary produces the new result.
 ##
 ## Precondition: run `cargo build --release` before invoking attest so the
-## `resplice` binary and `resplice-macros` artifacts already exist.
+## `resplice` binary and `resplice-macros` artifacts already exist. Then:
+##
+##     attest tests/resplice.test
 
-## Scratch directory for everything a case writes: the throwaway target binary
-## it patches, and the replacement crate whose `#[Splice]`s are the thing under
-## test. It sits under `target/`, so a run leaves the working tree as it found
-## it.
+## (Re)create the replacement crate, with no splices in it yet.
+##
+## `$fixture` is the scratch directory for everything a case writes: the
+## throwaway target binary it patches, and the replacement crate whose
+## `#[Splice]`s are the thing under test. It sits under `target/`, so a run
+## leaves the working tree as it found it.
 ##
 ## That replacement crate used to be `examples/adder`, the crate the README
 ## points a reader at for a complete example. Each case overwrote it with the
 ## splice it needed and left it that way, so a run ended with the example
 ## replaced by whichever scratch crate came last -- the deliberately missized
 ## data splice, which `resplice` refuses -- and the repository dirty.
-fixture=target/splice-fixture
-
-## (Re)create the replacement crate, with no splices in it yet.
 ##
 ## It is a crate of its own rather than a member of this workspace: nothing in
 ## it is checked in, and the `[workspace]` table keeps cargo from insisting that
@@ -26,14 +27,32 @@ fixture=target/splice-fixture
 ## depends on `resplice-macros` by path, as a real reimplementation crate would.
 ## Sharing the workspace's target directory keeps that dependency built once
 ## instead of once per case.
+##
+## Every case calls this first, so it is also where a case finds the
+## repository. attest starts each case in an empty scratch directory of its own
+## and runs only the functions in this file, not its top level -- so neither
+## the relative paths below (`target/release/resplice`, the fixture) nor a
+## top-level `fixture=` would mean anything there, and every case used to fail
+## on its first line with `mkdir: cannot create directory '/src'`. `$0` is this
+## file, so its parent is the repository root.
+##
+## attest also runs up to four cases at once, so each case gets a fixture --
+## and a crate name, and so an rlib in the shared target directory -- of its
+## own, named after the case. With one `target/splice-fixture` for all of them,
+## a case would patch its target with whichever crate another case had written
+## last.
 newFixture() {
+	cd "$(dirname "$0")/.."
+	crate=$(printf '%s' "${FUNCNAME[1]}" | tr '[:upper:]' '[:lower:]')
+	fixture=target/splice-fixture/$crate
+	rlib=target/release/lib$crate.rlib
 	mkdir -p "$fixture/src"
 	rm -f "$fixture/prog" "$fixture/prog.patched" "$fixture/prog.short" \
 		"$fixture/prog.bss" "$fixture/prog.lto" "$fixture/err"
-	printf '%s\n' '[workspace]' '' '[package]' 'name = "fixture"' \
+	printf '%s\n' '[workspace]' '' '[package]' "name = \"$crate\"" \
 		'version = "0.0.0"' 'edition = "2024"' 'publish = false' '' \
 		'[lib]' 'crate-type = ["rlib"]' '' '[dependencies]' \
-		'resplice-macros = { path = "../../resplice-macros" }' \
+		'resplice-macros = { path = "../../../resplice-macros" }' \
 		> "$fixture/Cargo.toml"
 }
 
@@ -47,7 +66,7 @@ buildFixture() {
 		cargo build --release --manifest-path "$fixture/Cargo.toml" \
 			--target-dir target
 	fi
-	[ -f target/release/libfixture.rlib ]
+	[ -f "$rlib" ]
 }
 
 ## Write `$fixture/compute.s`: a `compute` that returns 41, followed by `$1`
@@ -106,7 +125,7 @@ symRange() {
 
 ## Patch the throwaway target with every splice in the built rlib.
 applySplices() {
-	target/release/resplice "$fixture/prog" target/release/libfixture.rlib \
+	target/release/resplice "$fixture/prog" "$rlib" \
 		"$fixture/prog.patched"
 	chmod +x "$fixture/prog.patched"
 }
@@ -212,7 +231,7 @@ testSpliceResolvesHelperInAnotherCodegenUnit() {
 	buildFixture -C codegen-units=16 -C lto=no -C panic=abort
 	# Guard the premise: without more than one object member there is no
 	# cross-member reference left to resolve.
-	[ "$(ar t target/release/libfixture.rlib | grep -c '[.]o$')" -gt 1 ]
+	[ "$(ar t "$rlib" | grep -c '[.]o$')" -gt 1 ]
 
 	applySplices
 	[ "$("$fixture/prog.patched")" = "6001" ]
@@ -338,7 +357,7 @@ testSpliceRefusesAbsoluteReferenceIntoPieTarget() {
 	} > "$fixture/src/lib.rs"
 	buildFixture
 
-	! target/release/resplice "$fixture/prog" target/release/libfixture.rlib \
+	! target/release/resplice "$fixture/prog" "$rlib" \
 		"$fixture/prog.patched"
 	[ ! -e "$fixture/prog.patched" ]
 }
@@ -415,7 +434,7 @@ testDataSpliceReplacesTableAndRefusesAMissizedOne() {
 	printf 'use resplice_macros::Splice;\n#[Splice(begin = %d, end = %d)]\nstatic PRICES: [u32; 2] = [11, 22];\n' \
 		"$va" "$end" > "$fixture/src/lib.rs"
 	buildFixture
-	! target/release/resplice "$fixture/prog" target/release/libfixture.rlib \
+	! target/release/resplice "$fixture/prog" "$rlib" \
 		"$fixture/prog.short"
 	[ ! -e "$fixture/prog.short" ]
 }
@@ -454,7 +473,7 @@ testDataSpliceRefusesABssRangeAsBssNotAsUnmapped() {
 		"$va" "$end" > "$fixture/src/lib.rs"
 	buildFixture
 
-	! target/release/resplice "$fixture/prog" target/release/libfixture.rlib \
+	! target/release/resplice "$fixture/prog" "$rlib" \
 		"$fixture/prog.bss" 2> "$fixture/err"
 	[ ! -e "$fixture/prog.bss" ]
 	grep -q '`.bss`' "$fixture/err"
@@ -490,7 +509,7 @@ testRlibBuiltWithLtoIsRefusedNamingTheProfileSetting() {
 	printf '%s\n' '' '[profile.release]' 'lto = true' >> "$fixture/Cargo.toml"
 	buildFixture
 
-	! target/release/resplice "$fixture/prog" target/release/libfixture.rlib \
+	! target/release/resplice "$fixture/prog" "$rlib" \
 		"$fixture/prog.lto" 2> "$fixture/err"
 	[ ! -e "$fixture/prog.lto" ]
 	grep -q 'LLVM bitcode' "$fixture/err"
