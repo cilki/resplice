@@ -53,7 +53,14 @@ data, or call libc. `resplice` resolves those relocations recursively:
   up to point at their injected addresses. The segment needs a program header:
   an unused `PT_NOTE` is converted into a `PT_LOAD` when the target has one,
   otherwise the program-header table is grown by one entry into the padding
-  that follows it.
+  that follows it. When there is no such padding either, as in a shared
+  library linked without a build ID or the output of an earlier `resplice`
+  run, the table is copied, one entry longer, into the injected segment and
+  the ELF header (and `PT_PHDR`) pointed at the copy. An *executable* whose
+  table is moved needs Linux 5.18 or later to run: older kernels tell the
+  program its table is in the first segment, wherever it actually is. (A
+  shared library's table is found by the dynamic loader, which has no such
+  assumption.)
 - Calls to symbols the target already **defines or imports** (e.g. a libc
   function reachable through the PLT) bind to the target's own addresses. Two
   kinds of definition are reported rather than bound, because their `st_value`

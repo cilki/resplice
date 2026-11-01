@@ -1287,14 +1287,18 @@ impl Binary {
     /// Inject `blob` as a new read+execute segment mapped at virtual address
     /// `base`.
     ///
-    /// The segment needs a program header, and neither way of getting one
-    /// relocates the program-header table itself:
+    /// The segment needs a program header, which it gets the first way that
+    /// works:
     ///
     /// - An existing `PT_NOTE` entry is rewritten as a `PT_LOAD`, when the
     ///   target has one to spare.
     /// - Otherwise the table is grown by one entry into the padding that
     ///   follows it — many statically linked targets carry no `PT_NOTE` at all.
-    ///   A target with no such padding is refused.
+    /// - Otherwise — no padding, as in a shared library linked without a build
+    ///   ID or the output of an earlier run — the table is copied, one entry
+    ///   longer, into the injected segment behind `blob`, and `e_phoff` and
+    ///   `PT_PHDR` are pointed at the copy. The original table's bytes are left
+    ///   where they are, so nothing that follows them moves.
     ///
     /// `base` must be aligned to the target's page size (see
     /// [`injected_base`](Self::injected_base)); the file is padded to the same
@@ -1314,79 +1318,113 @@ impl Binary {
                  ({align:#x})"
             ));
         }
-        self.check_base_is_free(base, blob.len() as u64, align)?;
         let endian = self.endian;
         let c = self.class();
         let phentsize = c.phentsize;
 
-        // Where the program-header table lives. The no-PT_NOTE path below
-        // appends an entry to the table and bumps the count.
+        // Where the program-header table lives. The no-PT_NOTE paths below
+        // append an entry to the table and bump the count.
         let phoff = endian.read_uint(&self.data, c.e_phoff, c.word) as usize;
         let phdrs = self.program_headers()?;
         let phnum = phdrs.len();
+        let table_end = (phoff + phnum * phentsize) as u64;
 
-        // Find a PT_NOTE entry to repurpose.
-        let note_off = phdrs
-            .iter()
-            .find(|ph| ph.p_type == PT_NOTE)
-            .map(|ph| ph.entry_off);
-
-        // Many statically-linked targets carry no PT_NOTE at all,
-        // just REGINFO + a couple of PT_LOADs. Rather than give up, grow the
-        // program-header table by one entry into the padding gap between the
-        // table itself and the first file byte the target already occupies —
-        // the same trick linkers use to leave slack for PT_NOTE in the first
-        // place. This never touches bytes any parser needs, since it strictly
-        // stays inside currently-unclaimed padding.
-        let note_off = match note_off {
-            Some(off) => off,
-            None => {
-                let table_end = (phoff + phnum * phentsize) as u64;
-                // See `first_claimed_after` for why this cannot be answered
-                // from the program headers' own `p_offset`s.
-                let Some(first_claimed) = self.first_claimed_after(table_end)? else {
-                    return Err(anyhow!(
-                        "no PT_NOTE segment to convert, and the target has no section \
-                         headers and no segment past its program-header table, so \
-                         there is no way to tell whether the bytes after the table \
-                         are padding or content"
-                    ));
-                };
-                // A claim past the end of the file cannot vouch for bytes that
-                // are not there.
-                let gap = first_claimed.min(self.data.len() as u64) - table_end;
-                if gap < phentsize as u64 {
-                    return Err(anyhow!(
-                        "no PT_NOTE segment to convert, and insufficient padding to add \
-                         a new program header ({gap} bytes available, {phentsize} needed)"
-                    ));
+        // How the new program header gets a slot.
+        enum Slot {
+            /// Rewrite the `PT_NOTE` entry at this file offset.
+            Note(usize),
+            /// Grow the table in place, into the padding behind it.
+            Grow,
+            /// Move the table, plus the new entry, into the injected segment.
+            Move,
+        }
+        let slot = match phdrs.iter().find(|ph| ph.p_type == PT_NOTE) {
+            Some(ph) => Slot::Note(ph.entry_off),
+            // Many targets carry no PT_NOTE at all: statically linked ones
+            // (just REGINFO + a couple of PT_LOADs), shared libraries linked
+            // without a build ID, and the output of an earlier resplice run,
+            // which already converted the one there was. Growing the table by
+            // one entry into the padding between it and the first file byte
+            // the target already occupies is the same trick linkers use to
+            // leave slack for PT_NOTE in the first place, and never touches
+            // bytes any parser needs. See `first_claimed_after` for why that
+            // gap cannot be measured from the program headers' own
+            // `p_offset`s; a claim past the end of the file cannot vouch for
+            // bytes that are not there.
+            None => match self.first_claimed_after(table_end)? {
+                Some(first) if first.min(self.data.len() as u64) - table_end
+                    >= phentsize as u64 =>
+                {
+                    Slot::Grow
                 }
-
-                let new_phnum = phnum + 1;
-                if new_phnum > u16::MAX as usize {
-                    return Err(anyhow!("program header count overflow"));
-                }
-                endian.write_uint(&mut self.data, c.e_phnum, 2, new_phnum as u64);
-                // PT_PHDR describes the table, so it has to grow with it.
-                // Leaving it behind makes it contradict `e_phnum`, and every
-                // reader that trusts it -- `dl_iterate_phdr` in the target
-                // itself included -- stops one entry short of the segment just
-                // added.
-                let table_size = (new_phnum * phentsize) as u64;
-                for ph in phdrs.iter().filter(|ph| ph.p_type == PT_PHDR) {
-                    let off = ph.entry_off;
-                    endian.write_uint(&mut self.data, off + c.p_filesz, c.word, table_size);
-                    endian.write_uint(&mut self.data, off + c.p_memsz, c.word, table_size);
-                }
-                table_end as usize
-            }
+                // No padding, or no way to tell padding from content: leave
+                // the table's bytes where they are and give the loader a copy
+                // it can extend instead.
+                _ => Slot::Move,
+            },
         };
+        if !matches!(slot, Slot::Note(_)) && phnum + 1 > u16::MAX as usize {
+            return Err(anyhow!("program header count overflow"));
+        }
+
+        // A moved table sits behind the blob, at the alignment its entries'
+        // address-sized fields need, inside the same segment so it is mapped
+        // (the loader hands `AT_PHDR` to the program, and a shared library's
+        // `dl_iterate_phdr` entry points into its own mapping).
+        let moved_table_at = align_up(blob.len() as u64, c.word as u64);
+        let new_table_size = ((phnum + 1) * phentsize) as u64;
+        let len = match slot {
+            Slot::Move => moved_table_at + new_table_size,
+            _ => blob.len() as u64,
+        };
+        self.check_base_is_free(base, len, align)?;
 
         // Append the blob at a file offset congruent to `base` modulo `align`.
         let file_off = align_up(self.data.len() as u64, align);
         self.data.resize(file_off as usize, 0);
         self.data.extend_from_slice(blob);
-        let len = blob.len() as u64;
+
+        let note_off = match slot {
+            Slot::Note(off) => off,
+            Slot::Grow => table_end as usize,
+            Slot::Move => {
+                let new_phoff = file_off + moved_table_at;
+                self.data.resize(new_phoff as usize, 0);
+                self.data.extend_from_within(phoff..table_end as usize);
+                self.data.resize((new_phoff + new_table_size) as usize, 0);
+                endian.write_uint(&mut self.data, c.e_phoff, c.word, new_phoff);
+                // PT_PHDR says where the table is in memory, and the dynamic
+                // loader derives the executable's load bias from it, so it has
+                // to follow the table to its new home.
+                let delta = new_phoff as usize - phoff;
+                for ph in phdrs.iter().filter(|ph| ph.p_type == PT_PHDR) {
+                    let off = ph.entry_off + delta;
+                    let vaddr = base + moved_table_at;
+                    for (field, value) in [
+                        (c.p_offset, new_phoff),
+                        (c.p_vaddr, vaddr),
+                        (c.p_paddr, vaddr),
+                    ] {
+                        endian.write_uint(&mut self.data, off + field, c.word, value);
+                    }
+                }
+                (new_phoff + new_table_size) as usize - phentsize
+            }
+        };
+
+        if !matches!(slot, Slot::Note(_)) {
+            let new_phnum = phnum + 1;
+            endian.write_uint(&mut self.data, c.e_phnum, 2, new_phnum as u64);
+            // PT_PHDR describes the table, so it has to grow with it. Leaving
+            // it behind makes it contradict `e_phnum`, and every reader that
+            // trusts it -- `dl_iterate_phdr` in the target itself included --
+            // stops one entry short of the segment just added.
+            for ph in self.program_headers()?.iter().filter(|ph| ph.p_type == PT_PHDR) {
+                let off = ph.entry_off;
+                endian.write_uint(&mut self.data, off + c.p_filesz, c.word, new_table_size);
+                endian.write_uint(&mut self.data, off + c.p_memsz, c.word, new_table_size);
+            }
+        }
 
         // Rewrite the note phdr in place as a PT_LOAD covering the appended blob.
         let d = &mut self.data;
@@ -2210,8 +2248,11 @@ mod tests {
     /// gap that way declared it clear on a target whose `.text` began
     /// immediately after the table, and the new program header was written over
     /// the entry point -- with `resplice` reporting success.
+    ///
+    /// Such a target is now spliced by moving the table instead, and that must
+    /// not touch the content behind the old one either.
     #[test]
-    fn test_inject_segment_refuses_to_overwrite_content_after_the_table() {
+    fn test_inject_segment_moves_the_table_instead_of_overwriting_content() {
         use goblin::elf::program_header::PT_LOAD;
         // A freestanding `-nostdlib -static` executable, which is exactly the
         // no-PT_NOTE shape this fallback exists for: one PT_LOAD from file
@@ -2222,32 +2263,89 @@ mod tests {
         craft_sections(&mut bin, 0x300, &[(1 /* SHT_PROGBITS */, 0x78, 0x100)]);
         let before = bin.data().to_vec();
 
-        let msg = bin
-            .inject_segment(INJECT_AT, &PAYLOAD)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            msg.contains("no PT_NOTE") && msg.contains("padding"),
-            "{msg}"
-        );
-        assert_eq!(bin.data(), &before[..], "target must be left untouched");
+        bin.inject_segment(INJECT_AT, &PAYLOAD).unwrap();
+
+        // Everything past the ELF header -- the old table, `.text`, the
+        // section headers -- is exactly as it was.
+        let ehsize = bin.class().ehsize;
+        assert_eq!(&bin.data()[ehsize..before.len()], &before[ehsize..]);
+        assert_moved_table(&bin, INJECT_AT, &PAYLOAD, &phdrs);
     }
 
+    /// A target with no PT_NOTE and no padding at all -- a shared library
+    /// linked without a build ID, or the output of an earlier run, which
+    /// already spent its PT_NOTE -- gets its program-header table moved into
+    /// the injected segment. The PT_PHDR has to follow it there, since the
+    /// dynamic loader works out the executable's load bias from it.
     #[test]
-    fn test_inject_segment_no_note_no_room_errors() {
-        // When there's no PT_NOTE *and* no padding to grow into, injection
-        // must fail with a clear error instead of corrupting the file. The
-        // single PT_LOAD's content starts immediately after the table's one
-        // entry, so zero padding is available.
-        use goblin::elf::program_header::PT_LOAD;
-        let phdrs: [Phdr; 1] = [(PT_LOAD as u64, 0x40 + 56, 0x400000, 0x40, 5, 0x1000)];
-        let mut bin = craft_injectable(Endian::Little, Architecture::X86_64, 0x100, &phdrs);
-        let err = bin.inject_segment(INJECT_AT, &[0xde, 0xad]).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("no PT_NOTE") && msg.contains("padding"),
-            "{msg}"
-        );
+    fn test_inject_segment_moves_the_table_when_there_is_no_room() {
+        use goblin::elf::program_header::{PT_LOAD, PT_PHDR};
+        for (endian, arch) in [
+            (Endian::Little, Architecture::X86_64),
+            (Endian::Big, Architecture::Mips),
+        ] {
+            let l = Class::of(arch.is_64());
+            let table = (2 * l.phentsize) as u64;
+            let phoff = l.ehsize as u64;
+            let phdrs: [Phdr; 2] = [
+                (PT_PHDR as u64, phoff, 0x400000 + phoff, table, 4, 8),
+                (PT_LOAD as u64, 0, 0x400000, 0x400, 5, 0x1000),
+            ];
+            let mut bin = craft_injectable(endian, arch, 0x400, &phdrs);
+            // No section headers either, and nothing past the table that
+            // says where content begins: the gap cannot be measured.
+            bin.inject_segment(INJECT_AT, &PAYLOAD).unwrap();
+
+            let moved = assert_moved_table(&bin, INJECT_AT, &PAYLOAD, &phdrs);
+            let po = phdr_offsets(&bin)[0];
+            let read = |field| bin.endian().read_uint(bin.data(), po + field, l.word);
+            let new_table = (3 * l.phentsize) as u64;
+            assert_eq!(read(l.p_offset), moved as u64, "PT_PHDR p_offset ({arch:?})");
+            // Mapped where the segment maps it: right behind the 7-byte
+            // payload, rounded up to the class's word.
+            let vaddr = INJECT_AT + align_up(PAYLOAD.len() as u64, l.word as u64);
+            assert_eq!(read(l.p_vaddr), vaddr, "PT_PHDR p_vaddr ({arch:?})");
+            assert_eq!(read(l.p_filesz), new_table, "PT_PHDR p_filesz ({arch:?})");
+            assert_eq!(read(l.p_memsz), new_table, "PT_PHDR p_memsz ({arch:?})");
+        }
+    }
+
+    /// Check that `bin`'s program-header table was moved into the segment
+    /// injected at `base`: it holds `original`'s entries (the PT_PHDR's
+    /// location aside) followed by one R+X PT_LOAD mapping `payload` and the
+    /// table itself. Returns the table's new file offset.
+    fn assert_moved_table(bin: &Binary, base: u64, payload: &[u8], original: &[Phdr]) -> usize {
+        use goblin::elf::program_header::{PF_R, PF_X, PT_LOAD, PT_PHDR};
+        let (endian, l) = (bin.endian(), bin.class());
+        let phoff = endian.read_uint(bin.data(), l.e_phoff, l.word) as usize;
+        let offs = phdr_offsets(bin);
+        assert_eq!(offs.len(), original.len() + 1);
+        let read = |po: usize, field, size| endian.read_uint(bin.data(), po + field, size);
+
+        for (&po, &(p_type, p_off, _, p_filesz, p_flags, p_align)) in offs.iter().zip(original) {
+            assert_eq!(read(po, 0, 4), p_type);
+            assert_eq!(read(po, l.p_flags, 4), p_flags);
+            assert_eq!(read(po, l.p_align, l.word), p_align);
+            if p_type != PT_PHDR as u64 {
+                assert_eq!(read(po, l.p_offset, l.word), p_off);
+                assert_eq!(read(po, l.p_filesz, l.word), p_filesz);
+            }
+        }
+
+        let po = *offs.last().unwrap();
+        assert_eq!(read(po, 0, 4), PT_LOAD as u64);
+        assert_eq!(read(po, l.p_flags, 4), (PF_R | PF_X) as u64);
+        assert_eq!(read(po, l.p_vaddr, l.word), base);
+        let seg_off = read(po, l.p_offset, l.word) as usize;
+        let seg_len = read(po, l.p_filesz, l.word) as usize;
+        assert_eq!(read(po, l.p_memsz, l.word) as usize, seg_len);
+        assert_eq!(&bin.data()[seg_off..seg_off + payload.len()], payload);
+        // The table is mapped by the segment, behind the payload and aligned
+        // for its address-sized fields.
+        assert!(phoff >= seg_off + payload.len(), "table overlaps the payload");
+        assert_eq!(phoff % l.word, 0, "table misaligned");
+        assert_eq!(phoff + offs.len() * l.phentsize, seg_off + seg_len);
+        phoff
     }
 
     /// Virtual address of the one `.text` section in [`craft_with_symtab`]'s
