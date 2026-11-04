@@ -1383,7 +1383,8 @@ fn link_objects<'d>(
             let s = resolve(r.sym).with_context(context)?;
             let p = site_base + r.offset;
             let a = if r.has_implicit { 0 } else { r.addend };
-            let got_va = got.get(r.sym).map(|&(gva, _)| gva);
+            let mut got_va = got.get(r.sym).map(|&(gva, _)| gva);
+            let mut r_type = r.r_type;
 
             // An absolute address baked into a position-independent target is
             // wrong by its load base, and there is nothing left to correct it:
@@ -1418,18 +1419,36 @@ fn link_objects<'d>(
                     ))
                     .with_context(context);
                 }
-                // A GOT reference *could* be resolved without a slot, by
-                // relaxing the indirect load into the PC-relative form the
-                // linker's own relaxations produce (`mov rax, [rip+got]` ->
-                // `lea rax, [rip+sym]`, `adrp`+`ldr` -> `adrp`+`add`). That
-                // rewrites the splice's instructions rather than just filling
-                // in their fields, which nothing here does yet.
+                // A GOT slot holds an absolute address, so a GOT reference is
+                // relaxed into the PC-relative form a static linker produces
+                // for a symbol that cannot be preempted (`mov rax, [rip+got]`
+                // -> `lea rax, [rip+sym]`, `adrp`+`ldr` -> `adrp`+`add`). Every
+                // symbol a splice reaches is such a symbol. This is what lets a
+                // splice read or write a global of a PIE target: rustc reaches
+                // an `extern` static through the GOT whatever the relocation
+                // model. Only a form `arch::relax_got` does not recognise is
+                // still refused.
+                if got_va.is_some() {
+                    let buf: &mut [u8] = match bo {
+                        Some(bo) => &mut blob[bo..bo + sec.bytes.len()],
+                        None => &mut out,
+                    };
+                    if let Some(relaxed) =
+                        arch::relax_got(arch, endian, r_type, a, buf, r.offset as usize)
+                    {
+                        r_type = relaxed;
+                        got_va = None;
+                    }
+                }
                 if got_va.is_some() {
                     return Err(absolute_in_pie(
                         &format!(
                             "this reference goes through a GOT slot resplice \
                              synthesizes in the injected segment, which holds the \
-                             absolute address {s:#x}"
+                             absolute address {s:#x}, and relocation type {} is not \
+                             on an instruction resplice knows how to relax into a \
+                             PC-relative one",
+                            r_type.0
                         ),
                         "avoid the indirection: rustc routes a reference through \
                          the GOT when its definition is in another codegen unit, \
@@ -1456,7 +1475,7 @@ fn link_objects<'d>(
             arch::apply(
                 arch,
                 endian,
-                r.r_type,
+                r_type,
                 buf,
                 r.offset as usize,
                 s,
@@ -2253,6 +2272,11 @@ mod tests {
     /// point it at, so the linker has to synthesize a slot holding `TABLE`'s
     /// address and aim the load at that.
     fn build_rlib_got() -> Vec<u8> {
+        build_rlib_got_typed(object::elf::R_X86_64_REX_GOTPCRELX)
+    }
+
+    /// [`build_rlib_got`] with the GOT-style relocation of type `r_type`.
+    fn build_rlib_got_typed(r_type: object::elf::RelocationType) -> Vec<u8> {
         use object::write::{Object, Relocation, Symbol, SymbolSection as WSection};
         use object::{
             Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolFlags,
@@ -2284,9 +2308,7 @@ mod tests {
                 offset: 3,
                 symbol: table_sym,
                 addend: -4,
-                flags: RelocationFlags::Elf {
-                    r_type: object::elf::R_X86_64_REX_GOTPCRELX,
-                },
+                flags: RelocationFlags::Elf { r_type },
             },
         )
         .unwrap();
@@ -2335,8 +2357,14 @@ mod tests {
                 build_rlib_relro(".data.rel.ro.NAMES", 0),
                 ".data.rel.ro.NAMES",
             ),
-            // A synthesized GOT slot, which holds an address just the same.
-            ("rlib_pie_got", build_rlib_got(), "GOT slot"),
+            // A synthesized GOT slot, which holds an address just the same,
+            // when the instruction under it is not one `arch::relax_got` can
+            // turn PC-relative: plain `GOTPCREL` promises nothing about it.
+            (
+                "rlib_pie_got",
+                build_rlib_got_typed(object::elf::R_X86_64_GOTPCREL),
+                "GOT slot",
+            ),
         ] {
             let rlib_path = temp_path(tag);
             fs::write(&rlib_path, &rlib).unwrap();
@@ -2369,6 +2397,35 @@ mod tests {
         assert_eq!(applied.len(), 1);
         assert!(!applied[0].trampoline);
         assert_refs_resolved(&bin, 0x1000, SPLICE_VA);
+    }
+
+    /// A relaxable GOT reference into a position-independent target is turned
+    /// PC-relative instead of refused. rustc reaches every `extern` static --
+    /// which is how a splice names a global of the target -- through the GOT,
+    /// so refusing these left a PIE's globals out of reach altogether.
+    ///
+    /// `mov rax, [rip + TABLE@GOTPCREL]` must come out as
+    /// `lea rax, [rip + TABLE]`, its displacement aimed at the table itself.
+    #[test]
+    fn test_link_rlib_relaxes_a_got_load_in_a_pie_target() {
+        let (bin, applied) =
+            run_link_on(&crafted_pie_target(), "rlib_pie_relax", &build_rlib_got());
+        assert_eq!(applied.len(), 1);
+
+        let d = bin.data();
+        assert_eq!(
+            &d[0x1000..0x1003],
+            &[0x48, 0x8d, 0x05],
+            "mov was not relaxed to lea"
+        );
+        let disp = i32::from_le_bytes(d[0x1003..0x1007].try_into().unwrap());
+        let table_va = (SPLICE_VA as i64 + 7 + disp as i64) as u64;
+        assert!(
+            table_va >= INJECT_BASE,
+            "lea points at {table_va:#x}, not injected data"
+        );
+        let toff = bin.va_to_offset(table_va).unwrap();
+        assert_eq!(&d[toff..toff + table_data().len()], &table_data());
     }
 
     /// Link `rlib` into the crafted target and return the error it must produce.

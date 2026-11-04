@@ -334,7 +334,23 @@ link-time value, and whether that survives depends on what the reference holds:
   distance between any two of them is what it was. That covers calls into
   injected helpers, calls to functions the target imports through its PLT, the
   `adrp`/`lea` form of a data reference, and the trampoline of an oversized
-  splice — the bulk of what a replacement compiles into.
+  splice — the bulk of what a replacement compiles into. A load through the
+  GOT is turned into one of these (`adrp`+`ldr` becomes `adrp`+`add`, `mov`
+  becomes `lea`), which is how a splice reaches a global the target defines:
+  rustc always goes through the GOT for an `extern` static.
+
+  ```rust
+  unsafe extern "C" { static mut counter: i32; } // defined by the target
+
+  #[Splice(begin = 0x900, end = 0x920)]
+  unsafe fn bump(x: i32) -> i32 {
+      unsafe {
+          counter = counter.wrapping_add(x);
+          counter
+      }
+  }
+  ```
+
 - An **absolute** address does not. `resplice` emits no dynamic relocations, so
   nothing corrects it once the image is loaded. Such a reference is refused
   rather than written:
