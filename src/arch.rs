@@ -90,6 +90,91 @@ pub fn needs_got(arch: Architecture, r_type: RelocationType) -> bool {
     }
 }
 
+/// Rewrite a GOT-style reference at `off` so it computes the symbol's address
+/// PC-relatively instead of loading it from a GOT slot, returning the
+/// relocation type that now fills the rewritten instruction's field. `None`
+/// when the reference is not one of the forms recognised here; `buf` is left
+/// untouched in that case.
+///
+/// These are the relaxations a static linker performs for a symbol it knows
+/// cannot be preempted, and every symbol a splice reaches is one: it resolves
+/// either into the target or into the injected segment, both at link-time
+/// offsets that move together with the code referencing them. For a
+/// position-independent target that is the difference between working and
+/// not, because the slot `resplice` would otherwise synthesize holds an
+/// absolute address that nothing relocates at load time.
+///
+/// - aarch64: `adrp xN, :got:sym` is already an ADRP and only its page changes
+///   (`ADR_PREL_PG_HI21`); `ldr xT, [xN, :got_lo12:sym]` becomes
+///   `add xT, xN, :lo12:sym` (`ADD_ABS_LO12_NC`). Every GOT reference to a
+///   symbol is relaxed or the link refused, so an ADRP and its LDR never end up
+///   disagreeing about which page they address.
+/// - x86-64: a RIP-relative `mov reg, [rip + sym@GOTPCREL]` becomes
+///   `lea reg, [rip + sym]`, and `call [rip + sym@GOTPCREL]` becomes
+///   `addr32 call sym`, both `PC32`; the displacement field stays where it was
+///   and keeps its addend. Only the `GOTPCRELX` types promise the instruction
+///   is a relaxable one; plain `GOTPCREL` may sit under anything.
+///
+/// A nonzero addend on aarch64 addresses a byte past the start of the slot,
+/// which has no meaning once there is no slot, so it is not relaxed.
+pub fn relax_got(
+    arch: Architecture,
+    endian: Endian,
+    r_type: RelocationType,
+    a: i64,
+    buf: &mut [u8],
+    off: usize,
+) -> Option<RelocationType> {
+    match arch {
+        Architecture::Arm64 => {
+            if a != 0 || off.checked_add(4).is_none_or(|end| end > buf.len()) {
+                return None;
+            }
+            let insn = endian.read_uint(buf, off, 4) as u32;
+            match r_type {
+                // ADRP: op=1, bits 28:24 = 10000.
+                R_AARCH64_ADR_GOT_PAGE if insn & 0x9f00_0000 == 0x9000_0000 => {
+                    Some(R_AARCH64_ADR_PREL_PG_HI21)
+                }
+                // LDR Xt, [Xn, #imm12*8] -> ADD Xt, Xn, #0 (the relocation
+                // fills in the immediate).
+                R_AARCH64_LD64_GOT_LO12_NC if insn & 0xffc0_0000 == 0xf940_0000 => {
+                    let rn_rt = insn & 0x3ff;
+                    endian.write_uint(buf, off, 4, (0x9100_0000 | rn_rt) as u64);
+                    Some(R_AARCH64_ADD_ABS_LO12_NC)
+                }
+                _ => None,
+            }
+        }
+        Architecture::X86_64 => {
+            if !matches!(r_type, R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX)
+                || off < 2
+                || off.checked_add(4).is_none_or(|end| end > buf.len())
+            {
+                return None;
+            }
+            // ModRM must be RIP-relative (mod = 00, r/m = 101).
+            let (op, modrm) = (buf[off - 2], buf[off - 1]);
+            if modrm & 0xc7 != 0x05 {
+                return None;
+            }
+            match (op, modrm) {
+                // mov r, [rip+disp32] -> lea r, [rip+disp32]; a REX prefix,
+                // if any, carries over unchanged.
+                (0x8b, _) => buf[off - 2] = 0x8d,
+                // call [rip+disp32] (FF /2) -> addr32 call rel32.
+                (0xff, 0x15) if r_type == R_X86_64_GOTPCRELX => {
+                    buf[off - 2] = 0x67;
+                    buf[off - 1] = 0xe8;
+                }
+                _ => return None,
+            }
+            Some(R_X86_64_PC32)
+        }
+        _ => None,
+    }
+}
+
 /// Whether the field this relocation writes holds an absolute address, as
 /// opposed to a displacement (or a slice of one) that a uniform shift of the
 /// whole image leaves unchanged.
@@ -631,6 +716,91 @@ mod tests {
         assert_eq!(Endian::Big.read_uint(&b, 0, 4), 0x1122_3344);
         Endian::Little.write_uint(&mut b, 0, 8, 0x1122_3344_5566_7788);
         assert_eq!(Endian::Little.read_uint(&b, 0, 8), 0x1122_3344_5566_7788);
+    }
+
+    /// aarch64's GOT pair relaxes to `adrp` + `add` addressing the symbol
+    /// itself: `ldr x8, [x9, :got_lo12:sym]` becomes `add x8, x9, :lo12:sym`.
+    #[test]
+    fn aarch64_got_pair_relaxes_to_adrp_add() {
+        let (a, le) = (Architecture::Arm64, Endian::Little);
+        let p = 0x40_0000u64;
+        let s = 0x41_2345u64;
+
+        // adrp x8, 0 -- the instruction stays, only the relocation changes.
+        let mut adrp_buf = 0x9000_0008u32.to_le_bytes();
+        let t = relax_got(a, le, R_AARCH64_ADR_GOT_PAGE, 0, &mut adrp_buf, 0).unwrap();
+        assert_eq!(t, R_AARCH64_ADR_PREL_PG_HI21);
+        assert_eq!(u32::from_le_bytes(adrp_buf), 0x9000_0008);
+        apply(a, le, t, &mut adrp_buf, 0, s, 0, p, None, false, None).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(adrp_buf),
+            insn(
+                a,
+                le,
+                R_AARCH64_ADR_PREL_PG_HI21,
+                0x9000_0008,
+                s,
+                0,
+                p,
+                None,
+                false,
+                None
+            )
+        );
+
+        // ldr x8, [x9] -> add x8, x9, #0x345
+        let mut ldr_buf = 0xf940_0128u32.to_le_bytes();
+        let t = relax_got(a, le, R_AARCH64_LD64_GOT_LO12_NC, 0, &mut ldr_buf, 0).unwrap();
+        assert_eq!(t, R_AARCH64_ADD_ABS_LO12_NC);
+        apply(a, le, t, &mut ldr_buf, 0, s, 0, p + 4, None, false, None).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(ldr_buf),
+            0x9100_0000 | (0x345 << 10) | (9 << 5) | 8
+        );
+
+        // Not an LDR (here a 32-bit `ldr w8, [x9]`), or a nonzero addend: left
+        // alone, so the caller refuses the reference instead.
+        let mut w = 0xb940_0128u32.to_le_bytes();
+        assert!(relax_got(a, le, R_AARCH64_LD64_GOT_LO12_NC, 0, &mut w, 0).is_none());
+        assert_eq!(u32::from_le_bytes(w), 0xb940_0128);
+        let mut x = 0xf940_0128u32.to_le_bytes();
+        assert!(relax_got(a, le, R_AARCH64_LD64_GOT_LO12_NC, 8, &mut x, 0).is_none());
+        assert_eq!(u32::from_le_bytes(x), 0xf940_0128);
+    }
+
+    /// x86-64 relaxes the `GOTPCRELX` forms the ABI marks relaxable, and only
+    /// those: `mov` to `lea`, `call [rip+got]` to `addr32 call`.
+    #[test]
+    fn x86_64_got_loads_and_calls_relax() {
+        let (a, le) = (Architecture::X86_64, Endian::Little);
+
+        // mov rax, [rip+0] -> lea rax, [rip+0]
+        let mut mov = [0x48, 0x8b, 0x05, 0, 0, 0, 0];
+        assert_eq!(
+            relax_got(a, le, R_X86_64_REX_GOTPCRELX, -4, &mut mov, 3),
+            Some(R_X86_64_PC32)
+        );
+        assert_eq!(&mov[..3], &[0x48, 0x8d, 0x05]);
+
+        // call [rip+0] -> addr32 call rel32
+        let mut call = [0xff, 0x15, 0, 0, 0, 0];
+        assert_eq!(
+            relax_got(a, le, R_X86_64_GOTPCRELX, -4, &mut call, 2),
+            Some(R_X86_64_PC32)
+        );
+        assert_eq!(&call[..2], &[0x67, 0xe8]);
+
+        // Plain GOTPCREL, a non-RIP-relative operand, and a `jmp [rip+got]`
+        // are all left alone.
+        let mut plain = [0x48, 0x8b, 0x05, 0, 0, 0, 0];
+        assert!(relax_got(a, le, R_X86_64_GOTPCREL, -4, &mut plain, 3).is_none());
+        let mut sib = [0x8b, 0x04, 0, 0, 0, 0];
+        assert!(relax_got(a, le, R_X86_64_GOTPCRELX, -4, &mut sib, 2).is_none());
+        let mut jmp = [0xff, 0x25, 0, 0, 0, 0];
+        assert!(relax_got(a, le, R_X86_64_GOTPCRELX, -4, &mut jmp, 2).is_none());
+        assert_eq!((plain[1], sib[0], jmp[0]), (0x8b, 0x8b, 0xff));
+        // A field at the very start leaves no room for the opcode before it.
+        assert!(relax_got(a, le, R_X86_64_GOTPCRELX, -4, &mut [0; 4], 0).is_none());
     }
 
     /// `buf` is the relocation's own section, so a field that does not fit
