@@ -50,7 +50,11 @@ pub fn Splice(args: TokenStream, input: TokenStream) -> TokenStream {
     // which relies on `end - begin` as the length of the region being replaced.
     // A missing or reversed range has to be refused here, where the diagnostic
     // can point at the attribute that got it wrong.
-    let (begin, end) = match parse_range(meta_list) {
+    let range = match parse_range(meta_list) {
+        Ok(range) => range,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    let (begin, end) = match range {
         (Some(begin), Some(end)) if begin < end => (begin, end),
         (None, _) => return range_error(&item, "#[Splice] requires a `begin` address"),
         (_, None) => return range_error(&item, "#[Splice] requires an `end` address"),
@@ -73,6 +77,28 @@ pub fn Splice(args: TokenStream, input: TokenStream) -> TokenStream {
         // specified them, so the spliced code matches the target's calling
         // convention and is emitted as an external symbol.
         Item::Fn(mut input_fn) => {
+            // A function generic over types or consts is not code until it is
+            // instantiated, and `#[no_mangle]` cannot name an instantiation:
+            // rustc emits nothing for it, so the splice used to vanish from the
+            // rlib with no diagnostic at all, leaving the tool to report "no
+            // splices found". Lifetime parameters are erased and are fine.
+            if let Some(param) = input_fn
+                .sig
+                .generics
+                .params
+                .iter()
+                .find(|p| !matches!(p, syn::GenericParam::Lifetime(_)))
+            {
+                return syn::Error::new_spanned(
+                    param,
+                    "#[Splice] cannot apply to a function generic over types or consts: \
+                     rustc emits no code for it until it is instantiated, so there would be \
+                     nothing to splice. Write the replacement for the concrete types the \
+                     target uses",
+                )
+                .to_compile_error()
+                .into();
+            }
             if matches!(input_fn.vis, syn::Visibility::Inherited) {
                 input_fn.vis = syn::parse_quote!(pub);
             }
@@ -127,23 +153,76 @@ fn range_error(item: &Item, message: &str) -> TokenStream {
 
 /// Extract the `begin`/`end` integer addresses from a `#[Splice(..)]` argument
 /// list. Either may be missing (reported to the caller as `None`).
-fn parse_range(meta_list: impl IntoIterator<Item = Meta>) -> (Option<u64>, Option<u64>) {
+///
+/// Anything else in the list is an error spanned on the token at fault, not
+/// skipped. The address is the whole of what the macro is told, and every
+/// argument it used to pass over was a range the author meant and did not get.
+/// An unknown key or a non-literal value came out as "requires a `begin`
+/// address". A repeated key silently took its last value. A suffix was
+/// dropped, and Rust lexes `0X1000`, which has no `0X` prefix, as the literal
+/// `0` with suffix `X1000`, so that splice was aimed at address 0.
+fn parse_range(
+    meta_list: impl IntoIterator<Item = Meta>,
+) -> syn::Result<(Option<u64>, Option<u64>)> {
     let mut begin = None;
     let mut end = None;
     for meta in meta_list {
-        let Meta::NameValue(nv) = meta else { continue };
-        let slot = match nv.path.get_ident().map(|i| i.to_string()).as_deref() {
+        let Meta::NameValue(nv) = meta else {
+            return Err(syn::Error::new_spanned(
+                meta,
+                "expected `begin = <address>` or `end = <address>`",
+            ));
+        };
+        let key = nv.path.get_ident().map(|i| i.to_string());
+        let slot = match key.as_deref() {
             Some("begin") => &mut begin,
             Some("end") => &mut end,
-            _ => continue,
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    &nv.path,
+                    "unknown #[Splice] argument; expected `begin` or `end`",
+                ));
+            }
         };
-        if let Expr::Lit(expr_lit) = nv.value
-            && let Lit::Int(lit_int) = expr_lit.lit
-        {
-            *slot = lit_int.base10_parse().ok();
+        let key = key.unwrap();
+        if slot.is_some() {
+            return Err(syn::Error::new_spanned(
+                &nv.path,
+                format!("`{key}` is given more than once"),
+            ));
         }
+        let Expr::Lit(syn::ExprLit {
+            lit: Lit::Int(lit_int),
+            ..
+        }) = &nv.value
+        else {
+            return Err(syn::Error::new_spanned(
+                &nv.value,
+                format!("`{key}` must be an integer literal address, like `0x1000`"),
+            ));
+        };
+        match lit_int.suffix() {
+            "" | "u64" | "usize" => {}
+            s if lit_int.base10_digits() == "0" && s.starts_with(['X', 'B', 'O']) => {
+                return Err(syn::Error::new_spanned(
+                    lit_int,
+                    format!(
+                        "`0{s}` is the literal `0` with suffix `{s}`, not an address: \
+                         Rust's radix prefixes are lowercase -- write `0{}`",
+                        s.to_ascii_lowercase()
+                    ),
+                ));
+            }
+            s => {
+                return Err(syn::Error::new_spanned(
+                    lit_int,
+                    format!("unexpected suffix `{s}` on `{key}`; an address takes no suffix"),
+                ));
+            }
+        }
+        *slot = Some(lit_int.base10_parse::<u64>()?);
     }
-    (begin, end)
+    Ok((begin, end))
 }
 
 #[cfg(test)]
@@ -153,7 +232,12 @@ mod tests {
     use syn::punctuated::Punctuated;
 
     fn parse(input: Punctuated<Meta, syn::Token![,]>) -> (Option<u64>, Option<u64>) {
-        parse_range(input)
+        parse_range(input).unwrap()
+    }
+
+    /// The message `parse_range` refuses `input` with.
+    fn refusal(input: Punctuated<Meta, syn::Token![,]>) -> String {
+        parse_range(input).unwrap_err().to_string()
     }
 
     #[test]
@@ -162,14 +246,41 @@ mod tests {
             parse(parse_quote!(begin = 0x1000, end = 0x2000)),
             (Some(0x1000), Some(0x2000))
         );
+        assert_eq!(
+            parse(parse_quote!(end = 0x40_2000u64, begin = 4096usize)),
+            (Some(0x1000), Some(0x40_2000))
+        );
     }
 
     #[test]
-    fn missing_or_unknown_keys_yield_none() {
-        assert_eq!(
-            parse(parse_quote!(end = 0x2000, extra = 1)),
-            (None, Some(0x2000))
-        );
+    fn missing_keys_yield_none() {
+        assert_eq!(parse(parse_quote!(end = 0x2000)), (None, Some(0x2000)));
         assert_eq!(parse(parse_quote!()), (None, None));
+    }
+
+    /// `0X1000` is the literal `0` with suffix `X1000`; reading its digits
+    /// alone aimed the splice at address 0.
+    #[test]
+    fn uppercase_radix_prefix_is_refused_not_read_as_zero() {
+        let msg = refusal(parse_quote!(begin = 0X1000, end = 0x2000));
+        assert!(msg.contains("write `0x1000`"), "{msg}");
+        let msg = refusal(parse_quote!(begin = 0x1000, end = 0B11));
+        assert!(msg.contains("write `0b11`"), "{msg}");
+        let msg = refusal(parse_quote!(begin = 0x1000u8, end = 0x2000));
+        assert!(msg.contains("unexpected suffix `u8`"), "{msg}");
+    }
+
+    #[test]
+    fn unknown_repeated_and_non_literal_arguments_are_refused() {
+        let msg = refusal(parse_quote!(begin = 0x1000, ends = 0x2000));
+        assert!(msg.contains("unknown #[Splice] argument"), "{msg}");
+        let msg = refusal(parse_quote!(begin = 0x1000, end = 0x2000, begin = 0x10));
+        assert!(msg.contains("`begin` is given more than once"), "{msg}");
+        let msg = refusal(parse_quote!(begin = BASE, end = 0x2000));
+        assert!(msg.contains("must be an integer literal"), "{msg}");
+        let msg = refusal(parse_quote!(begin, end = 0x2000));
+        assert!(msg.contains("expected `begin = <address>`"), "{msg}");
+        let msg = refusal(parse_quote!(begin = 0x1_0000_0000_0000_0000, end = 0x2000));
+        assert!(msg.contains("too large"), "{msg}");
     }
 }
