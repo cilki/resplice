@@ -1256,13 +1256,33 @@ impl Binary {
     /// kernel maps whole pages, and the later mapping replaces the earlier one
     /// rather than being merged into it. Both ranges are therefore compared
     /// after rounding out to `align`, the target's page size.
+    ///
+    /// Those pages also have to end where the target can address them: below
+    /// 2^32 for an ELF32 target, whose `p_vaddr` is four bytes, and below 2^63
+    /// for an ELF64 one. The upper half of a 64-bit address space is the
+    /// kernel's on every architecture `resplice` supports, and it is also where
+    /// the PC-relative displacements in `arch::apply`, computed as `i64`, wrap:
+    /// a base there reads as a small *negative* address, so every reach check
+    /// passed. A base on the very last page also had its rounded end saturate
+    /// to the base, collapsing the claimed range to nothing. Either way
+    /// `resplice` reported success and the patched program segfaulted at
+    /// startup; on an ELF32 target a base past 4GB was truncated into
+    /// `p_vaddr` as written.
     fn check_base_is_free(&self, base: u64, len: u64, align: u64) -> Result<()> {
         use goblin::elf::program_header::PT_LOAD;
 
-        let end = base.checked_add(len).ok_or_else(|| {
-            anyhow!("injected segment at {base:#x} runs past the end of the address space")
-        })?;
-        let claimed_end = align_up(end, align);
+        let limit: u128 = if self.arch.is_64() { 1 << 63 } else { 1 << 32 };
+        let end = base as u128 + len as u128;
+        let claimed_end = (end + align as u128 - 1) & !(align as u128 - 1);
+        if claimed_end > limit {
+            return Err(anyhow!(
+                "injected segment {base:#x}..{end:#x} runs past {limit:#x}, the \
+                 highest address the target can place it below (its pages, rounded out to \
+                 {align:#x}, end at {claimed_end:#x}); choose a lower --inject-base"
+            ));
+        }
+        // Both fit: `end <= claimed_end <= limit <= 2^63`.
+        let (end, claimed_end) = (end as u64, claimed_end as u64);
 
         for ph in self.program_headers()? {
             if ph.p_type != PT_LOAD {
@@ -2198,6 +2218,39 @@ mod tests {
             !phdr_types(&bin).contains(&(PT_NOTE as u64)),
             "PT_NOTE should have been consumed"
         );
+    }
+
+    /// A segment that does not fit below the top of the target's usable
+    /// address space has to be refused. A real run against an aarch64 PIE with
+    /// `--inject-base 0xfffffffffffe0000` reported three applied splices for a
+    /// binary that segfaulted at startup: the base read as a small negative
+    /// address to the `i64` reach checks, and on the last page the rounded end
+    /// saturated, so the overlap check saw an empty range.
+    #[test]
+    fn test_inject_segment_rejects_base_past_the_address_space() {
+        use goblin::elf::program_header::{PT_LOAD, PT_NOTE};
+
+        // (arch, refused base, the highest base that still fits)
+        for (arch, refused, highest) in [
+            (Architecture::X86_64, 0xffff_ffff_ffff_f000u64, 0x7fff_ffff_ffff_f000),
+            (Architecture::Arm64, 0xffff_ffff_fffe_0000, 0x7fff_ffff_ffff_f000),
+            (Architecture::X86_64, 0x8000_0000_0000_0000, 0x7fff_ffff_ffff_f000),
+            // An ELF32 `p_vaddr` is four bytes: a base past 4GB used to be
+            // truncated into it.
+            (Architecture::X86, 0x1_0040_0000, 0xffff_f000),
+        ] {
+            let phdrs: [Phdr; 2] = [
+                (PT_LOAD as u64, 0, 0x400000, 0x400, 5, 0x1000),
+                (PT_NOTE as u64, 0x100, 0x400100, 0x20, 4, 4),
+            ];
+            let mut bin = craft_injectable(Endian::Little, arch, 0x400, &phdrs);
+            let err = bin.inject_segment(refused, &PAYLOAD).unwrap_err().to_string();
+            assert!(err.contains("highest address"), "{arch:?} {refused:#x}: {err}");
+
+            // The last page below the limit is still accepted.
+            bin.inject_segment(highest, &PAYLOAD).unwrap();
+            injected_phdr(&bin, highest, &PAYLOAD);
+        }
     }
 
     /// A `PT_PHDR` must not be mistaken for content blocking the growth of the
