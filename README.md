@@ -193,8 +193,9 @@ An oversized one would be relocated into the injected segment and reached by a
 jump written at `begin`, leaving a branch instruction where the target expects a
 table; an undersized one would have the rest of its range filled with NOP
 *instructions*. Any other kind of item is a compile error — `#[Splice]` accepts
-only `fn` and `static`, and not a `fn` generic over types or consts, which
-rustc emits no code for until something instantiates it.
+only `fn` and `static`, and not a `fn` generic over types or consts (including
+one taking an `impl Trait` argument), which rustc emits no code for until
+something instantiates it.
 
 The range also has to be one the image actually holds bytes for. A
 zero-initialized table lives in `.bss`, which the loader creates out of nothing
