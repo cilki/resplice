@@ -60,6 +60,10 @@ pub struct TargetSymbols<'n> {
     /// One entry per name asked about, `None` for a name the target neither
     /// defines nor imports.
     bound: HashMap<&'n str, Option<Binding>>,
+    /// Whether the target has no `.symtab`, i.e. it was stripped. Only its
+    /// `.dynsym` and PLT were searched then, so a name the target defines but
+    /// does not export was never visible -- not absent.
+    stripped: bool,
 }
 
 /// Record `binding` for a name in the map [`Binary::target_symbols`] builds.
@@ -81,6 +85,13 @@ fn bind(slot: &mut Option<Binding>, binding: Binding) {
 }
 
 impl TargetSymbols<'_> {
+    /// Whether the target was stripped of its `.symtab`, so that a name
+    /// [`resolve`](Self::resolve) found nothing for may still be something
+    /// the target defines internally, just no longer by name.
+    pub fn stripped(&self) -> bool {
+        self.stripped
+    }
+
     /// What the target offers for `name`: its address, `None` when the target
     /// neither defines nor imports it, or an error when what it defines is not
     /// something a reference can be pointed at (see [`Binding`]).
@@ -1134,7 +1145,10 @@ impl Binary {
         let mut bound: HashMap<&'n str, Option<Binding>> =
             names.into_iter().map(|name| (name, None)).collect();
         if bound.is_empty() {
-            return Ok(TargetSymbols { bound });
+            return Ok(TargetSymbols {
+                bound,
+                stripped: false,
+            });
         }
 
         // A 256-bit set of the first byte of every name asked about, which is
@@ -1266,7 +1280,8 @@ impl Binary {
             }
         }
 
-        Ok(TargetSymbols { bound })
+        let stripped = !shdrs.iter().any(|sh| sh.sh_type == SHT_SYMTAB);
+        Ok(TargetSymbols { bound, stripped })
     }
 
     /// Verify that `[base, base + len)` does not collide with the target's own
@@ -2869,6 +2884,37 @@ mod tests {
             assert_eq!(found.resolve("helper").unwrap(), Some(want), "{arch:?}");
             assert_eq!(found.resolve("absent").unwrap(), None, "{arch:?}");
         }
+    }
+
+    /// A target without `.symtab` has lost the names of everything it does not
+    /// export, so a name missing from it may well be defined there. That is
+    /// what lets the caller tell "stripped" apart from "absent" when it
+    /// reports the reference, rather than claiming the target lacks a
+    /// definition that the strip only made invisible.
+    #[test]
+    fn target_symbols_report_a_stripped_target() {
+        use goblin::elf::section_header::{SHT_PROGBITS, SHT_SYMTAB};
+        use goblin::elf::sym::STT_FUNC;
+        let bin = craft_with_symtab(&[("helper", STT_FUNC, 0x40_1100)]);
+        let found = bin.target_symbols(["helper"]).unwrap();
+        assert!(!found.stripped());
+        assert_eq!(found.resolve("helper").unwrap(), Some(0x40_1100));
+
+        // `strip` removes `.symtab`; retyping its header has the same effect
+        // on what the lookup can see.
+        let l = Class::of(true);
+        let mut d = bin.data().to_vec();
+        let shoff = Endian::Little.read_uint(&d, l.e_shoff, l.word) as usize;
+        let symtab = (1..)
+            .map(|i| shoff + i * l.shentsize)
+            .find(|&sh| Endian::Little.read_uint(&d, sh + 4, 4) == SHT_SYMTAB as u64)
+            .unwrap();
+        Endian::Little.write_uint(&mut d, symtab + 4, 4, SHT_PROGBITS as u64);
+        let stripped = Binary::new(d, Architecture::X86_64, Endian::Little);
+
+        let found = stripped.target_symbols(["helper"]).unwrap();
+        assert!(found.stripped());
+        assert_eq!(found.resolve("helper").unwrap(), None);
     }
 
     /// A function the target does not define but *imports* is reached through

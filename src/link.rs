@@ -1265,14 +1265,29 @@ fn link_objects<'d>(
             Ok(base_va + s.value)
         } else if s.undefined {
             target_syms.resolve(s.name)?.ok_or_else(|| {
+                // A stripped target is the usual thing to reverse engineer,
+                // and the one where "the target does not define it" is most
+                // often wrong: without `.symtab` only the names it exports
+                // are left, so a global or function it keeps to itself
+                // cannot be found however certainly it is there.
+                let stripped = if target_syms.stripped() {
+                    " by any name still in it: the target has no `.symtab` (it was \
+                     stripped), so only the symbols it exports (`.dynsym`) and the \
+                     functions it imports could be searched, and a function or \
+                     global it defines without exporting it cannot be found by name. \
+                     Splice an unstripped build of the target if there is one, or \
+                     reach the definition through its address instead of its name"
+                } else {
+                    ""
+                };
                 anyhow!(
                     "unresolved external symbol {:?}: no member of the rlib defines \
-                     it, and the target neither defines nor imports it. A splice can \
-                     only reach what its own rlib was compiled from, or a symbol the \
-                     target itself provides; a precompiled `core`/`std` (or any other \
-                     crate's) rlib is not read, so the `core::panicking` entry points \
-                     a bounds check, an overflow check or an `unwrap` compiles into \
-                     cannot be resolved either",
+                     it, and the target neither defines nor imports it{stripped}. A \
+                     splice can only reach what its own rlib was compiled from, or a \
+                     symbol the target itself provides; a precompiled `core`/`std` \
+                     (or any other crate's) rlib is not read, so the `core::panicking` \
+                     entry points a bounds check, an overflow check or an `unwrap` \
+                     compiles into cannot be resolved either",
                     s.name
                 )
             })
