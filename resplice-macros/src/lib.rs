@@ -99,6 +99,21 @@ pub fn Splice(args: TokenStream, input: TokenStream) -> TokenStream {
                 .to_compile_error()
                 .into();
             }
+            // `impl Trait` in argument position is the same thing spelled
+            // without a `<T>`: each one is an anonymous type parameter, so the
+            // function is just as generic and vanished from the rlib just as
+            // silently.
+            if let Some(ty) = arg_position_impl_trait(&input_fn.sig) {
+                return syn::Error::new_spanned(
+                    ty,
+                    "#[Splice] cannot apply to a function taking `impl Trait`: each one is \
+                     an anonymous type parameter, so the function is generic and rustc emits \
+                     no code for it until it is instantiated. Write the replacement for the \
+                     concrete types the target uses",
+                )
+                .to_compile_error()
+                .into();
+            }
             if matches!(input_fn.vis, syn::Visibility::Inherited) {
                 input_fn.vis = syn::parse_quote!(pub);
             }
@@ -142,6 +157,32 @@ pub fn Splice(args: TokenStream, input: TokenStream) -> TokenStream {
     };
 
     TokenStream::from(expanded)
+}
+
+/// The first `impl Trait` among `sig`'s argument types, however deeply nested
+/// (`&impl Copy`, `Option<impl Fn()>`, ...).
+///
+/// Expressions are not entered: an `impl Trait` inside an array length or a
+/// const argument belongs to whatever item that expression defines, not to the
+/// signature.
+fn arg_position_impl_trait(sig: &syn::Signature) -> Option<&syn::TypeImplTrait> {
+    use syn::visit::Visit;
+
+    struct Find<'a>(Option<&'a syn::TypeImplTrait>);
+    impl<'a> Visit<'a> for Find<'a> {
+        fn visit_type_impl_trait(&mut self, ty: &'a syn::TypeImplTrait) {
+            self.0.get_or_insert(ty);
+        }
+        fn visit_expr(&mut self, _: &'a Expr) {}
+    }
+
+    let mut find = Find(None);
+    for input in &sig.inputs {
+        if let syn::FnArg::Typed(arg) = input {
+            find.visit_type(&arg.ty);
+        }
+    }
+    find.0
 }
 
 /// A compile error about the `#[Splice]` range, spanned on the annotated item.
@@ -250,6 +291,18 @@ mod tests {
             parse(parse_quote!(end = 0x40_2000u64, begin = 4096usize)),
             (Some(0x1000), Some(0x40_2000))
         );
+    }
+
+    /// An argument-position `impl Trait` makes the function generic, wherever
+    /// in the argument's type it appears; a return-position one does not.
+    #[test]
+    fn finds_impl_trait_in_argument_types_only() {
+        let found = |sig: syn::Signature| arg_position_impl_trait(&sig).is_some();
+        assert!(found(parse_quote!(fn f(x: impl Copy) -> i32)));
+        assert!(found(parse_quote!(fn f(a: i32, x: &[Option<impl Fn()>]))));
+        assert!(!found(parse_quote!(fn f(x: &i32, y: *const u8) -> i32)));
+        assert!(!found(parse_quote!(fn f() -> impl Copy)));
+        assert!(!found(parse_quote!(fn f(x: [u8; { fn g(_: impl Copy) {} 4 }]))));
     }
 
     #[test]

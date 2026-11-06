@@ -9,6 +9,6 @@ license = "Unlicense"
 proc-macro = true
 
 [dependencies]
-syn = { version = "3.0", features = ["full"] }
+syn = { version = "3.0", features = ["full", "visit"] }
 quote = "1.0"
 proc-macro2 = "1.0"
