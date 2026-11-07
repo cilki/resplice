@@ -199,7 +199,8 @@ table; an undersized one would have the rest of its range filled with NOP
 *instructions*. Any other kind of item is a compile error — `#[Splice]` accepts
 only `fn` and `static`, and not a `fn` generic over types or consts (including
 one taking an `impl Trait` argument), which rustc emits no code for until
-something instantiates it.
+something instantiates it. Nor an `async fn`, whose compiled code only builds a
+future and returns it without running the body.
 
 The range also has to be one the image actually holds bytes for. A
 zero-initialized table lives in `.bss`, which the loader creates out of nothing

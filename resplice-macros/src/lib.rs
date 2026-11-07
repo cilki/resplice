@@ -77,42 +77,8 @@ pub fn Splice(args: TokenStream, input: TokenStream) -> TokenStream {
         // specified them, so the spliced code matches the target's calling
         // convention and is emitted as an external symbol.
         Item::Fn(mut input_fn) => {
-            // A function generic over types or consts is not code until it is
-            // instantiated, and `#[no_mangle]` cannot name an instantiation:
-            // rustc emits nothing for it, so the splice used to vanish from the
-            // rlib with no diagnostic at all, leaving the tool to report "no
-            // splices found". Lifetime parameters are erased and are fine.
-            if let Some(param) = input_fn
-                .sig
-                .generics
-                .params
-                .iter()
-                .find(|p| !matches!(p, syn::GenericParam::Lifetime(_)))
-            {
-                return syn::Error::new_spanned(
-                    param,
-                    "#[Splice] cannot apply to a function generic over types or consts: \
-                     rustc emits no code for it until it is instantiated, so there would be \
-                     nothing to splice. Write the replacement for the concrete types the \
-                     target uses",
-                )
-                .to_compile_error()
-                .into();
-            }
-            // `impl Trait` in argument position is the same thing spelled
-            // without a `<T>`: each one is an anonymous type parameter, so the
-            // function is just as generic and vanished from the rlib just as
-            // silently.
-            if let Some(ty) = arg_position_impl_trait(&input_fn.sig) {
-                return syn::Error::new_spanned(
-                    ty,
-                    "#[Splice] cannot apply to a function taking `impl Trait`: each one is \
-                     an anonymous type parameter, so the function is generic and rustc emits \
-                     no code for it until it is instantiated. Write the replacement for the \
-                     concrete types the target uses",
-                )
-                .to_compile_error()
-                .into();
+            if let Err(e) = check_signature(&input_fn.sig) {
+                return e.to_compile_error().into();
             }
             if matches!(input_fn.vis, syn::Visibility::Inherited) {
                 input_fn.vis = syn::parse_quote!(pub);
@@ -157,6 +123,58 @@ pub fn Splice(args: TokenStream, input: TokenStream) -> TokenStream {
     };
 
     TokenStream::from(expanded)
+}
+
+/// Refuse a function signature whose compiled code would not be the body the
+/// author wrote, spanned on the part of the signature at fault.
+fn check_signature(sig: &syn::Signature) -> syn::Result<()> {
+    // An `async fn` compiles to a function that builds the future and returns
+    // it without running a line of the body; the body only runs when something
+    // polls that future. The target's caller expects the result, not a future,
+    // so it got whatever the future's bytes happened to be -- `async fn f() ->
+    // i32 { 1 }` compiles to `mov x0, xzr; ret` on aarch64 -- and the splice
+    // applied without complaint. rustc only warns that the return type is not
+    // FFI-safe.
+    if let Some(asyncness) = sig.asyncness {
+        return Err(syn::Error::new_spanned(
+            asyncness,
+            "#[Splice] cannot apply to an `async fn`: calling one only builds a future \
+             and returns it, without running the body, so the target's caller would get \
+             the future's bytes instead of the result. Remove `async`",
+        ));
+    }
+    // A function generic over types or consts is not code until it is
+    // instantiated, and `#[no_mangle]` cannot name an instantiation: rustc
+    // emits nothing for it, so the splice used to vanish from the rlib with no
+    // diagnostic at all, leaving the tool to report "no splices found".
+    // Lifetime parameters are erased and are fine.
+    if let Some(param) = sig
+        .generics
+        .params
+        .iter()
+        .find(|p| !matches!(p, syn::GenericParam::Lifetime(_)))
+    {
+        return Err(syn::Error::new_spanned(
+            param,
+            "#[Splice] cannot apply to a function generic over types or consts: \
+             rustc emits no code for it until it is instantiated, so there would be \
+             nothing to splice. Write the replacement for the concrete types the \
+             target uses",
+        ));
+    }
+    // `impl Trait` in argument position is the same thing spelled without a
+    // `<T>`: each one is an anonymous type parameter, so the function is just
+    // as generic and vanished from the rlib just as silently.
+    if let Some(ty) = arg_position_impl_trait(sig) {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "#[Splice] cannot apply to a function taking `impl Trait`: each one is \
+             an anonymous type parameter, so the function is generic and rustc emits \
+             no code for it until it is instantiated. Write the replacement for the \
+             concrete types the target uses",
+        ));
+    }
+    Ok(())
 }
 
 /// The first `impl Trait` among `sig`'s argument types, however deeply nested
@@ -302,7 +320,24 @@ mod tests {
         assert!(found(parse_quote!(fn f(a: i32, x: &[Option<impl Fn()>]))));
         assert!(!found(parse_quote!(fn f(x: &i32, y: *const u8) -> i32)));
         assert!(!found(parse_quote!(fn f() -> impl Copy)));
-        assert!(!found(parse_quote!(fn f(x: [u8; { fn g(_: impl Copy) {} 4 }]))));
+        assert!(!found(
+            parse_quote!(fn f(x: [u8; { fn g(_: impl Copy) {} 4 }]))
+        ));
+    }
+
+    /// An `async fn` compiles to code that returns a future without running
+    /// the body, and a generic one to no code at all; qualifiers and lifetimes
+    /// that do not change what the code is are accepted.
+    #[test]
+    fn signatures_whose_code_is_not_the_body_are_refused() {
+        let refused = |sig: syn::Signature| check_signature(&sig).unwrap_err().to_string();
+        assert!(refused(parse_quote!(async fn f() -> i32)).contains("`async fn`"));
+        assert!(
+            refused(parse_quote!(async unsafe fn f(p: *const u8) -> i32)).contains("`async fn`")
+        );
+        assert!(refused(parse_quote!(fn f<T>(x: T))).contains("generic"));
+        assert!(refused(parse_quote!(fn f(x: impl Copy))).contains("`impl Trait`"));
+        assert!(check_signature(&parse_quote!(const unsafe fn f<'a>(x: &'a i32) -> i32)).is_ok());
     }
 
     #[test]
