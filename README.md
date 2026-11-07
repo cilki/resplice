@@ -332,6 +332,8 @@ the relocated site -- for a reference into the injected segment, choose an
 
 Note that the segment is mapped read+execute, so referenced *writable* data
 (mutable `static`s, `.bss`) is not supported yet and is reported as an error.
+Neither is a thread-local (`thread_local!`): it lives in each thread's TLS
+block, which `resplice` cannot add to, so it is refused by name too.
 
 ### Position-independent targets
 

@@ -379,6 +379,9 @@ impl<T> std::ops::Index<(usize, usize)> for IdTable<T> {
 struct Sec<'d> {
     align: u64,
     writable: bool,
+    /// Whether the section is a thread-local template (`SHF_TLS`: `.tdata`,
+    /// `.tbss`). See [`link_objects`] for why one is refused.
+    tls: bool,
     /// Whether the section holds machine code (`SHF_EXECINSTR`). A `#[Splice]`
     /// on a `fn` lands in an executable section, one on a `static` does not,
     /// and the two cannot be patched the same way. See [`link_objects`].
@@ -772,6 +775,7 @@ fn sec_header<'d, S: ObjectSection<'d>>(section: &S, splice: Option<(u64, u64)>)
         splice,
         align: section.align().max(1),
         writable: is_runtime_writable(section),
+        tls: matches!(section.kind(), SectionKind::Tls | SectionKind::UninitializedTls),
         code: matches!(section.kind(), SectionKind::Text),
         bytes: &[],
         relocs: 0..0,
@@ -1181,6 +1185,24 @@ fn link_objects<'d>(
     let blob_layout = inject_order.iter().chain(oversized.iter());
     for &si in blob_layout {
         let sec = &secs[si];
+        // A thread-local is not data at an address. `.tdata`/`.tbss` are the
+        // template the loader copies into each thread's TLS block, and code
+        // reaches a thread-local through an offset into that block, assigned
+        // by a linker that lays the block out. The target's block is already
+        // laid out and resplice cannot grow it, so injecting the template
+        // would put bytes in the segment that no thread ever reads. This used
+        // to fall through to the relocations, which refused the access as
+        // "unsupported aarch64 relocation type 562" (or the x86-64 `TLSGD`,
+        // ...) -- true, but a number that does not say what the user wrote.
+        if sec.tls {
+            bail!(
+                "splice references thread-local section {:?} (a `thread_local!` or \
+                 `#[thread_local]` static); a thread-local lives in each thread's TLS \
+                 block rather than at an address, and resplice cannot add to the \
+                 target's TLS block, so thread-locals are not supported",
+                sec_name(objs, si)
+            );
+        }
         if sec.writable {
             return Err(anyhow!(
                 "splice references writable section {:?}; injecting writable data \
@@ -2269,6 +2291,68 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("writable section"), "message was {msg:?}");
         assert!(msg.contains(".data.COUNTER"), "message was {msg:?}");
+    }
+
+    /// A splice that reaches a thread-local (`thread_local!`) is refused by
+    /// name, not by the number of the TLS relocation that reaches it: the
+    /// section is a TLS template, which is neither writable data nor anything
+    /// the injected segment can hold, and the relocation type alone (here
+    /// `R_X86_64_TLSGD`) said nothing about what the user wrote.
+    #[test]
+    fn test_link_rlib_rejects_thread_local() {
+        use object::write::{Object, Relocation, Symbol, SymbolSection as WSection};
+        use object::{
+            Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolFlags,
+            SymbolKind, SymbolScope,
+        };
+
+        for (name, kind) in [
+            (".tbss.COUNTER", SectionKind::UninitializedTls),
+            (".tdata.COUNTER", SectionKind::Tls),
+        ] {
+            let mut obj =
+                Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+            let tls = obj.add_section(vec![], name.as_bytes().to_vec(), kind);
+            if kind == SectionKind::Tls {
+                obj.append_section_data(tls, &[7, 0, 0, 0], 4);
+            } else {
+                obj.append_section_bss(tls, 4, 4);
+            }
+            let counter = obj.add_symbol(Symbol {
+                name: b"COUNTER".to_vec(),
+                value: 0,
+                size: 4,
+                kind: SymbolKind::Tls,
+                scope: SymbolScope::Compilation,
+                weak: false,
+                section: WSection::Section(tls),
+                flags: SymbolFlags::None,
+            });
+            let rspl_name = format!(".rspl.{SPLICE_VA:x}.{:x}", SPLICE_VA + 0x20).into_bytes();
+            let rspl = obj.add_section(vec![], rspl_name, SectionKind::Text);
+            // `lea rdi, [rip + COUNTER@tlsgd]` (operand@3); `ret`.
+            obj.append_section_data(rspl, &[0x48, 0x8d, 0x3d, 0, 0, 0, 0, 0xc3], 16);
+            obj.add_relocation(
+                rspl,
+                Relocation {
+                    offset: 3,
+                    symbol: counter,
+                    addend: -4,
+                    flags: RelocationFlags::Elf { r_type: object::elf::R_X86_64_TLSGD },
+                },
+            )
+            .unwrap();
+
+            let rlib_path = temp_path("rlib_tls");
+            fs::write(&rlib_path, ar_wrap("splice.o", &obj.write().unwrap())).unwrap();
+            let mut bin = load(&crafted_target());
+            let err = link_rlib(&mut bin, &rlib_path).unwrap_err();
+            fs::remove_file(&rlib_path).ok();
+
+            let msg = err.to_string();
+            assert!(msg.contains("thread-local section"), "message was {msg:?}");
+            assert!(msg.contains(name), "message was {msg:?}");
+        }
     }
 
     /// An 8-byte splice: `mov rax, [rip + d32]` (operand@3); `ret`.
