@@ -167,6 +167,9 @@ struct Patch {
     begin: u64,
     end: u64,
     code: Vec<u8>,
+    /// True for a code splice (and its trampoline), whose region the target
+    /// executes and so must be mapped executable; false for a `static`.
+    exec: bool,
     trampoline: bool,
 }
 
@@ -244,7 +247,7 @@ pub fn link_rlib(binary: &mut Binary, rlib_path: &Path) -> Result<Vec<Applied>> 
     // across a patch and reading it once per splice is most of what placing a
     // few thousand of them costs. See [`Binary::va_range_to_offsets`].
     let offsets = binary
-        .va_range_to_offsets(patches.iter().map(|p| (p.begin, p.end - p.begin)))?
+        .va_range_to_offsets(patches.iter().map(|p| (p.begin, p.end - p.begin, p.exec)))?
         .into_iter()
         .zip(&patches)
         .map(|(off, p)| off.with_context(|| format!("splice {:#x}..{:#x}", p.begin, p.end)))
@@ -1494,6 +1497,7 @@ fn link_objects<'d>(
                     begin,
                     end,
                     code: out,
+                    exec: sec.code,
                     trampoline: false,
                 });
             }
@@ -1516,6 +1520,9 @@ fn link_objects<'d>(
             begin,
             end,
             code: jump,
+            // Only a code splice is ever trampolined: an oversized data splice
+            // was refused when the splices were laid out.
+            exec: true,
             trampoline: true,
         });
     }

@@ -311,11 +311,24 @@ struct Phdr {
     /// File offset of this entry, for rewriting it in place.
     entry_off: usize,
     p_type: u32,
+    p_flags: u32,
     p_offset: u64,
     p_vaddr: u64,
     p_filesz: u64,
     p_memsz: u64,
     p_align: u64,
+}
+
+/// `p_flags` spelled the way `readelf -l` prints it (`R E`, `RW`, ...), so an
+/// error naming a segment's permissions matches what the user sees there.
+fn segment_perms(p_flags: u32) -> String {
+    use goblin::elf::program_header::{PF_R, PF_W, PF_X};
+    [(PF_R, 'R'), (PF_W, 'W'), (PF_X, 'E')]
+        .iter()
+        .map(|&(bit, c)| if p_flags & bit != 0 { c } else { ' ' })
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
 }
 
 /// Supported CPU architectures
@@ -818,6 +831,7 @@ impl Binary {
                 Phdr {
                     entry_off: off,
                     p_type: endian.read_uint(&self.data, off, 4) as u32,
+                    p_flags: endian.read_uint(&self.data, off + c.p_flags, 4) as u32,
                     p_offset: endian.read_uint(&self.data, off + c.p_offset, word),
                     p_vaddr: endian.read_uint(&self.data, off + c.p_vaddr, word),
                     p_filesz: endian.read_uint(&self.data, off + c.p_filesz, word),
@@ -850,7 +864,7 @@ impl Binary {
     /// `.dynamic` and `.got`, producing a binary that segfaults in the loader —
     /// both reported as a successful splice.
     pub fn va_range_to_offset(&self, va: u64, len: u64) -> Result<usize> {
-        self.translate(&self.program_headers()?, va, len)
+        self.translate(&self.program_headers()?, va, len, false)
     }
 
     /// Translate every range in `ranges`, reading the program-header table once
@@ -866,21 +880,34 @@ impl Binary {
     /// The outer `Result` is the one read of the table; each range then gets a
     /// `Result` of its own, so the caller can name whichever of *its* ranges
     /// failed rather than only the address in the message.
+    ///
+    /// Each range is `(va, len, exec)`. With `exec` set, the range holds code
+    /// the target will execute, so the segment backing it must be mapped
+    /// executable as well -- see [`translate`](Self::translate).
     pub fn va_range_to_offsets(
         &self,
-        ranges: impl IntoIterator<Item = (u64, u64)>,
+        ranges: impl IntoIterator<Item = (u64, u64, bool)>,
     ) -> Result<Vec<Result<usize>>> {
         let phdrs = self.program_headers()?;
         Ok(ranges
             .into_iter()
-            .map(|(va, len)| self.translate(&phdrs, va, len))
+            .map(|(va, len, exec)| self.translate(&phdrs, va, len, exec))
             .collect())
     }
 
     /// [`va_range_to_offset`](Self::va_range_to_offset) against an
     /// already-read program-header table.
-    fn translate(&self, phdrs: &[Phdr], va: u64, len: u64) -> Result<usize> {
-        use goblin::elf::program_header::PT_LOAD;
+    ///
+    /// `exec` additionally requires the backing `PT_LOAD` to carry `PF_X`. A
+    /// code splice is machine code that the target jumps to at `begin`, and the
+    /// loader maps a segment without `PF_X` non-executable, so a code splice
+    /// whose range sits in `.data`, `.rodata` or `.got` -- the address of a
+    /// table taken for the address of a function, or a `static` replacement
+    /// written as a `fn` -- overwrites that data with instructions that can
+    /// never run. The target goes on reading them as data, and the patch used
+    /// to be reported as applied.
+    fn translate(&self, phdrs: &[Phdr], va: u64, len: u64, exec: bool) -> Result<usize> {
+        use goblin::elf::program_header::{PF_X, PT_LOAD};
 
         let end = va
             .checked_add(len)
@@ -891,6 +918,7 @@ impl Binary {
         // wrapped would make a segment appear to map addresses it does not.
         let mut truncated = None;
         let mut zero_filled = None;
+        let mut not_exec = None;
         for ph in phdrs {
             if ph.p_type != PT_LOAD {
                 continue;
@@ -920,6 +948,12 @@ impl Binary {
                 truncated = Some((ph.p_vaddr, seg_end));
                 continue;
             }
+            if exec && ph.p_flags & PF_X == 0 {
+                // File-backed, but mapped without execute permission. Another
+                // segment may still map the range executable, so keep looking.
+                not_exec = Some((ph.p_vaddr, mem_end, ph.p_flags));
+                continue;
+            }
             let off = ph.p_offset.saturating_add(va - ph.p_vaddr);
             if off.saturating_add(len) > self.data.len() as u64 {
                 return Err(anyhow!(
@@ -929,6 +963,19 @@ impl Binary {
                 ));
             }
             return Ok(off as usize);
+        }
+
+        if let Some((seg_start, mem_end, flags)) = not_exec {
+            return Err(anyhow!(
+                "code splice {va:#x}..{end:#x} is in the PT_LOAD at \
+                 {seg_start:#x}..{mem_end:#x}, which is mapped `{}` -- not executable, \
+                 so the replacement's instructions could never run there, and the \
+                 target would read them as the data they overwrite. Check that \
+                 `begin`/`end` are the address of code (`.text`), not of a table in \
+                 `.data`/`.rodata`; to replace data, put the #[Splice] on a `static` \
+                 instead of a `fn`",
+                segment_perms(flags)
+            ));
         }
 
         match truncated {
@@ -2033,9 +2080,18 @@ mod tests {
                 let layout = Class::of(arch.is_64());
                 assert_eq!(o.entry_off, layout.ehsize + i * layout.phentsize);
                 assert_eq!(
-                    (o.p_type, o.p_offset, o.p_vaddr, o.p_filesz, o.p_memsz, o.p_align),
+                    (
+                        o.p_type,
+                        o.p_flags,
+                        o.p_offset,
+                        o.p_vaddr,
+                        o.p_filesz,
+                        o.p_memsz,
+                        o.p_align
+                    ),
                     (
                         g.p_type,
+                        g.p_flags,
                         g.p_offset,
                         g.p_vaddr,
                         g.p_filesz,
@@ -2196,7 +2252,9 @@ mod tests {
             (0x500000, 1),     // mapped by nothing
             (u64::MAX, 2),     // wraps the address space
         ];
-        let batch = bin.va_range_to_offsets(ranges).unwrap();
+        let batch = bin
+            .va_range_to_offsets(ranges.iter().map(|&(va, len)| (va, len, false)))
+            .unwrap();
         assert_eq!(batch.len(), ranges.len());
         for (got, &(va, len)) in batch.iter().zip(&ranges) {
             match (got, bin.va_range_to_offset(va, len)) {
@@ -2214,6 +2272,57 @@ mod tests {
         assert!(batch[3].as_ref().unwrap_err().to_string().contains("file-backed"));
         assert!(batch[4].as_ref().unwrap_err().to_string().contains("not mapped"));
         assert!(batch[5].as_ref().unwrap_err().to_string().contains("wraps"));
+    }
+
+    /// A code splice has to land in a segment the loader maps executable.
+    ///
+    /// Translating the range alone accepts any file-backed address, so a
+    /// `#[Splice]` on a `fn` whose `begin`/`end` were the address of a table in
+    /// `.data` -- an easy mix-up when reading addresses out of `nm` -- had its
+    /// machine code written over the table. The instructions could never run
+    /// (the segment is not `PF_X`), the target read them as data, and the patch
+    /// was reported as applied. Data splices are unaffected.
+    #[test]
+    fn va_range_to_offsets_refuses_code_in_a_non_executable_segment() {
+        use goblin::elf::program_header::PT_LOAD;
+        // R+X text, then RW data, then a read-only segment.
+        let phdrs: [Phdr; 3] = [
+            (PT_LOAD as u64, 0, 0x400000, 0x400, 5, 0x1000),
+            (PT_LOAD as u64, 0x400, 0x420000, 0x40, 6, 0x1000),
+            (PT_LOAD as u64, 0x440, 0x430000, 0x40, 4, 0x1000),
+        ];
+        let bin = craft_injectable(Endian::Little, Architecture::X86_64, 0x480, &phdrs);
+
+        let batch = bin
+            .va_range_to_offsets([
+                (0x400100, 0x10, true),  // code in the text segment
+                (0x420000, 0x10, false), // data in the data segment
+                (0x420000, 0x10, true),  // code in the data segment
+                (0x430000, 0x10, true),  // code in the read-only segment
+                (0x420040, 0x10, true),  // past the data: still "not mapped"
+            ])
+            .unwrap();
+        assert_eq!(*batch[0].as_ref().unwrap(), 0x100);
+        assert_eq!(*batch[1].as_ref().unwrap(), 0x400);
+
+        let err = batch[2].as_ref().unwrap_err().to_string();
+        assert!(err.contains("not executable"), "{err}");
+        assert!(err.contains("0x420000..0x420040"), "{err}");
+        assert!(err.contains("`RW`"), "{err}");
+        let err = batch[3].as_ref().unwrap_err().to_string();
+        assert!(err.contains("not executable"), "{err}");
+        assert!(err.contains("`R`"), "{err}");
+        let err = batch[4].as_ref().unwrap_err().to_string();
+        assert!(err.contains("not mapped by any PT_LOAD"), "{err}");
+
+        // An executable segment mapping the same range still serves the code.
+        let phdrs: [Phdr; 2] = [
+            (PT_LOAD as u64, 0x400, 0x420000, 0x40, 6, 0x1000),
+            (PT_LOAD as u64, 0x400, 0x420000, 0x40, 5, 0x1000),
+        ];
+        let bin = craft_injectable(Endian::Little, Architecture::X86_64, 0x440, &phdrs);
+        let batch = bin.va_range_to_offsets([(0x420000, 0x10, true)]).unwrap();
+        assert_eq!(*batch[0].as_ref().unwrap(), 0x400);
     }
 
     /// Address translation must see a segment that was just injected: nothing
