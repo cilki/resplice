@@ -216,6 +216,16 @@ the loader zeroes the rest out of nothing, so there is no byte in the image at
 
 Give such a table its values from a code splice instead.
 
+The reverse mix-up is refused too. A `fn` splice is code, so its range has to
+be in a segment the loader maps executable (`E` in `readelf -l`); one whose
+`begin`/`end` are the address of a table in `.data` would only overwrite that
+table with instructions that never run:
+
+```
+error: splice 0x420030..0x420040: code splice 0x420030..0x420040 is in the
+PT_LOAD at 0x41fdc8..0x420048, which is mapped `RW` -- not executable, [...]
+```
+
 ### Callers that rely on more than the calling convention
 
 `extern "C"` gives a replacement the platform's calling convention, and that is
