@@ -126,6 +126,18 @@ pub unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut 
 }
 ```
 
+Atomics are the same story on aarch64 Linux. There an atomic read-modify-write
+(`fetch_add`, `swap`, `compare_exchange` on any `Atomic*`) compiles into a call
+to an *outline-atomics* helper such as `__aarch64_ldadd4_relax`, which normally
+comes from `compiler_builtins` and so cannot be reached. Have rustc inline the
+atomic instead, with `-C target-feature=+lse` if the machine the target runs on
+has the ARMv8.1 LSE atomics, or `-C target-feature=-outline-atomics` (which
+rustc warns is unstable, but accepts) for a loop that runs on any aarch64:
+
+```sh
+RUSTFLAGS="-C target-feature=-outline-atomics" cargo build --release
+```
+
 Leave `lto` out of that profile, though. With link-time optimization on, rustc
 stops compiling the crate and writes LLVM bitcode into the rlib instead, for the
 linker's plugin to compile later — and `resplice` *is* the linker here, so there

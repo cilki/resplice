@@ -971,6 +971,20 @@ fn compiler_libcall(name: &str) -> Option<&'static str> {
     })
 }
 
+/// Whether `name` is one of the aarch64 "outline atomics" helpers.
+///
+/// `aarch64-unknown-linux-gnu` turns on `outline-atomics` by default, so every
+/// atomic read-modify-write -- `fetch_add`, `swap`, `compare_exchange` on any
+/// `Atomic*` -- compiles into a call to `__aarch64_{cas,swp,ldadd,ldclr,ldeor,
+/// ldset}<size>_<ordering>`, which picks LSE or LL/SC at run time. A normal
+/// link takes them from `compiler_builtins`; here they resolve only if the
+/// target happens to define them, which a C program built by GCC rarely does.
+/// Unlike `memcpy` they are not worth writing by hand: a codegen flag makes
+/// rustc inline the atomic instead.
+fn is_outline_atomic(name: &str) -> bool {
+    name.starts_with("__aarch64_")
+}
+
 /// Link every object member of the rlib into the shared injected blob + patch
 /// list.
 fn link_objects<'d>(
@@ -1328,6 +1342,22 @@ fn link_objects<'d>(
                          extern \"C\" fn {name}(..)` with the C signature, written as a \
                          plain byte-at-a-time loop -- and the splice resolves to that \
                          copy instead",
+                        name = s.name,
+                    );
+                }
+                if is_outline_atomic(s.name) {
+                    return anyhow!(
+                        "unresolved external symbol {name:?}: no member of the rlib \
+                         defines it, and the target neither defines nor imports it. \
+                         It is an aarch64 outline-atomics helper: rustc compiles an \
+                         atomic read-modify-write (`fetch_add`, `swap`, \
+                         `compare_exchange`, ...) into a call to it, leaving the linker \
+                         to take it from `compiler_builtins`, which resplice does not \
+                         read. Rebuild the replacement crate with the atomic inlined \
+                         instead: RUSTFLAGS=\"-C target-feature=+lse\" when the \
+                         machine the target runs on has the ARMv8.1 LSE atomics, or \
+                         RUSTFLAGS=\"-C target-feature=-outline-atomics\" for an \
+                         LL/SC loop that runs on any aarch64",
                         name = s.name,
                     );
                 }
@@ -2057,6 +2087,25 @@ mod tests {
         assert!(msg.contains(".rspl.401000.401020"), "message was {msg:?}");
         assert!(msg.contains("rustc emits the call itself"), "message was {msg:?}");
         assert!(msg.contains("extern \"C\" fn memcpy"), "message was {msg:?}");
+        assert!(!msg.contains("core::panicking"), "message was {msg:?}");
+    }
+
+    /// On aarch64-linux, rustc compiles an atomic `fetch_add` into a call to
+    /// an outline-atomics helper, so a splice touching any `Atomic*` fails on
+    /// a symbol its source never names. The error has to name the codegen
+    /// flags that inline the atomic, not point at `core::panicking` or ask for
+    /// a hand-written definition.
+    #[test]
+    fn test_link_rlib_explains_unresolved_outline_atomic() {
+        let msg = unresolved_call_err("rlib_ldadd", "__aarch64_ldadd4_relax");
+        assert!(
+            msg.contains("unresolved external symbol \"__aarch64_ldadd4_relax\""),
+            "message was {msg:?}"
+        );
+        assert!(msg.contains(".rspl.401000.401020"), "message was {msg:?}");
+        assert!(msg.contains("outline-atomics helper"), "message was {msg:?}");
+        assert!(msg.contains("target-feature=+lse"), "message was {msg:?}");
+        assert!(msg.contains("target-feature=-outline-atomics"), "message was {msg:?}");
         assert!(!msg.contains("core::panicking"), "message was {msg:?}");
     }
 
