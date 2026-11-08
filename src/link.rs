@@ -945,6 +945,32 @@ fn absolute_in_pie(what: &str, remedy: &str) -> anyhow::Error {
     )
 }
 
+/// What rustc lowers into a call to `name`, if `name` is one of the C library
+/// routines code generation emits on its own rather than because the source
+/// called them.
+///
+/// A struct or array copied by value, `copy_from_slice`, a `[0; N]`
+/// initializer or an `==` between byte arrays compile into `memcpy`, `memset`,
+/// `memmove`, `memcmp` or `bcmp` once they are too large to inline. A normal
+/// link takes those from libc or `compiler_builtins`; here they resolve only if
+/// the target happens to import them, which a C program that never copies
+/// memory itself does not. Reported as plain unresolved symbols, they looked
+/// like a call the user wrote, and the hint about `core::panicking` pointed at
+/// the wrong fix.
+fn compiler_libcall(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "memcpy" => "copies too large to inline (a struct or array moved by value, \
+                     `copy_from_slice`)",
+        "memmove" => "copies whose source and destination may overlap (`copy_within`, \
+                      `ptr::copy`, a slice `rotate`)",
+        "memset" => "fills too large to inline (a `[0; N]` or `[x; N]` initializer, \
+                     `fill`, zeroing a large struct)",
+        "memcmp" | "bcmp" => "comparisons of byte arrays and slices too large to \
+                              inline (`==` between `[u8; N]` or `&[u8]`)",
+        _ => return None,
+    })
+}
+
 /// Link every object member of the rlib into the shared injected blob + patch
 /// list.
 fn link_objects<'d>(
@@ -1290,6 +1316,21 @@ fn link_objects<'d>(
             Ok(base_va + s.value)
         } else if s.undefined {
             target_syms.resolve(s.name)?.ok_or_else(|| {
+                if let Some(what) = compiler_libcall(s.name) {
+                    return anyhow!(
+                        "unresolved external symbol {name:?}: no member of the rlib \
+                         defines it, and the target neither defines nor imports it. \
+                         Nothing in the replacement crate has to call {name:?} for \
+                         this to happen: rustc emits the call itself for {what}, \
+                         leaving it for the linker to take from libc or \
+                         `compiler_builtins`, and resplice reads neither. Define it in \
+                         the replacement crate -- `#[unsafe(no_mangle)] pub unsafe \
+                         extern \"C\" fn {name}(..)` with the C signature, written as a \
+                         plain byte-at-a-time loop -- and the splice resolves to that \
+                         copy instead",
+                        name = s.name,
+                    );
+                }
                 anyhow!(
                     "unresolved external symbol {:?}: no member of the rlib defines \
                      it, and the target neither defines nor imports it. A splice can \
@@ -1999,6 +2040,29 @@ mod tests {
     /// of a crate's splices needs rewriting.
     #[test]
     fn test_link_rlib_reports_unresolved_reference_with_its_splice() {
+        let msg = unresolved_call_err("rlib_unresolved", "nowhere_to_be_found");
+        assert!(msg.contains("unresolved external symbol"), "message was {msg:?}");
+        assert!(msg.contains("nowhere_to_be_found"), "message was {msg:?}");
+        assert!(msg.contains(".rspl.401000.401020"), "message was {msg:?}");
+    }
+
+    /// rustc calls `memcpy` and friends on its own, for copies and fills too
+    /// large to inline, so a splice can fail on a symbol its source never
+    /// mentions. The error has to say where the call came from and how to
+    /// supply the routine, rather than point at `core::panicking`.
+    #[test]
+    fn test_link_rlib_explains_unresolved_compiler_libcall() {
+        let msg = unresolved_call_err("rlib_memcpy", "memcpy");
+        assert!(msg.contains("unresolved external symbol \"memcpy\""), "message was {msg:?}");
+        assert!(msg.contains(".rspl.401000.401020"), "message was {msg:?}");
+        assert!(msg.contains("rustc emits the call itself"), "message was {msg:?}");
+        assert!(msg.contains("extern \"C\" fn memcpy"), "message was {msg:?}");
+        assert!(!msg.contains("core::panicking"), "message was {msg:?}");
+    }
+
+    /// Link a single splice that calls `callee`, which neither the rlib nor
+    /// the crafted target defines, and return the error.
+    fn unresolved_call_err(tag: &str, callee: &str) -> String {
         use object::write::{Object, Relocation, Symbol, SymbolSection as WSection};
         use object::{
             Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolFlags,
@@ -2010,7 +2074,7 @@ mod tests {
         let rspl = obj.add_section(vec![], name, SectionKind::Text);
         obj.append_section_data(rspl, &SPLICE_CODE, 16);
         let symbol = obj.add_symbol(Symbol {
-            name: b"nowhere_to_be_found".to_vec(),
+            name: callee.as_bytes().to_vec(),
             value: 0,
             size: 0,
             kind: SymbolKind::Text,
@@ -2032,10 +2096,7 @@ mod tests {
         )
         .unwrap();
 
-        let msg = link_err("rlib_unresolved", &ar_wrap("splice.o", &obj.write().unwrap()));
-        assert!(msg.contains("unresolved external symbol"), "message was {msg:?}");
-        assert!(msg.contains("nowhere_to_be_found"), "message was {msg:?}");
-        assert!(msg.contains(".rspl.401000.401020"), "message was {msg:?}");
+        link_err(tag, &ar_wrap("splice.o", &obj.write().unwrap()))
     }
 
     /// The crafted x86-64 target with its `e_machine` field changed to

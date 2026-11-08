@@ -107,6 +107,25 @@ replacement — itself a call into `core`:
 panic = "abort"
 ```
 
+The same goes for the C library routines rustc calls on its own: a copy, fill
+or byte comparison too large to inline (a big struct or array moved by value,
+`copy_from_slice`, `[0; N]`, `==` between byte arrays) compiles into a call to
+`memcpy`, `memmove`, `memset`, `memcmp` or `bcmp`. Those bind to the target's
+own when it imports them; when it does not, define the one named in the error
+in the replacement crate, as a plain byte loop:
+
+```rust
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    let mut i = 0;
+    while i < n {
+        unsafe { *dst.add(i) = *src.add(i) };
+        i += 1;
+    }
+    dst
+}
+```
+
 Leave `lto` out of that profile, though. With link-time optimization on, rustc
 stops compiling the crate and writes LLVM bitcode into the rlib instead, for the
 linker's plugin to compile later — and `resplice` *is* the linker here, so there
