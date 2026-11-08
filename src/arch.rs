@@ -238,12 +238,33 @@ pub fn mips_lo16_addend(endian: Endian, buf: &[u8], off: usize) -> i64 {
 /// start; this is the same refusal for the fields that did not.
 fn does_not_fit(kind: &str, value: i128, field: &str) -> anyhow::Error {
     anyhow!(
-        "{kind} {value:#x} does not fit the {field} field this relocation writes; \
+        "{kind} {} does not fit the {field} field this relocation writes; \
          truncating it would leave the reference pointing at an unrelated \
-         address. The symbol is too far from the relocated site -- for a \
-         reference into the injected segment, choose an --inject-base closer to \
-         the splice"
+         address. {TOO_FAR}",
+        signed_hex(value)
     )
+}
+
+/// What to do about a reference whose resolved value is out of its field's
+/// range. Every range refusal ends with it, so the aarch64 branch and ADRP
+/// fields -- by far the narrowest a splice meets, and so the ones an
+/// `--inject-base` most often puts out of reach -- say so as well as the
+/// 32-bit fields do.
+const TOO_FAR: &str = "The symbol is too far from the relocated site -- when either \
+     of them is in the injected segment, choose an --inject-base closer to the splice";
+
+/// `value` in hex with its sign, for an error message.
+///
+/// `{:#x}` formats a negative integer as its two's complement, so a reference
+/// 2GB *behind* its site read `0xffffffff7fffff00` -- or 32 digits of it for an
+/// `i128` -- and the one thing the reader needs from it, which way and how far
+/// the symbol is, had to be decoded by hand.
+fn signed_hex(value: i128) -> String {
+    if value < 0 {
+        format!("-{:#x}", value.unsigned_abs())
+    } else {
+        format!("{value:#x}")
+    }
 }
 
 /// The immediate of a branch that counts 4-byte instructions in a signed
@@ -259,15 +280,17 @@ fn does_not_fit(kind: &str, value: i128, field: &str) -> anyhow::Error {
 fn branch_imm(x: i64, bits: u32, what: &str) -> Result<u32> {
     if x & 3 != 0 {
         bail!(
-            "{what} displacement {x:#x} is not 4-byte aligned; the immediate counts \
-             whole instructions"
+            "{what} displacement {} is not 4-byte aligned; the immediate counts \
+             whole instructions",
+            signed_hex(x.into())
         );
     }
     let reach = 1i64 << (bits + 1);
     if !(-reach..reach).contains(&x) {
         bail!(
-            "{what} displacement {x:#x} is out of reach of its {bits}-bit immediate \
-             (±{reach:#x} bytes)"
+            "{what} displacement {} is out of reach of its {bits}-bit immediate \
+             (±{reach:#x} bytes). {TOO_FAR}",
+            signed_hex(x.into())
         );
     }
     Ok(((x >> 2) as u32) & ((1 << bits) - 1))
@@ -495,8 +518,15 @@ fn apply_aarch64(
 
 /// Encode a page displacement `x` (a multiple of 4096) into an ADRP at `off`.
 fn adrp(endian: Endian, buf: &mut [u8], off: usize, x: i64) -> Result<()> {
-    if x & 0xfff != 0 || !(-(1 << 32)..(1 << 32)).contains(&x) {
-        bail!("aarch64 ADRP displacement {x:#x} out of range");
+    if x & 0xfff != 0 {
+        bail!("aarch64 ADRP displacement {} is not page-aligned", signed_hex(x.into()));
+    }
+    if !(-(1 << 32)..(1 << 32)).contains(&x) {
+        bail!(
+            "aarch64 ADRP displacement {} is out of reach of its 21-bit page immediate \
+             (±0x100000000 bytes). {TOO_FAR}",
+            signed_hex(x.into())
+        );
     }
     let imm = (x >> 12) as u32 & 0x1f_ffff; // 21-bit
     let immlo = imm & 0x3;
@@ -881,6 +911,38 @@ mod tests {
         // On mips64 a 32-bit field, and a HI16/LO16 pair, still span 32 bits.
         err(R_MIPS_32, far, 0, 0, Architecture::Mips64);
         err(R_MIPS_HI16, far, 0, 0, Architecture::Mips64);
+    }
+
+    /// A reference an `--inject-base` put out of reach says what to do about it
+    /// on aarch64 too, and how far away the symbol is in a form a reader can
+    /// use. The narrowest fields a splice meets are aarch64's: a `bl` reaches
+    /// ±128MB. Its refusal used to stop at "out of reach of its 26-bit
+    /// immediate", naming no remedy, and a symbol *behind* the site printed as
+    /// the two's complement of the distance: `0xffffff80000106b4` for one
+    /// 0x7ffffef94c bytes back, from a real run with `--inject-base 0x7fffff0000`
+    /// against a PIE whose `printf` stub is at 0x700.
+    #[test]
+    fn out_of_range_references_name_the_remedy_and_a_signed_distance() {
+        let le = Endian::Little;
+        let err = |arch, r_type, s: u64, p: u64| {
+            let mut buf = [0u8; 8];
+            apply(arch, le, r_type, &mut buf, 0, s, 0, p, None, false, None)
+                .expect_err("out of range")
+                .to_string()
+        };
+
+        let cases = [
+            (Architecture::Arm64, R_AARCH64_CALL26, 0x700, 0x7f_ffff_0000, "-0x7ffffef900"),
+            (Architecture::Arm64, R_AARCH64_ADR_PREL_PG_HI21, 0x7f_ffff_0000, 0x700, "0x7fffff0000"),
+            (Architecture::Arm, R_ARM_CALL, 0x8000, 0x4_0000_8000, "-0x400000000"),
+            (Architecture::X86_64, R_X86_64_PC32, 0x1000, 0x2_0000_1000, "-0x200000000"),
+        ];
+        for (arch, r_type, s, p, distance) in cases {
+            let e = err(arch, r_type, s, p);
+            assert!(e.contains("--inject-base"), "message was {e:?}");
+            assert!(e.contains(&format!(" {distance} ")), "message was {e:?}");
+            assert!(!e.contains("0xffff"), "message was {e:?}");
+        }
     }
 
     #[test]

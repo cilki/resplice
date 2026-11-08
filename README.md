@@ -327,9 +327,12 @@ error: trampoline at 0x401000 cannot reach its target 0x100000020; choose an
 --inject-base within reach of the splice: PC-relative displacement 0xffbff01b
 does not fit the signed 32-bit field this relocation writes; truncating it would
 leave the reference pointing at an unrelated address. The symbol is too far from
-the relocated site -- for a reference into the injected segment, choose an
+the relocated site -- when either of them is in the injected segment, choose an
 --inject-base closer to the splice
 ```
+
+An aarch64 `bl` or `adrp` that cannot reach is refused the same way, with the
+distance signed (`-0x7ffffef94c` is that far *behind* the reference).
 
 Note that the segment is mapped read+execute, so referenced *writable* data
 (mutable `static`s, `.bss`) is not supported yet and is reported as an error.
