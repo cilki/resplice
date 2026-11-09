@@ -985,6 +985,78 @@ fn is_outline_atomic(name: &str) -> bool {
     name.starts_with("__aarch64_")
 }
 
+/// What rustc lowers into a call to `name`, if `name` is one of the arithmetic
+/// helpers of the compiler runtime (libgcc's names, which `compiler_builtins`
+/// provides for Rust).
+///
+/// Code generation calls one wherever the CPU has no instruction for the
+/// operation: `/` and `%` on `u128`/`i128` (`__udivti3`, `__modti3`), `as`
+/// between a float and a 128-bit integer (`__floatuntidf`, `__fixdfti`),
+/// `f64::powi` (`__powidf2`) on any target, and on 32-bit ones 64-bit division
+/// or software floating point too. A normal link takes them from
+/// `compiler_builtins`; here they resolve only if the target defines them,
+/// which a dynamically linked C program does not. Reported as plain
+/// unresolved symbols they named a function the crate never calls, and the
+/// hint about `core::panicking` pointed at the wrong fix.
+///
+/// The names are recognised by libgcc's scheme -- an operation, a machine
+/// mode for its operands (`si`/`di`/`ti` for 32/64/128-bit integers,
+/// `sf`/`df`/`tf`/`xf`/`hf` for floats) and the operand count -- rather than
+/// listed, since there are a few hundred of them across the targets resplice
+/// handles. The scheme is distinctive enough that no libc function matches it.
+fn compiler_builtins_helper(name: &str) -> Option<&'static str> {
+    const INT: [&str; 3] = ["si", "di", "ti"];
+    const FLOAT: [&str; 5] = ["sf", "df", "tf", "xf", "hf"];
+    let is_mode = |m: &str| INT.contains(&m) || FLOAT.contains(&m);
+
+    let rest = name.strip_prefix("__")?;
+    if rest.starts_with("aeabi_") {
+        return Some(
+            "operations the ARM EABI leaves to its runtime library (integer division \
+             on a core without a divide instruction, 64-bit division and shifts, \
+             floating point without an FPU)",
+        );
+    }
+    // `float[un]<int><float>` and `fix[uns]<float><int>`: conversions, which
+    // carry two modes and no operand count.
+    let conversion = |op: &str, from: &[&str], to: &[&str]| {
+        rest.strip_prefix(op)
+            .and_then(|r| r.split_at_checked(2))
+            .is_some_and(|(a, b)| from.contains(&a) && to.contains(&b))
+    };
+    if conversion("float", &INT, &FLOAT)
+        || conversion("floatun", &INT, &FLOAT)
+        || conversion("fix", &FLOAT, &INT)
+        || conversion("fixuns", &FLOAT, &INT)
+    {
+        return Some(
+            "an `as` conversion between a float and an integer the CPU cannot convert \
+             in one instruction (`u128`/`i128` on any target, any width without an FPU)",
+        );
+    }
+    // `<op><mode><operand count>`, e.g. `udivti3`, `powidf2`, `extenddftf2`.
+    let (stem, arity) = rest.split_at_checked(rest.len().checked_sub(1)?)?;
+    if !matches!(arity, "2" | "3" | "4") {
+        return None;
+    }
+    let (op, mode) = stem.split_at_checked(stem.len().checked_sub(2)?)?;
+    if op.is_empty() || !op.bytes().all(|b| b.is_ascii_lowercase()) || !is_mode(mode) {
+        return None;
+    }
+    Some(if op == "powi" {
+        "`f32::powi`/`f64::powi` with an exponent not known at compile time"
+    } else if op.contains("div") || op.contains("mod") {
+        "a `/` or `%` wider than the CPU divides in one instruction (`u128`/`i128` on \
+         any target, 64-bit integers on a 32-bit one)"
+    } else if op.starts_with("mul") {
+        "a multiplication wider than the CPU multiplies in one instruction, or an \
+         overflow-checked one (`checked_mul`, `overflowing_mul`) at that width"
+    } else {
+        "arithmetic the CPU has no instruction for at that width or format (a \
+         128-bit shift, floating point without an FPU, `f128`)"
+    })
+}
+
 /// Link every object member of the rlib into the shared injected blob + patch
 /// list.
 fn link_objects<'d>(
@@ -1358,6 +1430,23 @@ fn link_objects<'d>(
                          machine the target runs on has the ARMv8.1 LSE atomics, or \
                          RUSTFLAGS=\"-C target-feature=-outline-atomics\" for an \
                          LL/SC loop that runs on any aarch64",
+                        name = s.name,
+                    );
+                }
+                if let Some(what) = compiler_builtins_helper(s.name) {
+                    return anyhow!(
+                        "unresolved external symbol {name:?}: no member of the rlib \
+                         defines it, and the target neither defines nor imports it. \
+                         Nothing in the replacement crate has to call {name:?} for \
+                         this to happen: it is a compiler runtime helper, which rustc \
+                         calls for {what}, leaving the linker to take it from \
+                         `compiler_builtins`, which resplice does not read. Do the \
+                         arithmetic in operations the CPU has instructions for (split a \
+                         128-bit value into 64-bit halves, replace `powi` with a \
+                         multiplication loop), or define it in the replacement crate as \
+                         `#[unsafe(no_mangle)] pub extern \"C\" fn {name}(..)` written \
+                         in those narrower operations -- one written with the same \
+                         operation compiles into a call to itself",
                         name = s.name,
                     );
                 }
@@ -2107,6 +2196,58 @@ mod tests {
         assert!(msg.contains("target-feature=+lse"), "message was {msg:?}");
         assert!(msg.contains("target-feature=-outline-atomics"), "message was {msg:?}");
         assert!(!msg.contains("core::panicking"), "message was {msg:?}");
+    }
+
+    /// `u128` division compiles into a call to `__udivti3`, which only
+    /// `compiler_builtins` defines, so a splice doing it fails on a symbol its
+    /// source never names. The error has to say it is a runtime helper and
+    /// how to avoid it, not point at `core::panicking`.
+    #[test]
+    fn test_link_rlib_explains_unresolved_compiler_builtins_helper() {
+        let msg = unresolved_call_err("rlib_udivti3", "__udivti3");
+        assert!(msg.contains("unresolved external symbol \"__udivti3\""), "message was {msg:?}");
+        assert!(msg.contains(".rspl.401000.401020"), "message was {msg:?}");
+        assert!(msg.contains("compiler runtime helper"), "message was {msg:?}");
+        assert!(msg.contains("`/` or `%`"), "message was {msg:?}");
+        assert!(msg.contains("extern \"C\" fn __udivti3"), "message was {msg:?}");
+        assert!(!msg.contains("core::panicking"), "message was {msg:?}");
+    }
+
+    /// The helpers rustc was seen to call (on aarch64 and armv7) are
+    /// recognised by libgcc's naming scheme, and the C library functions a
+    /// splice might really import are not mistaken for them.
+    #[test]
+    fn compiler_builtins_helpers_are_recognised_by_name() {
+        let what = |name| compiler_builtins_helper(name);
+        for name in ["__udivti3", "__modti3", "__divdi3", "__udivmodti4", "__aeabi_uldivmod"] {
+            assert!(what(name).is_some_and(|w| w.contains('/') || w.contains("division")), "{name}");
+        }
+        for name in ["__floatuntidf", "__floattisf", "__fixdfti", "__fixunssfdi"] {
+            assert!(what(name).is_some_and(|w| w.contains("conversion")), "{name}");
+        }
+        assert!(what("__powidf2").is_some_and(|w| w.contains("powi")));
+        assert!(what("__muloti4").is_some_and(|w| w.contains("multiplication")));
+        assert!(what("__ashlti3").is_some_and(|w| w.contains("shift")));
+        assert!(what("__addtf3").is_some());
+        assert!(what("__extenddftf2").is_some());
+        for name in [
+            "memcpy",
+            "__errno_location",
+            "__stack_chk_fail",
+            "__libc_start_main",
+            "__cxa_finalize",
+            "__isoc99_sscanf",
+            "__aarch64_ldadd4_relax",
+            "__printf_chk",
+            "__ti3",
+            "__float",
+            "__fixdfx",
+            "__UDIVTI3",
+            "__divti5",
+            "__é3",
+        ] {
+            assert_eq!(what(name), None, "{name}");
+        }
     }
 
     /// Link a single splice that calls `callee`, which neither the rlib nor
