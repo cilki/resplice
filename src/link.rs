@@ -2213,8 +2213,8 @@ mod tests {
         assert!(!msg.contains("core::panicking"), "message was {msg:?}");
     }
 
-    /// The helpers rustc was seen to call (on aarch64 and armv7) are
-    /// recognised by libgcc's naming scheme, and the C library functions a
+    /// The runtime helpers rustc calls are recognised by libgcc's naming
+    /// scheme, and the C library functions a
     /// splice might really import are not mistaken for them.
     #[test]
     fn compiler_builtins_helpers_are_recognised_by_name() {
