@@ -1057,6 +1057,107 @@ fn compiler_builtins_helper(name: &str) -> Option<&'static str> {
     })
 }
 
+/// What compiled into a reference to `name`, and how to write the splice
+/// without it, if `name` is something only the precompiled standard library
+/// (`core`, `alloc`, `std`) or its unwinder defines.
+///
+/// One generic sentence about `core::panicking` used to cover all of these,
+/// and it named the wrong cause for the commonest ones: the abort-on-unwind
+/// guard (`panic_cannot_unwind`), which a splice gets without a single checked
+/// operation in it and which only `panic = "abort"` removes, and the overflow
+/// checks and shared generic instances of a debug build, which only
+/// `--release` removes. Each kind has a different fix, so each is named.
+///
+/// Names are matched by their length-prefixed identifiers, which both the v0
+/// (`_RNvNtCs..._4core9panicking18panic_bounds_check`) and the legacy
+/// (`_ZN4core9panicking18panic_bounds_check17h...E`) manglings share.
+fn std_symbol_hint(name: &str) -> Option<&'static str> {
+    let has = |ident: &str| name.contains(&format!("{}{ident}", ident.len()));
+    let any = |idents: &[&str]| idents.iter().any(|i| has(i));
+
+    if matches!(name, "rust_eh_personality" | "_Unwind_Resume")
+        || any(&["panic_cannot_unwind", "panic_in_cleanup"])
+    {
+        return Some(
+            "It belongs to the abort-on-unwind guard rustc puts around an `extern \"C\"` \
+             function that calls something which may panic, so that the panic aborts \
+             instead of unwinding into the function's C caller. Add `panic = \"abort\"` \
+             to the Cargo profile the replacement crate is built with -- `[profile.release]`, \
+             building with `--release` -- which leaves nothing to unwind and so no guard",
+        );
+    }
+    let in_core = name.starts_with("_ZN4core")
+        || name.starts_with("_ZN5alloc")
+        || name.starts_with("_ZN3std")
+        || (name.starts_with("_R")
+            && ["4core", "5alloc", "3std"]
+                .iter()
+                .any(|c| name.contains(&format!("_{c}")) || name.contains(&format!("C{c}"))))
+        || ["core..", "alloc..", "std.."]
+            .iter()
+            .any(|c| name.contains(&format!("$LT${c}")) || name.contains(&format!("$u20${c}")));
+    if !in_core {
+        return None;
+    }
+    let ops = ["add", "sub", "mul", "neg", "shl", "shr"];
+    if ops.iter().any(|op| has(&format!("panic_const_{op}_overflow"))) {
+        return Some(
+            "It is the panic of an arithmetic overflow check, which a debug build puts on \
+             every `+`, `-`, `*`, negation and shift. Build with `--release` (or set \
+             `overflow-checks = false` in the profile), or use the `wrapping_*` methods",
+        );
+    }
+    if any(&[
+        "panic_const_div_by_zero",
+        "panic_const_rem_by_zero",
+        "panic_const_div_overflow",
+        "panic_const_rem_overflow",
+    ]) {
+        return Some(
+            "It is the panic of the check rustc puts on a `/` or `%` whose divisor it \
+             cannot prove nonzero (and, for a signed one, not -1 under a `MIN` dividend), \
+             in a release build too. Test the divisor before dividing (`if b != 0`, plus \
+             `b != -1` for a signed one) so the check folds away, or divide an unsigned \
+             value by a `NonZero` one",
+        );
+    }
+    if any(&[
+        "panic_bounds_check",
+        "slice_index_fail",
+        "slice_start_index_len_fail",
+        "slice_end_index_len_fail",
+        "slice_index_order_fail",
+    ]) {
+        return Some(
+            "It is the panic of an index or range bounds check (`t[i]`, `t[a..b]`), which \
+             stays in a release build unless the index is provably in range. Index with \
+             `get_unchecked`, or mask the index into range (`t[i & 3]` on a 4-element \
+             array)",
+        );
+    }
+    if any(&["unwrap_failed", "expect_failed"]) {
+        return Some(
+            "It is the panic of an `unwrap` or `expect`. Use a `match` or `if let` instead, \
+             or `unwrap_unchecked` where the value is known to be there",
+        );
+    }
+    if has("panicking") {
+        return Some(
+            "It is one of `core::panicking`'s entry points, which a `panic!`, `assert!`, \
+             `unreachable!`, a checked operation, or a debug build's precondition check \
+             compiles into. Write the splice without the check (`get_unchecked`, \
+             `wrapping_*`, `unwrap_unchecked`), and build with `--release`",
+        );
+    }
+    Some(
+        "It is an item of the precompiled standard library. A debug build calls the \
+         standard library's own copies of generic code (`Option::expect`, slice \
+         iterators, ...) and of what a release build inlines, rather than compiling them \
+         into the crate: build with `--release`. An item that is not generic or \
+         `#[inline]` exists only in that precompiled form, so write the splice without it",
+    )
+}
+
 /// Link every object member of the rlib into the shared injected blob + patch
 /// list.
 fn link_objects<'d>(
@@ -1448,6 +1549,16 @@ fn link_objects<'d>(
                          in those narrower operations -- one written with the same \
                          operation compiles into a call to itself",
                         name = s.name,
+                    );
+                }
+                if let Some(hint) = std_symbol_hint(s.name) {
+                    return anyhow!(
+                        "unresolved external symbol {:?}: no member of the rlib defines \
+                         it, and the target neither defines nor imports it. A splice can \
+                         only reach what its own rlib was compiled from, or a symbol the \
+                         target itself provides, and the precompiled standard library \
+                         is neither. {hint}",
+                        s.name
                     );
                 }
                 anyhow!(
@@ -2211,6 +2322,92 @@ mod tests {
         assert!(msg.contains("`/` or `%`"), "message was {msg:?}");
         assert!(msg.contains("extern \"C\" fn __udivti3"), "message was {msg:?}");
         assert!(!msg.contains("core::panicking"), "message was {msg:?}");
+    }
+
+    /// A debug build of the README's example fails on the abort-on-unwind
+    /// guard, which no line of the splice asked for. The error has to name
+    /// the profile setting that removes it rather than send the user looking
+    /// for a bounds check, an overflow check or an `unwrap` they never wrote.
+    #[test]
+    fn test_link_rlib_explains_unresolved_unwind_guard() {
+        let sym = "_RNvNtCsezJPv0cR1HF_4core9panicking19panic_cannot_unwind";
+        let msg = unresolved_call_err("rlib_cannot_unwind", sym);
+        assert!(msg.contains(&format!("unresolved external symbol \"{sym}\"")), "message was {msg:?}");
+        assert!(msg.contains(".rspl.401000.401020"), "message was {msg:?}");
+        assert!(msg.contains("abort-on-unwind guard"), "message was {msg:?}");
+        assert!(msg.contains("panic = \"abort\""), "message was {msg:?}");
+        assert!(!msg.contains("bounds check"), "message was {msg:?}");
+    }
+
+    /// Each reference rustc leaves into the precompiled standard library is
+    /// told apart by what compiled into it, in both manglings; the names are
+    /// the ones a debug and a release build of checked arithmetic, indexing,
+    /// `unwrap`, `expect`, `assert!` and slice iteration leave undefined.
+    /// Symbols of the target's own and libc's are not mistaken for them.
+    #[test]
+    fn std_symbols_are_told_apart_by_cause() {
+        fn hint(name: &str) -> &'static str {
+            std_symbol_hint(name).unwrap_or_else(|| panic!("no hint for {name}"))
+        }
+        let v0 = "_RNvNtCsezJPv0cR1HF_4core9panicking";
+        let pc = "_RNvNtNtCsezJPv0cR1HF_4core9panicking11panic_const";
+        for name in [
+            format!("{v0}19panic_cannot_unwind"),
+            format!("{v0}16panic_in_cleanup"),
+            "rust_eh_personality".into(),
+            "_Unwind_Resume".into(),
+        ] {
+            assert!(hint(&name).contains("panic = \"abort\""), "{name}");
+        }
+        for name in [
+            format!("{pc}24panic_const_add_overflow"),
+            format!("{pc}24panic_const_shl_overflow"),
+            "_ZN4core9panicking11panic_const24panic_const_mul_overflow17h0123456789abcdefE".into(),
+        ] {
+            assert!(hint(&name).contains("overflow check"), "{name}");
+            assert!(hint(&name).contains("--release"), "{name}");
+        }
+        for name in [
+            format!("{pc}23panic_const_div_by_zero"),
+            format!("{pc}24panic_const_div_overflow"),
+            format!("{pc}23panic_const_rem_by_zero"),
+        ] {
+            assert!(hint(&name).contains("divisor"), "{name}");
+        }
+        for name in [
+            format!("{v0}18panic_bounds_check"),
+            "_RNvNtNtCsezJPv0cR1HF_4core5slice5index16slice_index_fail".into(),
+            "_ZN4core5slice5index24slice_end_index_len_fail17h0123456789abcdefE".into(),
+        ] {
+            assert!(hint(&name).contains("get_unchecked"), "{name}");
+        }
+        for name in [
+            "_RNvNtCsezJPv0cR1HF_4core6option13unwrap_failed",
+            "_RNvNtCsezJPv0cR1HF_4core6option13expect_failed",
+            "_RNvNtCsezJPv0cR1HF_4core6result13unwrap_failed",
+        ] {
+            assert!(hint(name).contains("`unwrap` or `expect`"), "{name}");
+        }
+        for name in [format!("{v0}5panic"), format!("{v0}18panic_nounwind_fmt")] {
+            assert!(hint(&name).contains("`assert!`"), "{name}");
+        }
+        for name in [
+            "_ZN4core6option15Option$LT$T$GT$6expect17h407b4582d6c877cbE",
+            "_ZN4core5slice4iter13Iter$LT$T$GT$3new17h3369ace7b57fa4e7E",
+            "_ZN110_$LT$core..ops..range..RangeFrom$LT$usize$GT$$u20$as$u20$core..slice..\
+             index..SliceIndex$LT$$u5b$T$u5d$$GT$$GT$5index17h4d4840dd2ed6a380E",
+        ] {
+            assert!(hint(name).contains("debug build"), "{name}");
+        }
+        for name in [
+            "printf",
+            "memcpy",
+            "helper_c",
+            "_ZN5score4main17h0123456789abcdefE",
+            "_RNvCs1234_7mycrate18panic_bounds_check",
+        ] {
+            assert!(std_symbol_hint(name).is_none(), "{name}");
+        }
     }
 
     /// The runtime helpers rustc calls are recognised by libgcc's naming
