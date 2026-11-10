@@ -138,6 +138,16 @@ rustc warns is unstable, but accepts) for a loop that runs on any aarch64:
 RUSTFLAGS="-C target-feature=-outline-atomics" cargo build --release
 ```
 
+So is arithmetic the CPU has no instruction for. `/` and `%` on `u128`/`i128`,
+`as` between a float and a 128-bit integer, and `powi` with a variable exponent
+compile into calls to compiler runtime helpers such as `__udivti3`,
+`__floatuntidf` or `__powidf2` (on a 32-bit target, 64-bit division and
+software floating point do too). Those come from `compiler_builtins` as well,
+so do the arithmetic at a width the CPU handles instead (split a `u128` into
+`u64` halves, write `powi` as a multiplication loop), or define the helper
+named in the error in the replacement crate in those narrower operations --
+one written with the operation it implements compiles into a call to itself.
+
 Leave `lto` out of that profile, though. With link-time optimization on, rustc
 stops compiling the crate and writes LLVM bitcode into the rlib instead, for the
 linker's plugin to compile later — and `resplice` *is* the linker here, so there
