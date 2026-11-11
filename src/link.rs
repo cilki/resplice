@@ -971,6 +971,41 @@ fn compiler_libcall(name: &str) -> Option<&'static str> {
     })
 }
 
+/// What rustc lowers into a call to `name`, if `name` is a routine of the C
+/// math library.
+///
+/// The float methods the CPU has no instruction for -- `sin`, `exp`, `powf`,
+/// `atan2`, `cbrt`, ... -- are implemented by calling libm, and so is `%` on
+/// `f32`/`f64`, which compiles into `fmod`/`fmodf` on every target. A normal
+/// link takes them from libm; here they resolve only if the target imports
+/// them, which a C program that does no floating point of its own does not.
+/// Reported as plain unresolved symbols, a `%` looked like a call the crate
+/// never made, and the hint about `core::panicking` pointed at the wrong fix.
+///
+/// The `f32` variant of each routine is its `f64` name with an `f` appended
+/// (`sinf`, `fmodf`), which is how both are recognised from one list.
+fn libm_routine(name: &str) -> Option<&'static str> {
+    const LIBM: &[&str] = &[
+        "acos", "acosh", "asin", "asinh", "atan", "atan2", "atanh", "cbrt", "ceil",
+        "copysign", "cos", "cosh", "erf", "erfc", "exp", "exp10", "exp2", "expm1", "fdim",
+        "floor", "fma", "fmax", "fmin", "fmod", "frexp", "hypot", "ldexp", "lgamma",
+        "lgamma_r", "log", "log10", "log1p", "log2", "modf", "nearbyint", "pow", "rint",
+        "round", "roundeven", "sin", "sinh", "sqrt", "tan", "tanh", "tgamma", "trunc",
+    ];
+    let base = if LIBM.contains(&name) {
+        name
+    } else {
+        name.strip_suffix('f').filter(|b| LIBM.contains(b))?
+    };
+    Some(if base == "fmod" {
+        "a `%` between two floats (no CPU has an instruction for it)"
+    } else {
+        "a float method the CPU has no instruction for (`sin`, `exp`, `ln`, `powf`, \
+         `atan2`, `cbrt`, ..., and on x86-64 without SSE4.1 `floor`, `ceil`, `round` \
+         and `trunc` too), which the standard library implements by calling libm"
+    })
+}
+
 /// Whether `name` is one of the aarch64 "outline atomics" helpers.
 ///
 /// `aarch64-unknown-linux-gnu` turns on `outline-atomics` by default, so every
@@ -1548,6 +1583,23 @@ fn link_objects<'d>(
                          `#[unsafe(no_mangle)] pub extern \"C\" fn {name}(..)` written \
                          in those narrower operations -- one written with the same \
                          operation compiles into a call to itself",
+                        name = s.name,
+                    );
+                }
+                if let Some(what) = libm_routine(s.name) {
+                    return anyhow!(
+                        "unresolved external symbol {name:?}: no member of the rlib \
+                         defines it, and the target neither defines nor imports it. \
+                         It is a C math library (libm) routine, which rustc calls for \
+                         {what}, leaving the linker to take it from libm, which \
+                         resplice does not read. Compute the value without it (a \
+                         polynomial over the range the splice needs, say), or define \
+                         it in the replacement crate as `#[unsafe(no_mangle)] pub \
+                         extern \"C\" fn {name}(..)` with the C signature, written \
+                         without the operation it implements -- one written with it \
+                         compiles into a call to itself. The `libm` crate's source for \
+                         it can be copied in, but not depended on: resplice reads only \
+                         the replacement crate's own rlib",
                         name = s.name,
                     );
                 }
@@ -2322,6 +2374,43 @@ mod tests {
         assert!(msg.contains("`/` or `%`"), "message was {msg:?}");
         assert!(msg.contains("extern \"C\" fn __udivti3"), "message was {msg:?}");
         assert!(!msg.contains("core::panicking"), "message was {msg:?}");
+    }
+
+    /// `%` between two floats compiles into a call to `fmod`, which a C
+    /// target that does no floating point of its own does not import, so a
+    /// splice doing it fails on a symbol its source never names. The error has
+    /// to say it is a libm routine and what compiled into it, not point at
+    /// `core::panicking`.
+    #[test]
+    fn test_link_rlib_explains_unresolved_libm_routine() {
+        let msg = unresolved_call_err("rlib_fmod", "fmod");
+        assert!(msg.contains("unresolved external symbol \"fmod\""), "message was {msg:?}");
+        assert!(msg.contains(".rspl.401000.401020"), "message was {msg:?}");
+        assert!(msg.contains("libm"), "message was {msg:?}");
+        assert!(msg.contains("`%` between two floats"), "message was {msg:?}");
+        assert!(msg.contains("extern \"C\" fn fmod"), "message was {msg:?}");
+        assert!(!msg.contains("core::panicking"), "message was {msg:?}");
+    }
+
+    /// The math routines are recognised in both their `f64` and `f32`
+    /// (`f`-suffixed) names, and neither libc's other functions nor a name
+    /// that merely ends in `f` are mistaken for them.
+    #[test]
+    fn libm_routines_are_recognised_by_name() {
+        for name in ["fmod", "fmodf"] {
+            assert!(libm_routine(name).is_some_and(|w| w.contains('%')), "{name}");
+        }
+        for name in [
+            "sin", "sinf", "pow", "powf", "expf", "atan2", "cbrt", "hypot", "log1p", "erf",
+            "erff", "modf", "floorf",
+        ] {
+            assert!(libm_routine(name).is_some_and(|w| w.contains("float method")), "{name}");
+        }
+        for name in [
+            "printf", "memcpy", "f", "erf_", "sprintf", "fmodff", "sinl", "__powidf2", "helper",
+        ] {
+            assert_eq!(libm_routine(name), None, "{name}");
+        }
     }
 
     /// A debug build of the README's example fails on the abort-on-unwind

@@ -126,6 +126,15 @@ pub unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut 
 }
 ```
 
+Floating point reaches the C library too: `%` between two floats compiles into
+a call to `fmod` (`fmodf` for `f32`), and the float methods the CPU has no
+instruction for (`sin`, `exp`, `ln`, `powf`, `atan2`, `cbrt`, ...) into calls to
+the libm routine of the same name. A C target that does no such math itself
+imports none of them, so define the one named in the error in the replacement
+crate (the `libm` crate's source for it can be copied in; depending on that
+crate does not help, since its rlib is never read), or compute the value
+without it.
+
 Atomics are the same story on aarch64 Linux. There an atomic read-modify-write
 (`fetch_add`, `swap`, `compare_exchange` on any `Atomic*`) compiles into a call
 to an *outline-atomics* helper such as `__aarch64_ldadd4_relax`, which normally
