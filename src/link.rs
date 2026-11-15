@@ -110,8 +110,9 @@ fn map_rlib(path: &Path) -> Result<Rlib> {
 /// it, and the helpers and `static`s its siblings reference in it, are then
 /// simply absent -- so `resplice` patches whichever splices the members that
 /// did parse happened to carry, reports exactly that many as applied, and exits
-/// successfully. A one-member rlib produces nothing but a "no splices found"
-/// warning next to an unpatched copy of the target.
+/// successfully. A one-member rlib produced nothing but a "no splices found"
+/// warning next to an unpatched copy of the target (an rlib with no splice in
+/// it is refused now; see [`link_rlib`]).
 ///
 /// Two things mark a member as one that had to parse:
 ///
@@ -214,6 +215,26 @@ pub fn link_rlib(binary: &mut Binary, rlib_path: &Path) -> Result<Vec<Applied>> 
     let mut blob: Vec<u8> = Vec::new();
     let mut patches: Vec<Patch> = Vec::new();
     link_objects(&objs, binary, base, &mut blob, &mut patches)?;
+
+    // An rlib with nothing to splice used to go through: a warning on stderr,
+    // `applied 0 splice(s)` on stdout, an unchanged copy of the target at the
+    // output path and exit status 0 -- the one outcome everything else here
+    // refuses to produce. It is reached by handing the tool the wrong file: the
+    // rlib of a helper crate rather than the replacement crate's, a stale path
+    // in a workspace, or every `#[Splice]` behind a `#[cfg]` that was off. The
+    // `./patched` that follows then tests the original.
+    if patches.is_empty() {
+        bail!(
+            "no `#[Splice]` items in {}: none of its {} object member(s) has a \
+             `.rspl.<begin>.<end>` section, so there is nothing to patch and the output \
+             would be an unchanged copy of the target. Check that this is the rlib of the \
+             replacement crate (`cargo build --release` in that crate leaves it at \
+             `target/release/lib<crate>.rlib`) and that its `#[Splice]` items are not \
+             behind a `#[cfg]` that is off",
+            rlib_path.display(),
+            objs.len()
+        );
+    }
 
     // Two splices claiming overlapping ranges cannot both survive: each patch
     // NOP-fills the whole of its own region, so whichever is written last erases
@@ -3631,6 +3652,37 @@ mod tests {
         let (bin, applied) = run_link_on(&crafted_target(), "rlib_rmeta", &rlib);
         assert_eq!(applied.len(), 1);
         assert_eq!(lea_target(&bin), INJECT_BASE);
+    }
+
+    /// An rlib with no `.rspl.*` section in any member has nothing to splice.
+    /// It used to link: zero patches, a warning on stderr, and the output
+    /// written as an unchanged copy of the target with exit status 0 -- which is
+    /// what the wrong rlib (a helper crate's, a stale path, every `#[Splice]`
+    /// `#[cfg]`-ed out) got a user, right before `./patched` ran the original.
+    /// It has to be refused like every other run that would report an
+    /// unpatched target as a success.
+    #[test]
+    fn test_link_rlib_refuses_an_rlib_without_splices() {
+        use object::write::Object;
+        use object::{Architecture, BinaryFormat, Endianness, SectionKind};
+
+        // A well-formed object of the target's architecture, with code and data
+        // in it -- just no splice section. Alongside the metadata member rustc
+        // puts in every rlib, so the count in the message is of object members.
+        let mut obj = Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+        let text = obj.add_section(vec![], b".text.helper".to_vec(), SectionKind::Text);
+        obj.append_section_data(text, &HELPER_CODE, 1);
+        let rodata = obj.add_section(vec![], b".rodata.table".to_vec(), SectionKind::ReadOnlyData);
+        obj.append_section_data(rodata, &table_data(), 1);
+        let member = obj.write().unwrap();
+        let mut rmeta = Vec::from(&b"rust\0\0\0\0"[..]);
+        rmeta.extend_from_slice(&[0xab; 64]);
+        let rlib = ar_wrap_many(&[("lib.rmeta", &rmeta), ("helper.o", &member)]);
+
+        let msg = link_err("rlib_no_splices", &rlib);
+        assert!(msg.contains("no `#[Splice]` items in"), "message was {msg:?}");
+        assert!(msg.contains("1 object member(s)"), "message was {msg:?}");
+        assert!(msg.contains("unchanged copy of the target"), "message was {msg:?}");
     }
 
     /// An rlib whose splice reads a `TABLE` through

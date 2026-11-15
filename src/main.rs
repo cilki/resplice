@@ -54,10 +54,9 @@ fn parse_addr(s: &str) -> Result<u64, String> {
 fn run(cli: Cli) -> Result<()> {
     let mut binary = Binary::load(&cli.original_binary)?;
     binary.set_injected_base(cli.inject_base);
+    // An rlib with no `#[Splice]` in it is an error from `link_rlib`, so
+    // `applied` is never empty here and nothing is written for one.
     let applied = link_rlib(&mut binary, Path::new(&cli.rlib))?;
-    if applied.is_empty() {
-        eprintln!("warning: no splices found in {}", cli.rlib.display());
-    }
     binary.save(&cli.output_binary)?;
 
     // One line per splice, and a crate that reimplements a few thousand

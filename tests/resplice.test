@@ -521,6 +521,30 @@ testRlibBuiltWithLtoIsRefusedNamingTheProfileSetting() {
 	grep -q 'lto = false' "$fixture/err"
 }
 
+## An rlib with no `#[Splice]` in it -- the wrong crate's, or one whose splices
+## are all behind a `#[cfg]` that is off -- has to be refused, and nothing
+## written. It used to go through with a warning: `applied 0 splice(s)` and an
+## unchanged copy of the target at the output path, exit status 0, so the
+## `./patched` that followed ran the original.
+##
+## The rlib is one rustc built, so it carries the `lib.rmeta` member next to its
+## object members, as the one a reader points `resplice` at does.
+testRlibWithoutSplicesIsRefusedAndNothingWritten() {
+	newFixture
+	writeComputeAsm 32
+	printf '%s\n' '#include <stdio.h>' 'int compute(void);' \
+		'int main(void){ printf("%d\n", compute()); return 0; }' > "$fixture/prog.c"
+	buildTarget "$fixture/compute.s"
+
+	printf 'pub extern "C" fn compute() -> i32 { 42 }\n' > "$fixture/src/lib.rs"
+	buildFixture
+
+	! target/release/resplice "$fixture/prog" "$rlib" \
+		"$fixture/prog.patched" 2> "$fixture/err"
+	[ ! -e "$fixture/prog.patched" ]
+	grep -q 'no `#\[Splice\]` items in' "$fixture/err"
+}
+
 ## The attributes written on a spliced `fn` have to survive `#[Splice]`.
 ##
 ## `#[Splice]` used to rebuild the function from its visibility, signature and
