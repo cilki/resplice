@@ -1488,19 +1488,6 @@ fn link_objects<'d>(
         blob.extend_from_slice(bytes);
     }
 
-    // Synthesize a pointer-sized GOT slot per symbol referenced by a GOT-style
-    // relocation, so an indirect load through the GOT reaches a real pointer.
-    let got_width = arch::got_slot_width(is_64);
-    let mut got: IdTable<(u64, usize)> = IdTable::new(&sym_lens);
-    for sym in got_syms {
-        if got.get(sym).is_none() {
-            pad_to(blob, got_width as u64)?;
-            let va = base + blob.len() as u64;
-            got.insert(sym, (va, blob.len()))?;
-            blob.resize(blob.len() + got_width, 0);
-        }
-    }
-
     // Everything the closure leaves undefined has to come from the target
     // itself, and that is the whole list: `syms` holds exactly the symbols the
     // included sections' relocations reference, and `extract_relocs` has
@@ -1513,6 +1500,30 @@ fn link_objects<'d>(
             .filter(|s| s.undefined)
             .map(|s| s.name),
     )?;
+
+    // The target's own GOT slot for a symbol the rlib leaves undefined, when
+    // it has one. A GOT reference to such a symbol goes through that slot,
+    // exactly as the target's own code does, rather than through one
+    // synthesized here or relaxed away: the slot is where the dynamic loader
+    // puts whichever definition wins at run time, which in a shared library
+    // need not be the library's own. See [`crate::TargetSymbols::got_slot`].
+    let target_got = |sym: SymId| -> Option<u64> {
+        let s = syms.get(sym)?;
+        if s.undefined { target_syms.got_slot(s.name) } else { None }
+    };
+
+    // Synthesize a pointer-sized GOT slot per symbol referenced by a GOT-style
+    // relocation, so an indirect load through the GOT reaches a real pointer.
+    let got_width = arch::got_slot_width(is_64);
+    let mut got: IdTable<(u64, usize)> = IdTable::new(&sym_lens);
+    for sym in got_syms {
+        if got.get(sym).is_none() && target_got(sym).is_none() {
+            pad_to(blob, got_width as u64)?;
+            let va = base + blob.len() as u64;
+            got.insert(sym, (va, blob.len()))?;
+            blob.resize(blob.len() + got_width, 0);
+        }
+    }
 
     // Resolve a symbol index to its final virtual address.
     let resolve = |sym: SymId| -> Result<u64> {
@@ -1749,11 +1760,43 @@ fn link_objects<'d>(
                 };
                 format!("relocation against {what:?} in {:?}", sec_name(objs, si))
             };
-            let s = resolve(r.sym).with_context(context)?;
             let p = site_base + r.offset;
             let a = if r.has_implicit { 0 } else { r.addend };
-            let mut got_va = got.get(r.sym).map(|&(gva, _)| gva);
             let mut r_type = r.r_type;
+
+            // A GOT reference to a symbol the target has a GOT slot for loads
+            // through that slot. The field holds the slot's address and never
+            // the symbol's, so there is nothing to resolve -- and nothing to
+            // resolve *to* when the target imports the symbol rather than
+            // defining it -- and nothing to relax: the slot is the target's
+            // own, filled in by the loader wherever the image lands.
+            if let Some(slot) = arch::needs_got(arch, r_type)
+                .then(|| target_got(r.sym))
+                .flatten()
+            {
+                let buf: &mut [u8] = match bo {
+                    Some(bo) => &mut blob[bo..bo + sec.bytes.len()],
+                    None => &mut out,
+                };
+                arch::apply(
+                    arch,
+                    endian,
+                    r_type,
+                    buf,
+                    r.offset as usize,
+                    0,
+                    a,
+                    p,
+                    Some(slot),
+                    r.has_implicit,
+                    None,
+                )
+                .with_context(context)?;
+                continue;
+            }
+
+            let s = resolve(r.sym).with_context(context)?;
+            let mut got_va = got.get(r.sym).map(|&(gva, _)| gva);
 
             // An absolute address baked into a position-independent target is
             // wrong by its load base, and there is nothing left to correct it:
@@ -1791,8 +1834,11 @@ fn link_objects<'d>(
                 // A GOT slot holds an absolute address, so a GOT reference is
                 // relaxed into the PC-relative form a static linker produces
                 // for a symbol that cannot be preempted (`mov rax, [rip+got]`
-                // -> `lea rax, [rip+sym]`, `adrp`+`ldr` -> `adrp`+`add`). Every
-                // symbol a splice reaches is such a symbol. This is what lets a
+                // -> `lea rax, [rip+sym]`, `adrp`+`ldr` -> `adrp`+`add`). A
+                // symbol the target itself reaches through its GOT -- the way a
+                // shared library reaches a global another module may preempt --
+                // went through the target's slot above instead, so what is left
+                // is bound where it was found. This is what lets a
                 // splice read or write a global of a PIE target: rustc reaches
                 // an `extern` static through the GOT whatever the relocation
                 // model. Only a form `arch::relax_got` does not recognise is
@@ -3075,6 +3121,142 @@ mod tests {
         );
         let toff = bin.va_to_offset(table_va).unwrap();
         assert_eq!(&d[toff..toff + table_data().len()], &table_data());
+    }
+
+    /// Address of the GOT slot [`with_got_slot`] gives the crafted target.
+    const TARGET_GOT_SLOT: u64 = TARGET_BASE + 0x1800;
+
+    /// `target` with a `.dynsym` naming `name` and a `.rela.dyn` holding one
+    /// `R_X86_64_GLOB_DAT` against it at [`TARGET_GOT_SLOT`]: a GOT slot of
+    /// the target's own, the way a shared library has one for each global it
+    /// reaches through its GOT. `defined` is the symbol's `st_value` when the
+    /// target defines it as well, and `None` when it only imports it.
+    ///
+    /// The tables are appended past the end of the mapped image, as section
+    /// contents nothing loads.
+    fn with_got_slot(mut d: Vec<u8>, name: &str, defined: Option<u64>) -> Vec<u8> {
+        let w16 = |d: &mut [u8], at: usize, v: u16| d[at..at + 2].copy_from_slice(&v.to_le_bytes());
+        let w32 = |d: &mut [u8], at: usize, v: u32| d[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        let w64 = |d: &mut [u8], at: usize, v: u64| d[at..at + 8].copy_from_slice(&v.to_le_bytes());
+
+        let mut dynstr = vec![0u8];
+        dynstr.extend_from_slice(name.as_bytes());
+        dynstr.push(0);
+        // STN_UNDEF, then the symbol: STB_GLOBAL | STT_OBJECT.
+        let mut dynsym = vec![0u8; 48];
+        w32(&mut dynsym, 24, 1);
+        dynsym[24 + 4] = (1 << 4) | 1;
+        if let Some(value) = defined {
+            w16(&mut dynsym, 24 + 6, 1); // any defined section
+            w64(&mut dynsym, 24 + 8, value);
+        }
+        let mut rela = vec![0u8; 24];
+        w64(&mut rela, 0, TARGET_GOT_SLOT);
+        w64(&mut rela, 8, (1 << 32) | object::elf::R_X86_64_GLOB_DAT.0 as u64);
+        let shstrtab = b"\0.dynsym\0.dynstr\0.rela.dyn\0.shstrtab\0";
+
+        let (off_dynsym, off_dynstr) = (d.len(), d.len() + dynsym.len());
+        let off_rela = (off_dynstr + dynstr.len() + 7) & !7;
+        let off_shstr = off_rela + rela.len();
+        let shoff = (off_shstr + shstrtab.len() + 7) & !7;
+        d.resize(shoff + 5 * 64, 0);
+        d[off_dynsym..off_dynstr].copy_from_slice(&dynsym);
+        d[off_dynstr..off_dynstr + dynstr.len()].copy_from_slice(&dynstr);
+        d[off_rela..off_shstr].copy_from_slice(&rela);
+        d[off_shstr..off_shstr + shstrtab.len()].copy_from_slice(shstrtab);
+
+        // (sh_name, sh_type, sh_offset, sh_size, sh_link, sh_entsize)
+        let shdrs = [
+            (1, 11, off_dynsym, dynsym.len(), 2, 24), // .dynsym -> .dynstr
+            (9, 3, off_dynstr, dynstr.len(), 0, 0),   // .dynstr
+            (17, 4, off_rela, rela.len(), 1, 24),     // .rela.dyn -> .dynsym
+            (27, 3, off_shstr, shstrtab.len(), 0, 0), // .shstrtab
+        ];
+        for (i, (name, kind, off, size, link, entsize)) in shdrs.into_iter().enumerate() {
+            let sh = shoff + (i + 1) * 64;
+            w32(&mut d, sh, name);
+            w32(&mut d, sh + 4, kind);
+            w64(&mut d, sh + 24, off as u64);
+            w64(&mut d, sh + 32, size as u64);
+            w32(&mut d, sh + 40, link);
+            w64(&mut d, sh + 56, entsize);
+        }
+        w64(&mut d, 0x28, shoff as u64); // e_shoff
+        w16(&mut d, 0x3a, 64); // e_shentsize
+        w16(&mut d, 0x3c, 5); // e_shnum
+        w16(&mut d, 0x3e, 4); // e_shstrndx
+        d
+    }
+
+    /// An rlib whose 8-byte splice loads `name`'s address out of the GOT
+    /// (`mov rax, [rip + name@GOTPCREL]`), `name` being left undefined for the
+    /// target to provide -- an `extern` static, as rustc compiles one.
+    fn build_rlib_got_extern(name: &str) -> Vec<u8> {
+        use object::write::{Object, Relocation, Symbol, SymbolSection as WSection};
+        use object::{
+            Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolFlags,
+            SymbolKind, SymbolScope,
+        };
+
+        let mut obj = Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+        let sym = obj.add_symbol(Symbol {
+            name: name.as_bytes().to_vec(),
+            value: 0,
+            size: 0,
+            kind: SymbolKind::Data,
+            scope: SymbolScope::Linkage,
+            weak: false,
+            section: WSection::Undefined,
+            flags: SymbolFlags::None,
+        });
+        let sec = format!(".rspl.{SPLICE_VA:x}.{:x}", SPLICE_VA + 0x20).into_bytes();
+        let rspl = obj.add_section(vec![], sec, SectionKind::Text);
+        obj.append_section_data(rspl, &GOT_SPLICE_CODE, 16);
+        obj.add_relocation(
+            rspl,
+            Relocation {
+                offset: 3,
+                symbol: sym,
+                addend: -4,
+                flags: RelocationFlags::Elf { r_type: object::elf::R_X86_64_REX_GOTPCRELX },
+            },
+        )
+        .unwrap();
+        ar_wrap("splice.o", &obj.write().unwrap())
+    }
+
+    /// A GOT reference to a global the target reaches through a GOT slot of
+    /// its own has to load through that slot, not be relaxed to the address
+    /// the target defines the global at.
+    ///
+    /// In a shared library the two differ. An executable that reads a global
+    /// of the library directly gets its own copy of it (a copy relocation),
+    /// and the loader points the library's slot at that copy, so the library's
+    /// own code uses the copy too. Relaxing the splice's load bound it to the
+    /// library's definition, a variable nothing else in the process used: a
+    /// splice that updated a counter left the executable reading the old value.
+    ///
+    /// When the target only imports the global (`stdout` in a library, say),
+    /// the slot is the one place it can be reached at all. That used to be
+    /// reported as a symbol the target "neither defines nor imports".
+    #[test]
+    fn test_link_rlib_loads_through_the_targets_own_got_slot() {
+        for (tag, defined) in [
+            ("rlib_got_preempt", Some(TARGET_BASE + 0x1900)),
+            ("rlib_got_import", None),
+        ] {
+            for target in [crafted_target(), crafted_pie_target()] {
+                let target = with_got_slot(target, "counter", defined);
+                let (bin, applied) = run_link_on(&target, tag, &build_rlib_got_extern("counter"));
+                assert_eq!(applied.len(), 1);
+
+                let d = bin.data();
+                assert_eq!(&d[0x1000..0x1003], &[0x48, 0x8b, 0x05], "{tag}: load was relaxed");
+                let disp = i32::from_le_bytes(d[0x1003..0x1007].try_into().unwrap());
+                let slot = (SPLICE_VA as i64 + 7 + disp as i64) as u64;
+                assert_eq!(slot, TARGET_GOT_SLOT, "{tag}: load does not use the target's slot");
+            }
+        }
     }
 
     /// Link `rlib` into the crafted target and return the error it must produce.

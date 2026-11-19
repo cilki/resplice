@@ -408,7 +408,13 @@ link-time value, and whether that survives depends on what the reference holds:
   splice — the bulk of what a replacement compiles into. A load through the
   GOT is turned into one of these (`adrp`+`ldr` becomes `adrp`+`add`, `mov`
   becomes `lea`), which is how a splice reaches a global the target defines:
-  rustc always goes through the GOT for an `extern` static.
+  rustc always goes through the GOT for an `extern` static. The exception is
+  a global the target itself loads through a GOT slot of its own (a
+  `GLOB_DAT` dynamic relocation), which a shared library does for every global
+  it exports or imports. The splice loads through that slot too, so it sees
+  whichever definition the loader picked, such as the executable's copy of a
+  library global, and it can reach a global the target only imports, like
+  `stdout`.
 
   ```rust
   unsafe extern "C" { static mut counter: i32; } // defined by the target

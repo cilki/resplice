@@ -60,6 +60,10 @@ pub struct TargetSymbols<'n> {
     /// One entry per name asked about, `None` for a name the target neither
     /// defines nor imports.
     bound: HashMap<&'n str, Option<Binding>>,
+    /// The target's own GOT slot for each name asked about that has one: the
+    /// address a `GLOB_DAT` dynamic relocation against that name fills in at
+    /// load time. See [`TargetSymbols::got_slot`].
+    got: HashMap<&'n str, u64>,
 }
 
 /// Record `binding` for a name in the map [`Binary::target_symbols`] builds.
@@ -81,6 +85,25 @@ fn bind(slot: &mut Option<Binding>, binding: Binding) {
 }
 
 impl TargetSymbols<'_> {
+    /// The address of the target's own GOT slot for `name`, when it has one.
+    ///
+    /// A slot like that is filled in by the dynamic loader. Whatever `name`
+    /// resolves to at run time is what ends up in it, and that is not always
+    /// the definition `name` has in the target. In a shared library an
+    /// exported global can be *preempted*: when the executable reads it
+    /// directly, the executable gets its own copy of it (a copy relocation),
+    /// and the library's slot is pointed at that copy. The library's own code
+    /// goes through the slot, so it uses the copy too. A splice has to do the
+    /// same. If it addresses the library's definition directly, it reads and
+    /// writes a variable that nothing else in the process uses.
+    ///
+    /// Loading through the slot is also position-independent, since the
+    /// slot's address moves with the image. And it reaches data the target
+    /// only imports, which has no address in the target to bind to at all.
+    pub fn got_slot(&self, name: &str) -> Option<u64> {
+        self.got.get(name).copied()
+    }
+
     /// What the target offers for `name`: its address, `None` when the target
     /// neither defines nor imports it, or an error when what it defines is not
     /// something a reference can be pointed at (see [`Binding`]).
@@ -1175,13 +1198,14 @@ impl Binary {
         &self,
         names: impl IntoIterator<Item = &'n str>,
     ) -> Result<TargetSymbols<'n>> {
-        use goblin::elf::section_header::{SHN_UNDEF, SHT_DYNSYM, SHT_RELA, SHT_SYMTAB};
+        use goblin::elf::section_header::{SHN_UNDEF, SHT_DYNSYM, SHT_REL, SHT_RELA, SHT_SYMTAB};
         use goblin::elf::sym::{STT_GNU_IFUNC, STT_TLS};
 
         let mut bound: HashMap<&'n str, Option<Binding>> =
             names.into_iter().map(|name| (name, None)).collect();
+        let mut got: HashMap<&'n str, u64> = HashMap::new();
         if bound.is_empty() {
-            return Ok(TargetSymbols { bound });
+            return Ok(TargetSymbols { bound, got });
         }
 
         // A 256-bit set of the first byte of every name asked about, which is
@@ -1313,7 +1337,72 @@ impl Binary {
             }
         }
 
-        Ok(TargetSymbols { bound })
+        // 4: the target's own GOT slots, one per `GLOB_DAT` dynamic relocation
+        // against a name asked about. See [`TargetSymbols::got_slot`]. MIPS
+        // has no `GLOB_DAT`: its GOT is laid out by `.dynamic` entries
+        // instead, and is not read here.
+        let glob_dat = match self.arch {
+            Architecture::X86 | Architecture::X86_64 => Some(6), // R_386_ / R_X86_64_GLOB_DAT
+            Architecture::Arm64 => Some(1025),                   // R_AARCH64_GLOB_DAT
+            Architecture::Arm => Some(21),                       // R_ARM_GLOB_DAT
+            Architecture::Mips | Architecture::Mips64 => None,
+        };
+        let dynsym_idx = shdrs.iter().rposition(|sh| sh.sh_type == SHT_DYNSYM);
+        if let (Some(glob_dat), Some(dynsym_idx)) = (glob_dat, dynsym_idx) {
+            let dynsym = &shdrs[dynsym_idx];
+            let syms = self.section_bytes(dynsym);
+            let names = self.section_bytes_at(&shdrs, dynsym.sh_link as usize);
+            let sym_stride = (dynsym.sh_entsize as usize).max(sym_size);
+            // Every relocation section against `.dynsym`, whatever it is
+            // called: `.rela.dyn` is where the slots are, and `.rela.plt`
+            // holds only `JUMP_SLOT`s, which the type test skips.
+            let relsecs = shdrs.iter().filter(|sh| {
+                matches!(sh.sh_type, SHT_RELA | SHT_REL) && sh.sh_link as usize == dynsym_idx
+            });
+            if let (Some(syms), Some(names)) = (syms, names) {
+                for sh in relsecs {
+                    let Some(rels) = self.section_bytes(sh) else {
+                        continue;
+                    };
+                    let rel_size = if sh.sh_type == SHT_RELA {
+                        c.relasize
+                    } else {
+                        c.relsize
+                    };
+                    let stride = (sh.sh_entsize as usize).max(rel_size);
+                    for rel in (0..).map_while(|i| {
+                        let at = i * stride;
+                        rels.get(at..at.checked_add(rel_size)?)
+                    }) {
+                        let r_info = endian.read_uint(rel, word, word);
+                        let (sym, r_type) = if is_64 {
+                            (r_info >> 32, r_info & 0xffff_ffff)
+                        } else {
+                            (r_info >> 8, r_info & 0xff)
+                        };
+                        if r_type != glob_dat {
+                            continue;
+                        }
+                        let at = (sym as usize).saturating_mul(sym_stride);
+                        let Some(entry) = at
+                            .checked_add(sym_size)
+                            .and_then(|end| syms.get(at..end))
+                        else {
+                            continue;
+                        };
+                        let name_off = endian.read_uint(entry, 0, 4) as usize;
+                        let Some((&name, _)) = strtab_str(names, name_off)
+                            .and_then(|n| bound.get_key_value(n))
+                        else {
+                            continue;
+                        };
+                        got.entry(name).or_insert(endian.read_uint(rel, 0, word));
+                    }
+                }
+            }
+        }
+
+        Ok(TargetSymbols { bound, got })
     }
 
     /// Verify that `[base, base + len)` does not collide with the target's own
