@@ -97,9 +97,11 @@ pub fn needs_got(arch: Architecture, r_type: RelocationType) -> bool {
 /// untouched in that case.
 ///
 /// These are the relaxations a static linker performs for a symbol it knows
-/// cannot be preempted, and every symbol a splice reaches is one: it resolves
-/// either into the target or into the injected segment, both at link-time
-/// offsets that move together with the code referencing them. For a
+/// cannot be preempted. The linker only asks for it once a reference has been
+/// bound into the target or the injected segment, both at link-time offsets
+/// that move together with the code referencing them; a symbol the target
+/// reaches through a GOT slot of its own goes through that slot instead and is
+/// never relaxed (see [`crate::TargetSymbols::got_slot`]). For a
 /// position-independent target that is the difference between working and
 /// not, because the slot `resplice` would otherwise synthesize holds an
 /// absolute address that nothing relocates at load time.
