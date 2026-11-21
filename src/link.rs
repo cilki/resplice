@@ -978,6 +978,16 @@ fn absolute_in_pie(what: &str, remedy: &str) -> anyhow::Error {
 /// memory itself does not. Reported as plain unresolved symbols, they looked
 /// like a call the user wrote, and the hint about `core::panicking` pointed at
 /// the wrong fix.
+///
+/// `strlen` is in the same position. LLVM recognises a loop that counts bytes
+/// up to a NUL -- `while *p.add(n) != 0 { n += 1 }`, the obvious way to walk a
+/// C string -- and replaces it with a call to `strlen`, and `CStr::from_ptr`
+/// calls it outright. A C program that measures no string of its own imports
+/// no `strlen`, so a splice whose source never names it failed on it, and the
+/// message said nothing about where the call came from. `wcslen` is the same
+/// idiom over `wchar_t`. The loop-written definition the message asks for does
+/// not recurse into itself: LLVM leaves the idiom alone inside a function of
+/// that name.
 fn compiler_libcall(name: &str) -> Option<&'static str> {
     Some(match name {
         "memcpy" => "copies too large to inline (a struct or array moved by value, \
@@ -988,6 +998,11 @@ fn compiler_libcall(name: &str) -> Option<&'static str> {
                      `fill`, zeroing a large struct)",
         "memcmp" | "bcmp" => "comparisons of byte arrays and slices too large to \
                               inline (`==` between `[u8; N]` or `&[u8]`)",
+        "strlen" => "a loop that counts bytes up to a NUL terminator (`while *p.add(n) \
+                     != 0 { n += 1 }`), which LLVM recognises and replaces with the \
+                     call, and for `CStr::from_ptr`",
+        "wcslen" => "a loop that counts `wchar_t`s up to a NUL terminator, which LLVM \
+                     recognises and replaces with the call",
         _ => return None,
     })
 }
@@ -2406,6 +2421,19 @@ mod tests {
         assert!(msg.contains(".rspl.401000.401020"), "message was {msg:?}");
         assert!(msg.contains("rustc emits the call itself"), "message was {msg:?}");
         assert!(msg.contains("extern \"C\" fn memcpy"), "message was {msg:?}");
+        assert!(!msg.contains("core::panicking"), "message was {msg:?}");
+    }
+
+    /// LLVM turns a hand-written loop over a C string into a call to
+    /// `strlen`, which a target that measures no string of its own does not
+    /// import. The error has to say the loop is where the call came from.
+    #[test]
+    fn test_link_rlib_explains_unresolved_strlen_idiom() {
+        let msg = unresolved_call_err("rlib_strlen", "strlen");
+        assert!(msg.contains("unresolved external symbol \"strlen\""), "message was {msg:?}");
+        assert!(msg.contains("rustc emits the call itself"), "message was {msg:?}");
+        assert!(msg.contains("NUL terminator"), "message was {msg:?}");
+        assert!(msg.contains("extern \"C\" fn strlen"), "message was {msg:?}");
         assert!(!msg.contains("core::panicking"), "message was {msg:?}");
     }
 
