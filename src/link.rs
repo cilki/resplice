@@ -1007,6 +1007,35 @@ fn compiler_libcall(name: &str) -> Option<&'static str> {
     })
 }
 
+/// The call LLVM rewrites into one to `name`, if `name` is a C library routine
+/// it substitutes for a formatted-output call.
+///
+/// LLVM treats `printf` and its relatives as known functions, and turns a call
+/// whose format it can see, and whose result is unused, into a cheaper
+/// routine: `printf("%s\n", s)` becomes `puts(s)`, `fprintf(f, "x")` becomes
+/// `fputc`, `sprintf(d, "%s", s)` becomes `strcpy`. A splice that calls the
+/// `printf` its target imports then needs a `puts` the target may well not
+/// import -- a C program that does all its output through `printf` imports
+/// nothing else. Unlike `memcpy` there is nothing to write by hand: the crate
+/// attribute `#![no_builtins]` stops the rewrite and leaves the call that was
+/// written, which is the one the target can satisfy.
+fn stdio_rewrite(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "puts" => "a `printf` of a plain line (`\"done\\n\"`) or of `\"%s\\n\"` whose \
+                   result is unused",
+        "putchar" => "a `printf` of a single character (`\"x\"`, `\"%c\"`) whose result is \
+                      unused, or a `puts(\"\")`",
+        "fputs" => "an `fprintf` of `\"%s\"` whose result is unused",
+        "fputc" => "an `fprintf` of a single character (`\"x\"`, `\"%c\"`) whose result is \
+                    unused",
+        "fwrite" => "an `fprintf` of a format with no `%` in it whose result is unused, or \
+                     an `fputs` of a string literal",
+        "strcpy" => "a `sprintf` of `\"%s\"` whose result is unused",
+        "stpcpy" => "a `sprintf` of `\"%s\"` whose result is used",
+        _ => return None,
+    })
+}
+
 /// What rustc lowers into a call to `name`, if `name` is a routine of the C
 /// math library.
 ///
@@ -1597,6 +1626,22 @@ fn link_objects<'d>(
                          extern \"C\" fn {name}(..)` with the C signature, written as a \
                          plain byte-at-a-time loop -- and the splice resolves to that \
                          copy instead",
+                        name = s.name,
+                    );
+                }
+                if let Some(what) = stdio_rewrite(s.name) {
+                    return anyhow!(
+                        "unresolved external symbol {name:?}: no member of the rlib \
+                         defines it, and the target neither defines nor imports it. If \
+                         the replacement crate does not call {name:?} itself, the call \
+                         is LLVM's: it treats the C library's formatted-output routines \
+                         as known functions and rewrites {what} into a call to \
+                         {name:?}, which the target need not import even when it \
+                         imports the routine the crate called. Add `#![no_builtins]` \
+                         at the top of the replacement crate's `lib.rs` to keep the \
+                         call as written; if the crate does call {name:?}, call a \
+                         routine the target imports instead, or define it in the \
+                         replacement crate",
                         name = s.name,
                     );
                 }
@@ -2435,6 +2480,26 @@ mod tests {
         assert!(msg.contains("NUL terminator"), "message was {msg:?}");
         assert!(msg.contains("extern \"C\" fn strlen"), "message was {msg:?}");
         assert!(!msg.contains("core::panicking"), "message was {msg:?}");
+    }
+
+    /// LLVM turns `printf("%s\n", s)` into `puts(s)`, which a target that does
+    /// all its output through `printf` does not import. The error has to say
+    /// the rewrite is LLVM's and name the crate attribute that stops it.
+    #[test]
+    fn test_link_rlib_explains_unresolved_stdio_rewrite() {
+        let msg = unresolved_call_err("rlib_puts", "puts");
+        assert!(msg.contains("unresolved external symbol \"puts\""), "message was {msg:?}");
+        assert!(msg.contains(".rspl.401000.401020"), "message was {msg:?}");
+        assert!(msg.contains("the call is LLVM's"), "message was {msg:?}");
+        assert!(msg.contains("`printf`"), "message was {msg:?}");
+        assert!(msg.contains("#![no_builtins]"), "message was {msg:?}");
+        assert!(!msg.contains("core::panicking"), "message was {msg:?}");
+        for name in ["putchar", "fputs", "fputc", "fwrite", "strcpy", "stpcpy"] {
+            assert!(stdio_rewrite(name).is_some(), "{name}");
+        }
+        for name in ["printf", "fprintf", "sprintf", "memcpy", "strlen", "write"] {
+            assert_eq!(stdio_rewrite(name), None, "{name}");
+        }
     }
 
     /// On aarch64-linux, rustc compiles an atomic `fetch_add` into a call to
