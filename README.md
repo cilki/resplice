@@ -335,10 +335,10 @@ pub extern "C" fn sum() {
     core::arch::naked_asm!(
         "stp x29, x30, [sp, #-96]!",
         "mov x29, sp",
-        "stp x8, x9, [sp, #16]",   // x8-x17: the registers a call may
-        "stp x10, x11, [sp, #32]", // overwrite, other than the argument
-        "stp x12, x13, [sp, #48]", // registers x0-x7
-        "stp x14, x15, [sp, #64]",
+        "stp x8, x9, [sp, #16]",   // x8-x17: the general-purpose
+        "stp x10, x11, [sp, #32]", // registers a call may overwrite,
+        "stp x12, x13, [sp, #48]", // other than the argument registers
+        "stp x14, x15, [sp, #64]", // x0-x7
         "stp x16, x17, [sp, #80]",
         "bl {imp}",
         "ldp x8, x9, [sp, #16]",
@@ -356,6 +356,30 @@ pub extern "C" fn sum() {
 The wrapper does not save the argument registers. Under `-fipa-ra` the caller
 may still expect them back unchanged if the original never wrote them, so save
 them too when the caller's disassembly reads them after the call.
+
+Nor does it save the floating-point/SIMD registers, which a call may overwrite
+too: all of `v0`-`v7` and `v16`-`v31`, and the upper 64 bits of `v8`-`v15`.
+An integer-only original never touches them, so a caller may keep a `double`
+there across the call. Compiled Rust uses them whenever it vectorizes, even
+for byte loops (a `.max()` or a `windows(2)` over a slice, or a small array
+copied by value). Here `main` loads the argument of a later call into `d0`
+before calling the function being replaced, and the patched program passes
+that later call a garbage value:
+
+```
+  40062c:  fmov d0, #1.5        // argument for scale(), loaded early ...
+  40063c:  bl   400800 <score>  // ... because the original `score` never writes d0
+  400648:  bl   400868 <scale>  // gets whatever the replacement left in d0
+```
+
+Save them in the wrapper as well, for each one the caller sets before the call
+and reads after it. Save the whole 128-bit `q` register, not just the `d` half:
+
+```rust
+        "stp q0, q1, [sp, #-32]!",
+        "bl {imp}",
+        "ldp q0, q1, [sp], #32",
+```
 
 ### Placing the injected segment
 
