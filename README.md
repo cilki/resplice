@@ -128,6 +128,22 @@ pub unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut 
 }
 ```
 
+A call the replacement does make can turn into one to a routine it never
+named. LLVM knows what `printf` and its relatives do, and rewrites a call whose
+format it can see, and whose result is unused, into a cheaper routine:
+`printf("%s\n", s)` into `puts(s)`, `printf("x")` into `putchar`, `fprintf` into
+`fputs`, `fputc` or `fwrite`, `sprintf(d, "%s", s)` into `strcpy`. A C target
+that does all its output through `printf` imports none of those, so the splice
+fails on a `puts` it never called. Put `#![no_builtins]` at the top of the
+replacement crate's `lib.rs` to keep each call as written (it also stops the
+`strlen` rewrite above):
+
+```rust
+#![no_builtins]
+
+unsafe extern "C" { fn printf(fmt: *const u8, ...) -> i32; } // imported by the target
+```
+
 Floating point reaches the C library too: `%` between two floats compiles into
 a call to `fmod` (`fmodf` for `f32`), and the float methods the CPU has no
 instruction for (`sin`, `exp`, `ln`, `powf`, `atan2`, `cbrt`, ...) into calls to
