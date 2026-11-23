@@ -295,6 +295,20 @@ error: splice 0x420030..0x420040: code splice 0x420030..0x420040 is in the
 PT_LOAD at 0x41fdc8..0x420048, which is mapped `RW` -- not executable, [...]
 ```
 
+An executable segment is not all code, though. On aarch64 (and on x86-64
+linked with `-z noseparate-code`) the one `R E` segment also holds `.rodata`,
+`.dynsym` and `.eh_frame`, so when the target has section headers a `fn`
+splice is also refused if it overlaps an allocated section that is not code:
+
+```
+error: splice 0x9b8..0x9c8: code splice 0x9b8..0x9c8 overlaps `.rodata` at
+0x9b8..0x9e4, which is not code: [...]
+```
+
+And no splice, `fn` or `static`, may overwrite the ELF header or the
+program-header table, which the first segment usually maps too; the loader
+needs both to load the patched binary at all.
+
 ### Callers that rely on more than the calling convention
 
 `extern "C"` gives a replacement the platform's calling convention, and that is
