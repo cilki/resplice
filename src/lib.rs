@@ -230,6 +230,7 @@ struct Class {
     p_align: usize,
     // Section-header entry; `sh_name` and `sh_type` are at 0 and 4 in both.
     shentsize: usize,
+    sh_flags: usize,
     sh_addr: usize,
     sh_offset: usize,
     sh_size: usize,
@@ -271,6 +272,7 @@ const ELF32: Class = Class {
     p_flags: 24,
     p_align: 28,
     shentsize: 40,
+    sh_flags: 8,
     sh_addr: 12,
     sh_offset: 16,
     sh_size: 20,
@@ -303,6 +305,7 @@ const ELF64: Class = Class {
     p_memsz: 40,
     p_align: 48,
     shentsize: 64,
+    sh_flags: 8,
     sh_addr: 16,
     sh_offset: 24,
     sh_size: 32,
@@ -321,6 +324,7 @@ const ELF64: Class = Class {
 struct Shdr {
     sh_name: u32,
     sh_type: u32,
+    sh_flags: u64,
     sh_addr: u64,
     sh_offset: u64,
     sh_size: u64,
@@ -765,6 +769,7 @@ impl Binary {
                 Shdr {
                     sh_name: endian.read_uint(&self.data, off, 4) as u32,
                     sh_type: endian.read_uint(&self.data, off + 4, 4) as u32,
+                    sh_flags: endian.read_uint(&self.data, off + c.sh_flags, word),
                     sh_addr: endian.read_uint(&self.data, off + c.sh_addr, word),
                     sh_offset: endian.read_uint(&self.data, off + c.sh_offset, word),
                     sh_size: endian.read_uint(&self.data, off + c.sh_size, word),
@@ -795,6 +800,16 @@ impl Binary {
     /// `e_shstrndx` — or, when the index does not fit that 16-bit field, by the
     /// `sh_link` of the null section header that `SHN_XINDEX` defers to.
     fn section_by_name(&self, shdrs: &[Shdr], name: &str) -> Option<Shdr> {
+        let names = self.section_names(shdrs)?;
+        shdrs
+            .iter()
+            .find(|sh| strtab_str(names, sh.sh_name as usize) == Some(name))
+            .copied()
+    }
+
+    /// The string table the section names live in, or `None` when the image
+    /// has no section headers or its `e_shstrndx` names nothing it backs.
+    fn section_names(&self, shdrs: &[Shdr]) -> Option<&[u8]> {
         use goblin::elf::section_header::SHN_XINDEX;
         if shdrs.is_empty() {
             return None;
@@ -805,11 +820,7 @@ impl Binary {
         if idx == SHN_XINDEX as usize {
             idx = shdrs.first()?.sh_link as usize;
         }
-        let names = self.section_bytes_at(shdrs, idx)?;
-        shdrs
-            .iter()
-            .find(|sh| strtab_str(names, sh.sh_name as usize) == Some(name))
-            .copied()
+        self.section_bytes_at(shdrs, idx)
     }
 
     /// Read the program-header table straight out of the image.
@@ -907,15 +918,115 @@ impl Binary {
     /// Each range is `(va, len, exec)`. With `exec` set, the range holds code
     /// the target will execute, so the segment backing it must be mapped
     /// executable as well -- see [`translate`](Self::translate).
+    ///
+    /// These are the ranges about to be written, so on top of translating them
+    /// each is checked against what the loader reads out of the image -- see
+    /// [`refuse_overwriting`](Self::refuse_overwriting).
     pub fn va_range_to_offsets(
         &self,
         ranges: impl IntoIterator<Item = (u64, u64, bool)>,
     ) -> Result<Vec<Result<usize>>> {
         let phdrs = self.program_headers()?;
+        // A section-header table this cannot read only costs the section-level
+        // check below, not the splice: the loader never looks at the table.
+        let shdrs = self.section_headers().unwrap_or_default();
         Ok(ranges
             .into_iter()
-            .map(|(va, len, exec)| self.translate(&phdrs, va, len, exec))
+            .map(|(va, len, exec)| {
+                let off = self.translate(&phdrs, va, len, exec)?;
+                self.refuse_overwriting(&shdrs, va, len, off, exec)?;
+                Ok(off)
+            })
             .collect())
+    }
+
+    /// Refuse a patch of `[va, va + len)`, at file offset `off`, that would
+    /// overwrite something other than what it was meant to replace.
+    ///
+    /// Translation only asks whether a segment maps the range, and the first
+    /// `PT_LOAD` of a typical image maps far more than code: it starts at file
+    /// offset 0, so it spans the ELF header and the program-header table, and
+    /// on aarch64 (and on x86-64 linked with `-z noseparate-code`) one `R E`
+    /// segment holds `.dynsym`, `.rela.dyn`, `.rodata` and `.eh_frame` as well
+    /// as `.text`. A `begin`/`end` that was the address of any of those passed
+    /// every check, was reported as applied, and left a binary the kernel
+    /// refused as "Exec format error" (header overwritten) or one that printed
+    /// garbage (its `.rodata` format strings overwritten by instructions).
+    ///
+    /// - No splice, code or data, may touch the ELF header or the
+    ///   program-header table: the kernel and the loader read both to map the
+    ///   image at all, and nothing a replacement holds belongs there. This
+    ///   needs nothing but the ELF header, so it holds for a stripped target.
+    /// - A code splice may not overlap an allocated section that is not
+    ///   `SHF_EXECINSTR`. Only the section headers say where code ends and
+    ///   tables begin inside an executable segment, so a target without them
+    ///   gets the segment-level check of [`translate`](Self::translate) alone.
+    ///   Bytes that no section claims (alignment padding between `.text` and
+    ///   `.fini`, say) are left writable.
+    fn refuse_overwriting(
+        &self,
+        shdrs: &[Shdr],
+        va: u64,
+        len: u64,
+        off: usize,
+        exec: bool,
+    ) -> Result<()> {
+        use goblin::elf::section_header::{SHF_ALLOC, SHF_EXECINSTR, SHT_NOBITS};
+        let c = self.class();
+        let end = va.saturating_add(len);
+        let file_end = (off as u64).saturating_add(len);
+        let overlaps = |a: u64, b: u64, lo: u64, hi: u64| a < hi && lo < b;
+
+        let phoff = self.endian.read_uint(&self.data, c.e_phoff, c.word);
+        let phnum = self.endian.read_uint(&self.data, c.e_phnum, 2);
+        let phend = phoff.saturating_add(phnum * c.phentsize as u64);
+        for (what, lo, hi) in [
+            ("ELF header", 0, c.ehsize as u64),
+            ("program-header table", phoff, phend),
+        ] {
+            if overlaps(off as u64, file_end, lo, hi) {
+                bail!(
+                    "{va:#x}..{end:#x} is file bytes {off:#x}..{file_end:#x}, which would \
+                     overwrite the target's {what} (file bytes {lo:#x}..{hi:#x}) -- the \
+                     loader reads it to map the image, so the patched binary would not \
+                     load. Check that `begin`/`end` are virtual addresses read from a \
+                     disassembly of this target"
+                );
+            }
+        }
+
+        if !exec {
+            return Ok(());
+        }
+        let names = self.section_names(shdrs);
+        for sh in shdrs {
+            let flags = sh.sh_flags;
+            if flags & SHF_ALLOC as u64 == 0
+                || flags & SHF_EXECINSTR as u64 != 0
+                || sh.sh_type == SHT_NOBITS
+                || sh.sh_size == 0
+            {
+                continue;
+            }
+            let sh_end = sh.sh_addr.saturating_add(sh.sh_size);
+            if !overlaps(va, end, sh.sh_addr, sh_end) {
+                continue;
+            }
+            let name = names
+                .and_then(|n| strtab_str(n, sh.sh_name as usize))
+                .filter(|n| !n.is_empty())
+                .map_or_else(|| "a section".to_string(), |n| format!("`{n}`"));
+            bail!(
+                "code splice {va:#x}..{end:#x} overlaps {name} at {:#x}..{sh_end:#x}, \
+                 which is not code: the segment mapping it is executable, but the \
+                 section is not (`SHF_EXECINSTR` is clear), so the replacement's \
+                 instructions would overwrite data the target reads. Check that \
+                 `begin`/`end` are the address of code (`.text`); to replace data, \
+                 put the #[Splice] on a `static` instead of a `fn`",
+                sh.sh_addr
+            );
+        }
+        Ok(())
     }
 
     /// [`va_range_to_offset`](Self::va_range_to_offset) against an
@@ -2322,6 +2433,8 @@ mod tests {
     /// offsets, and the same refusal for the same reason -- or the speedup is
     /// paid for in behaviour. A batch is also what the linker hands over, so an
     /// empty one (an rlib whose splices all trampoline) must not be an error.
+    /// (The batch also refuses writes over the image's headers, which a single
+    /// translation does not, so every range here is clear of them.)
     #[test]
     fn va_range_to_offsets_agrees_with_translating_one_at_a_time() {
         use goblin::elf::program_header::PT_LOAD;
@@ -2334,7 +2447,7 @@ mod tests {
         assert!(bin.va_range_to_offsets(std::iter::empty()).unwrap().is_empty());
 
         let ranges = [
-            (0x400000, 1),     // start of the first segment
+            (0x400100, 1),     // first segment, clear of the ELF and program headers
             (0x4003ff, 1),     // its last file-backed byte
             (0x401000, 0x40),  // the whole of the second segment's file data
             (0x400000, 0x401), // runs off the end of the segment mapping it
@@ -2356,7 +2469,7 @@ mod tests {
         }
         // Not vacuously equal: the batch really does translate and really does
         // refuse.
-        assert_eq!(*batch[0].as_ref().unwrap(), 0);
+        assert_eq!(*batch[0].as_ref().unwrap(), 0x100);
         assert_eq!(*batch[2].as_ref().unwrap(), 0x400);
         assert!(batch[3].as_ref().unwrap_err().to_string().contains("file-backed"));
         assert!(batch[4].as_ref().unwrap_err().to_string().contains("not mapped"));
@@ -2412,6 +2525,85 @@ mod tests {
         let bin = craft_injectable(Endian::Little, Architecture::X86_64, 0x440, &phdrs);
         let batch = bin.va_range_to_offsets([(0x420000, 0x10, true)]).unwrap();
         assert_eq!(*batch[0].as_ref().unwrap(), 0x400);
+    }
+
+    /// A splice may not overwrite what the loader reads, nor may a code splice
+    /// overwrite a table that shares an executable segment with `.text`.
+    ///
+    /// Both used to be reported as applied: on a typical aarch64 PIE, `begin =
+    /// 0x0` wrote instructions over the ELF header (the kernel then refused the
+    /// binary with "Exec format error"), and a `fn` splice at the address of
+    /// `.rodata` -- mapped `R E` with the code there -- overwrote the target's
+    /// format strings.
+    #[test]
+    fn va_range_to_offsets_refuses_headers_and_data_sections() {
+        use goblin::elf::program_header::PT_LOAD;
+        use goblin::elf::section_header::{
+            SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_NOBITS, SHT_PROGBITS, SHT_STRTAB,
+        };
+        const SHOFF: usize = 0x600;
+        const NAMES: &[u8] = b"\0.text\0.rodata\0.bss\0.shstrtab\0";
+        // One `R E` segment from file offset 0, as on aarch64: the ELF header at
+        // 0..0x40, the program-header table at 0x40..0x78, then the sections.
+        let phdrs: [Phdr; 1] = [(PT_LOAD as u64, 0, 0x400000, 0x400, 5, 0x1000)];
+        let mut bin = craft_injectable(Endian::Little, Architecture::X86_64, 0x800, &phdrs);
+        let alloc = SHF_ALLOC as u64;
+        // (sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size)
+        let sections = [
+            (1, SHT_PROGBITS, alloc | SHF_EXECINSTR as u64, 0x400100, 0x100, 0x100),
+            (7, SHT_PROGBITS, alloc, 0x400200, 0x200, 0x40),
+            // `.tbss`-like: NOBITS, claims addresses it has no bytes at.
+            (15, SHT_NOBITS, alloc | SHF_WRITE as u64, 0x400100, 0x200, 0x100),
+            (20, SHT_STRTAB, 0, 0, 0x780, NAMES.len() as u64),
+        ];
+        let e = bin.endian;
+        e.write_uint(&mut bin.data, 0x28, 8, SHOFF as u64); // e_shoff
+        e.write_uint(&mut bin.data, 0x3a, 2, 64); // e_shentsize
+        e.write_uint(&mut bin.data, 0x3c, 2, sections.len() as u64 + 1); // e_shnum
+        e.write_uint(&mut bin.data, 0x3e, 2, sections.len() as u64); // e_shstrndx
+        for (i, &(name, ty, flags, addr, off, size)) in sections.iter().enumerate() {
+            let so = SHOFF + (i + 1) * 64;
+            e.write_uint(&mut bin.data, so, 4, name);
+            e.write_uint(&mut bin.data, so + 4, 4, ty as u64);
+            e.write_uint(&mut bin.data, so + 8, 8, flags);
+            e.write_uint(&mut bin.data, so + 16, 8, addr);
+            e.write_uint(&mut bin.data, so + 24, 8, off);
+            e.write_uint(&mut bin.data, so + 32, 8, size);
+        }
+        bin.data[0x780..0x780 + NAMES.len()].copy_from_slice(NAMES);
+
+        let batch = bin
+            .va_range_to_offsets([
+                (0x400000, 0x10, true),  // 0: code over the ELF header
+                (0x400070, 0x10, false), // 1: data over the program-header table
+                (0x400100, 0x40, true),  // 2: code in `.text`
+                (0x4001f0, 0x20, true),  // 3: code running from `.text` into `.rodata`
+                (0x400200, 0x10, false), // 4: data in `.rodata`
+                (0x400240, 0x10, true),  // 5: code in bytes no section claims
+                (0x400078, 0x10, false), // 6: data just past the program headers
+            ])
+            .unwrap();
+
+        let err = batch[0].as_ref().unwrap_err().to_string();
+        assert!(err.contains("ELF header (file bytes 0x0..0x40)"), "{err}");
+        let err = batch[1].as_ref().unwrap_err().to_string();
+        assert!(err.contains("program-header table (file bytes 0x40..0x78)"), "{err}");
+        assert_eq!(*batch[2].as_ref().unwrap(), 0x100);
+        let err = batch[3].as_ref().unwrap_err().to_string();
+        assert!(err.contains("overlaps `.rodata` at 0x400200..0x400240"), "{err}");
+        assert!(err.contains("`static`"), "{err}");
+        assert_eq!(*batch[4].as_ref().unwrap(), 0x200);
+        assert_eq!(*batch[5].as_ref().unwrap(), 0x240);
+        assert_eq!(*batch[6].as_ref().unwrap(), 0x78);
+
+        // Stripped of its section headers, the target still has its ELF
+        // header guarded, and nothing to say where `.rodata` is.
+        e.write_uint(&mut bin.data, 0x28, 8, 0);
+        let batch = bin
+            .va_range_to_offsets([(0x400000, 0x10, true), (0x4001f0, 0x20, true)])
+            .unwrap();
+        assert!(batch[0].as_ref().unwrap_err().to_string().contains("ELF header"));
+        assert_eq!(*batch[1].as_ref().unwrap(), 0x1f0);
     }
 
     /// Address translation must see a segment that was just injected: nothing
