@@ -402,7 +402,8 @@ impl Binary {
         let path = path.as_ref();
         let data = fs::read(path)
             .with_context(|| format!("failed to read target {}", path.display()))?;
-        let (arch, endian) = Self::detect_arch(&data)?;
+        let (arch, endian) = Self::detect_arch(&data)
+            .with_context(|| format!("cannot patch {}", path.display()))?;
         let mut binary = Self::new(data, arch, endian);
         binary.perms = fs::metadata(path).ok().map(|m| m.permissions());
         Ok(binary)
@@ -457,6 +458,16 @@ impl Binary {
     fn detect_arch(data: &[u8]) -> Result<(Architecture, Endian)> {
         use goblin::elf::header::{EM_386, EM_AARCH64, EM_ARM, EM_MIPS, EM_X86_64};
 
+        // An `ar` archive in the target's place is almost always the rlib,
+        // given first: the two inputs are both paths, and nothing else about
+        // the command line tells them apart. Say so, rather than leave the
+        // reader to work out why their freshly built crate "is not an ELF".
+        if data.starts_with(b"!<arch>\n") {
+            bail!(
+                "target is an `ar` archive (an rlib?), not an ELF binary; the arguments \
+                 are `resplice <ORIGINAL_BINARY> <RLIB> <OUTPUT_BINARY>`, target first"
+            );
+        }
         if data.len() < 0x14 || data[..4] != [0x7f, b'E', b'L', b'F'] {
             bail!("target is not an ELF binary");
         }
@@ -1789,6 +1800,16 @@ mod tests {
         for data in [create_minimal_pe(), vec![0x7f, 0x45, 0x4c, 0x46], vec![0; 100]] {
             assert!(Binary::detect_arch(&data).is_err());
         }
+    }
+
+    /// An rlib given as the target is the arguments in the wrong order, and the
+    /// refusal has to say that rather than only that the file is not an ELF.
+    #[test]
+    fn detect_arch_names_the_argument_order_for_an_archive() {
+        let err = Binary::detect_arch(b"!<arch>\n/               0           ").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("`ar` archive"), "{msg}");
+        assert!(msg.contains("<ORIGINAL_BINARY> <RLIB> <OUTPUT_BINARY>"), "{msg}");
     }
 
     /// The machine type drives the pointer width used to read every later header

@@ -179,7 +179,20 @@ struct Patch {
 /// segment, and patch each splice into place.
 pub fn link_rlib(binary: &mut Binary, rlib_path: &Path) -> Result<Vec<Applied>> {
     let data = map_rlib(rlib_path)?;
-    let archive = ArchiveFile::parse(&*data).context("failed to parse rlib archive")?;
+    // An ELF file in the rlib's place is either the target, given twice or
+    // second, or the replacement crate built as something other than an rlib
+    // (a `cdylib`'s `.so`). `object` would only call it an unsupported archive
+    // identifier, which names neither the file nor the mistake.
+    if data.starts_with(b"\x7fELF") {
+        bail!(
+            "rlib {rlib_path:?} is an ELF file, not an rlib (an `ar` archive). The \
+             arguments are `resplice <ORIGINAL_BINARY> <RLIB> <OUTPUT_BINARY>`, rlib \
+             second; if this is the replacement crate's build output, build it with \
+             `crate-type = [\"rlib\"]` and pass `target/release/lib<crate>.rlib`"
+        );
+    }
+    let archive = ArchiveFile::parse(&*data)
+        .with_context(|| format!("failed to parse rlib {rlib_path:?} as an `ar` archive"))?;
 
     // Every object member of the archive, kept alive together, and not just
     // the ones that carry a splice section: a splice's helpers and `static`s
@@ -2917,6 +2930,33 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("aarch64"), "message was {msg:?}");
         assert!(msg.contains("x86-64"), "message was {msg:?}");
+    }
+
+    /// The target passed where the rlib goes is refused by name and with the
+    /// argument order, not as an "unsupported archive identifier"; anything
+    /// else that is not an archive at least names the file.
+    #[test]
+    fn test_link_rlib_names_an_elf_or_non_archive_rlib_path() {
+        let target = crafted_target();
+        let mut bin = load(&target);
+
+        let elf_path = temp_path("rlib_is_elf");
+        fs::write(&elf_path, &target).unwrap();
+        let err = link_rlib(&mut bin, &elf_path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains(&format!("{elf_path:?}")), "message was {msg:?}");
+        assert!(msg.contains("is an ELF file"), "message was {msg:?}");
+        assert!(msg.contains("<ORIGINAL_BINARY> <RLIB> <OUTPUT_BINARY>"), "message was {msg:?}");
+        fs::remove_file(&elf_path).ok();
+
+        let junk_path = temp_path("rlib_is_junk");
+        fs::write(&junk_path, b"not an archive at all").unwrap();
+        let err = link_rlib(&mut bin, &junk_path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains(&format!("{junk_path:?}")), "message was {msg:?}");
+        fs::remove_file(&junk_path).ok();
+
+        assert_eq!(bin.data(), &target[..], "target was modified");
     }
 
     const STR_DATA: [u8; 4] = *b"abc\0";
