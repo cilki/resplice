@@ -995,6 +995,70 @@ const SWITCH_TABLE_REMEDY: &str = "keep LLVM from building this table: it is not
      `RUSTFLAGS=\"-C jump-tables=no\"`, which stops LLVM turning a `match` into a \
      table, or have the arms compute a value rather than choose an address";
 
+/// The `file:line:col` of the panic whose `core::panic::Location` `sec` is, or
+/// `None` when `sec` does not have that record's shape.
+///
+/// A bounds check, an overflow check, an `unwrap`/`expect` or a `panic!` passes
+/// the panic handler a `Location { file: &str, line: u32, col: u32 }`, which
+/// rustc emits as an anonymous constant (`.data.rel.ro..Lanon.<hash>.<n>`): a
+/// pointer to the file name, its length, then the line and the column. The
+/// pointer makes it one more thing [`absolute_in_pie`] refuses in a
+/// position-independent target, and the generic advice -- find the `static`
+/// or `&str` you stored -- sent the user looking for something no line of the
+/// crate wrote. A Rust target defines the panic entry points the splice calls,
+/// so this record, not an unresolved symbol, is what stops such a splice.
+///
+/// Recognised by shape: a section exactly that size, with a single
+/// relocation, at offset 0, into a section the closure reached that holds a
+/// UTF-8 file name of the recorded length, and a non-zero line and column.
+/// `relocs` are `sec`'s own relocations; `target` looks up the section a
+/// symbol is defined in, if the closure reached it, and the symbol's value.
+fn panic_location<'s>(
+    name: &str,
+    sec: &Sec,
+    relocs: &[Rel],
+    target: impl FnOnce(SymId) -> Option<(&'s Sec<'s>, u64)>,
+    width: usize,
+    endian: Endian,
+) -> Option<String> {
+    if !name.contains(".Lanon.") || sec.bytes.len() != 2 * width + 8 {
+        return None;
+    }
+    let [r] = relocs else { return None };
+    if r.offset != 0 {
+        return None;
+    }
+    let (target, value) = target(r.sym)?;
+    let addend = if r.has_implicit {
+        endian.read_uint(sec.bytes, 0, width) as i64
+    } else {
+        r.addend
+    };
+    let start = usize::try_from((value as i64).checked_add(addend)?).ok()?;
+    let len = endian.read_uint(sec.bytes, width, width);
+    let line = endian.read_uint(sec.bytes, 2 * width, 4);
+    let col = endian.read_uint(sec.bytes, 2 * width + 4, 4);
+    if line == 0 || col == 0 {
+        return None;
+    }
+    let end = start.checked_add(usize::try_from(len).ok()?)?;
+    let file = std::str::from_utf8(target.bytes.get(start..end)?).ok()?;
+    Some(format!("{file}:{line}:{col}"))
+}
+
+/// The remedy [`absolute_in_pie`] gives for a reference out of the panic
+/// location [`panic_location`] recognises, at `at`.
+fn panic_location_remedy(at: &str) -> String {
+    format!(
+        "keep the panic at {at} out of the splice: the section is not a `static` the \
+         crate wrote, but the `core::panic::Location` (file, line and column) rustc \
+         records for a bounds check, an overflow check, an `unwrap`/`expect` or a \
+         `panic!` there, and it holds a pointer to the file name. Index with \
+         `get_unchecked`, do arithmetic with the `wrapping_*` methods, and match on \
+         an `Option` instead of unwrapping it"
+    )
+}
+
 /// What rustc lowers into a call to `name`, if `name` is one of the C library
 /// routines code generation emits on its own rather than because the source
 /// called them.
@@ -1908,19 +1972,35 @@ fn link_objects<'d>(
                 sym.section.is_some() || sym.undefined
             } {
                 if arch::writes_absolute_address(arch, r.r_type) {
+                    let name = sec_name(objs, si);
+                    let location = panic_location(
+                        name,
+                        sec,
+                        relocs,
+                        |sym| {
+                            let s = &syms[sym];
+                            Some((secs.get(s.section?)?, s.value))
+                        },
+                        if is_64 { 8 } else { 4 },
+                        endian,
+                    );
+                    let remedy = if is_switch_table(name) {
+                        SWITCH_TABLE_REMEDY.to_string()
+                    } else if let Some(at) = location {
+                        panic_location_remedy(&at)
+                    } else {
+                        "keep addresses out of the data the splice reaches. What \
+                         stores one is a `static` holding a reference, a `&str`, a \
+                         function pointer, or a table of any of those -- index a \
+                         byte array rather than a slice of references"
+                            .to_string()
+                    };
                     return Err(absolute_in_pie(
                         &format!(
                             "relocation type {} writes the absolute address {s:#x}",
                             r.r_type.0
                         ),
-                        if is_switch_table(sec_name(objs, si)) {
-                            SWITCH_TABLE_REMEDY
-                        } else {
-                            "keep addresses out of the data the splice reaches. \
-                             What stores one is a `static` holding a reference, a \
-                             `&str`, a function pointer, or a table of any of those \
-                             -- index a byte array rather than a slice of references"
-                        },
+                        &remedy,
                     ))
                     .with_context(context);
                 }
@@ -2929,6 +3009,12 @@ mod tests {
     /// data), with a relocation at `ptr_reloc_off` for the pointer it contains
     /// (an offset past the end of the 8-byte static makes it malformed).
     fn build_rlib_relro(data_section: &str, ptr_reloc_off: u64) -> Vec<u8> {
+        build_rlib_relro_data(data_section, ptr_reloc_off, &[0u8; 8])
+    }
+
+    /// [`build_rlib_relro`], with `data` as the contents of the section holding
+    /// the pointer.
+    fn build_rlib_relro_data(data_section: &str, ptr_reloc_off: u64, data: &[u8]) -> Vec<u8> {
         use object::write::{Object, Relocation, Symbol, SymbolSection as WSection};
         use object::{
             Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolFlags,
@@ -2944,11 +3030,11 @@ mod tests {
         // `static NAMES: &[u8; 4] = &STR;` — one pointer, relocated at link time.
         let names_sec =
             obj.add_section(vec![], data_section.as_bytes().to_vec(), SectionKind::Data);
-        obj.append_section_data(names_sec, &[0u8; 8], 8);
+        obj.append_section_data(names_sec, data, 8);
         let names_sym = obj.add_symbol(Symbol {
             name: b"NAMES".to_vec(),
             value: 0,
-            size: 8,
+            size: data.len() as u64,
             kind: SymbolKind::Data,
             scope: SymbolScope::Compilation,
             weak: false,
@@ -3171,6 +3257,16 @@ mod tests {
     /// dereferenced the bottom of its address space and died on the first read.
     #[test]
     fn test_link_rlib_rejects_absolute_references_into_a_pie_target() {
+        const ANON_SECTION: &str = ".data.rel.ro..Lanon.0123456789abcdef.1";
+        // `Location { file: "abc", line: 12, col: 9 }`, the pointer left zero
+        // for the relocation to fill.
+        const LOCATION: [u8; 24] = {
+            let mut l = [0u8; 24];
+            l[8] = 3;
+            l[16] = 12;
+            l[20] = 9;
+            l
+        };
         for (tag, rlib, cue) in [
             // `R_X86_64_64`: the pointer inside an injected RELRO `static`.
             (
@@ -3186,6 +3282,17 @@ mod tests {
                 build_rlib_relro(".data.rel.ro..Lswitch.table._ZN4play6lookup17h0123E", 0),
                 "-C jump-tables=no",
             ),
+            // The `core::panic::Location` behind a bounds check: a pointer to
+            // the file name (`abc`, 3 bytes), its length, the line and the
+            // column. The refusal names the panic it records, which is the
+            // line of the crate to change.
+            (
+                "rlib_pie_location",
+                build_rlib_relro_data(ANON_SECTION, 0, &LOCATION),
+                "panic at abc:12:9",
+            ),
+            // An anonymous constant without that shape is not taken for one.
+            ("rlib_pie_anon", build_rlib_relro(ANON_SECTION, 0), "`&str`"),
             // A synthesized GOT slot, which holds an address just the same,
             // when the instruction under it is not one `arch::relax_got` can
             // turn PC-relative: plain `GOTPCREL` promises nothing about it.
@@ -3208,6 +3315,12 @@ mod tests {
             assert_eq!(
                 msg.contains("jump-tables"),
                 tag == "rlib_pie_switch",
+                "message was {msg:?}"
+            );
+            // Only a record of a panic's location is blamed on a panic.
+            assert_eq!(
+                msg.contains("core::panic::Location"),
+                tag == "rlib_pie_location",
                 "message was {msg:?}"
             );
             // Refused before anything was written over the target's own bytes.
