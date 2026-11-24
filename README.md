@@ -484,6 +484,13 @@ So either keep those out of the data a splice can reach (index a byte array
 rather than a slice of references), or splice a target linked at fixed
 addresses (`cc -no-pie`).
 
+LLVM can build such a table without being asked. A `match` whose arms only
+pick a value, or a loop over a constant table that it can see all of, may
+compile into a lookup table of addresses. That table is in a section named
+`.data.rel.ro..Lswitch.table.<fn>`, and the refusal names it. Build the
+replacement crate with `RUSTFLAGS="-C jump-tables=no"` to keep the `match` as
+code.
+
 ### Cross-compiling for another architecture
 
 The replacement crate must be compiled for the **same** architecture as the

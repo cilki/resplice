@@ -966,6 +966,35 @@ fn absolute_in_pie(what: &str, remedy: &str) -> anyhow::Error {
     )
 }
 
+/// Whether `section` is a lookup table LLVM built out of a `match`, rather than
+/// data the source wrote.
+///
+/// SimplifyCFG turns a `match` whose arms only pick a value -- including a
+/// loop over a constant table it can see all of -- into an indexed load from a
+/// private `switch.table.<fn>` constant, which rustc's per-function sections
+/// put in `.rodata..Lswitch.table.<fn>`, or in `.data.rel.ro..Lswitch.table.<fn>`
+/// when the values it picks between are addresses. In a position-independent
+/// target such a table is refused like any other `static` holding a pointer,
+/// and the generic advice -- find the reference, `&str` or function pointer you
+/// stored -- sent the user hunting for something no line of the crate wrote.
+fn is_switch_table(section: &str) -> bool {
+    section.contains(".Lswitch.table.")
+}
+
+/// The remedy [`absolute_in_pie`] gives for a reference out of a table
+/// [`is_switch_table`] recognises.
+///
+/// `-C jump-tables=no` keeps LLVM from building lookup tables as well as jump
+/// tables. On aarch64, a gcc shared library whose function was replaced by a
+/// `match` that indexed a `repr(C)` table was refused for exactly this, and
+/// linked and returned the right values once the crate was rebuilt with it.
+const SWITCH_TABLE_REMEDY: &str = "keep LLVM from building this table: it is not \
+     a `static` the crate wrote, but a lookup table of addresses LLVM made out of \
+     a `match` (or a loop over a constant table it could see through) in the \
+     function the section is named after. Build the replacement crate with \
+     `RUSTFLAGS=\"-C jump-tables=no\"`, which stops LLVM turning a `match` into a \
+     table, or have the arms compute a value rather than choose an address";
+
 /// What rustc lowers into a call to `name`, if `name` is one of the C library
 /// routines code generation emits on its own rather than because the source
 /// called them.
@@ -1884,10 +1913,14 @@ fn link_objects<'d>(
                             "relocation type {} writes the absolute address {s:#x}",
                             r.r_type.0
                         ),
-                        "keep addresses out of the data the splice reaches. What \
-                         stores one is a `static` holding a reference, a `&str`, a \
-                         function pointer, or a table of any of those -- index a \
-                         byte array rather than a slice of references",
+                        if is_switch_table(sec_name(objs, si)) {
+                            SWITCH_TABLE_REMEDY
+                        } else {
+                            "keep addresses out of the data the splice reaches. \
+                             What stores one is a `static` holding a reference, a \
+                             `&str`, a function pointer, or a table of any of those \
+                             -- index a byte array rather than a slice of references"
+                        },
                     ))
                     .with_context(context);
                 }
@@ -3145,6 +3178,14 @@ mod tests {
                 build_rlib_relro(".data.rel.ro.NAMES", 0),
                 ".data.rel.ro.NAMES",
             ),
+            // The same pointer in a lookup table LLVM built out of a `match`:
+            // no `static` in the crate holds it, so the refusal names the
+            // flag that stops LLVM building the table instead.
+            (
+                "rlib_pie_switch",
+                build_rlib_relro(".data.rel.ro..Lswitch.table._ZN4play6lookup17h0123E", 0),
+                "-C jump-tables=no",
+            ),
             // A synthesized GOT slot, which holds an address just the same,
             // when the instruction under it is not one `arch::relax_got` can
             // turn PC-relative: plain `GOTPCREL` promises nothing about it.
@@ -3163,6 +3204,12 @@ mod tests {
             let msg = format!("{:#}", result.expect_err("expected an error"));
             assert!(msg.contains("position-independent"), "message was {msg:?}");
             assert!(msg.contains(cue), "message was {msg:?}");
+            // Only a compiler-built table is blamed on the compiler.
+            assert_eq!(
+                msg.contains("jump-tables"),
+                tag == "rlib_pie_switch",
+                "message was {msg:?}"
+            );
             // Refused before anything was written over the target's own bytes.
             assert_eq!(&bin.data()[0x1000..0x1020], &[0xcc; 0x20], "target was patched");
 
