@@ -50,6 +50,40 @@ enum Binding {
     Tls(u64),
 }
 
+impl Binding {
+    /// The symbol value this binding was made from, whatever it means.
+    fn value(self) -> u64 {
+        match self {
+            Binding::Addr(v) | Binding::Ifunc(v) | Binding::Tls(v) => v,
+        }
+    }
+}
+
+/// Everything the target's tables offer for one name.
+///
+/// A linked image has at most one global definition of a name, but it can have
+/// any number of *local* (`STB_LOCAL`) ones -- a C `static` function or
+/// variable in each translation unit that happens to use the name -- and
+/// `.symtab` lists every local before the first global. Binding whichever came
+/// first therefore bound a splice's `extern "C" fn helper` to some file's
+/// private `helper` rather than to the global `helper` a linker would have
+/// picked, and with two private ones and no global it picked one arbitrarily.
+/// Both patched binaries ran and called the wrong function.
+///
+/// So the two kinds are kept apart: a global (or weak) definition, or an
+/// import, always wins; a local one is used only when it is the only candidate
+/// there is, and two locals at different addresses are refused as ambiguous.
+#[derive(Debug, Default, Clone, Copy)]
+struct Found {
+    /// From a global or weak definition, or from the PLT.
+    global: Option<Binding>,
+    /// From the first local definition seen.
+    local: Option<Binding>,
+    /// The value of a second local definition whose value differs from
+    /// `local`'s, which makes a name with no global definition ambiguous.
+    other_local: Option<u64>,
+}
+
 /// What the target has to offer for each of the names a link asked about,
 /// built by [`Binary::target_symbols`].
 ///
@@ -59,7 +93,7 @@ enum Binding {
 pub struct TargetSymbols<'n> {
     /// One entry per name asked about, `None` for a name the target neither
     /// defines nor imports.
-    bound: HashMap<&'n str, Option<Binding>>,
+    bound: HashMap<&'n str, Found>,
     /// The target's own GOT slot for each name asked about that has one: the
     /// address a `GLOB_DAT` dynamic relocation against that name fills in at
     /// load time. See [`TargetSymbols::got_slot`].
@@ -118,7 +152,28 @@ impl TargetSymbols<'_> {
                  symbol tables were searched for"
             ));
         };
-        match *slot {
+        let binding = match *slot {
+            Found {
+                global: Some(binding),
+                ..
+            } => Some(binding),
+            Found {
+                local: Some(first),
+                other_local: Some(second),
+                ..
+            } => {
+                return Err(anyhow!(
+                    "the target defines {name:?} more than once, as local symbols at \
+                     {:#x} and {second:#x} (a `static` of that name in more than one \
+                     source file), and has no global definition of it to say which \
+                     one a reference means; define the one this splice needs in the \
+                     replacement crate instead",
+                    first.value()
+                ));
+            }
+            Found { local, .. } => local,
+        };
+        match binding {
             Some(Binding::Addr(va)) => Ok(Some(va)),
             None => Ok(None),
             // An IFUNC's `st_value` is the address of the *resolver*: a
@@ -187,11 +242,11 @@ fn strtab_str(strtab: &[u8], off: usize) -> Option<&str> {
 /// object use) resolve to whichever section came first instead of being
 /// reported as unresolvable, so the empty name is dropped here.
 fn slot_for<'b>(
-    bound: &'b mut HashMap<&str, Option<Binding>>,
+    bound: &'b mut HashMap<&str, Found>,
     first_bytes: &[u64; 4],
     strtab: &[u8],
     off: usize,
-) -> Option<&'b mut Option<Binding>> {
+) -> Option<&'b mut Found> {
     let &first = strtab.get(off)?;
     if first == 0 || first_bytes[(first >> 6) as usize] >> (first & 63) & 1 == 0 {
         return None;
@@ -1283,7 +1338,9 @@ impl Binary {
     /// defined symbol in `.dynsym`, then a function the target imports through
     /// its PLT (the stub's address). A usable definition is the exception to
     /// that precedence: it replaces an unusable one recorded earlier (see
-    /// [`bind`]). [`TargetSymbols::resolve`] reports what each name got.
+    /// [`bind`]). A *local* definition ranks below all three, and two of them
+    /// at different addresses make the name ambiguous (see [`Found`]).
+    /// [`TargetSymbols::resolve`] reports what each name got.
     ///
     /// The names a link needs are known before any of them is looked up — they
     /// are what the rlib leaves undefined — so they are all asked for at once.
@@ -1310,10 +1367,12 @@ impl Binary {
         names: impl IntoIterator<Item = &'n str>,
     ) -> Result<TargetSymbols<'n>> {
         use goblin::elf::section_header::{SHN_UNDEF, SHT_DYNSYM, SHT_REL, SHT_RELA, SHT_SYMTAB};
-        use goblin::elf::sym::{STT_GNU_IFUNC, STT_TLS};
+        use goblin::elf::sym::{STB_LOCAL, STT_GNU_IFUNC, STT_TLS};
 
-        let mut bound: HashMap<&'n str, Option<Binding>> =
-            names.into_iter().map(|name| (name, None)).collect();
+        let mut bound: HashMap<&'n str, Found> = names
+            .into_iter()
+            .map(|name| (name, Found::default()))
+            .collect();
         let mut got: HashMap<&'n str, u64> = HashMap::new();
         if bound.is_empty() {
             return Ok(TargetSymbols { bound, got });
@@ -1372,14 +1431,24 @@ impl Binary {
                     continue;
                 }
                 let st_type = entry[c.st_info] & 0xf;
-                bind(
-                    slot,
-                    match st_type {
-                        STT_GNU_IFUNC => Binding::Ifunc(value),
-                        STT_TLS => Binding::Tls(value),
-                        _ => Binding::Addr(value),
-                    },
-                );
+                let binding = match st_type {
+                    STT_GNU_IFUNC => Binding::Ifunc(value),
+                    STT_TLS => Binding::Tls(value),
+                    _ => Binding::Addr(value),
+                };
+                if entry[c.st_info] >> 4 == STB_LOCAL {
+                    // See [`Found`]: a local is kept apart from the global
+                    // definition, and a second one elsewhere is remembered.
+                    match slot.local {
+                        None => slot.local = Some(binding),
+                        Some(prev) if prev.value() != value => {
+                            slot.other_local.get_or_insert(value);
+                        }
+                        Some(_) => bind(&mut slot.local, binding),
+                    }
+                } else {
+                    bind(&mut slot.global, binding);
+                }
             }
         }
 
@@ -1442,7 +1511,7 @@ impl Binary {
                             .sh_addr
                             .saturating_add(plt_header)
                             .saturating_add(i as u64 * plt_entry);
-                        bind(slot, Binding::Addr(stub));
+                        bind(&mut slot.global, Binding::Addr(stub));
                     }
                 }
             }
@@ -3072,6 +3141,82 @@ mod tests {
         let err = found.resolve("errno").unwrap_err().to_string();
         assert!(err.contains("thread-local"), "{err}");
         assert!(err.contains("0x30"), "{err}");
+    }
+
+    /// Make the `.symtab` entries of an ELF64 [`craft_elf`] image whose
+    /// position in its `syms` is listed in `local` `STB_LOCAL` -- a C `static`.
+    fn make_local(mut bin: Binary, local: &[usize]) -> Binary {
+        let elf = goblin::elf::Elf::parse(bin.data()).unwrap();
+        let sh = elf
+            .section_headers
+            .iter()
+            .find(|sh| sh.sh_type == goblin::elf::section_header::SHT_SYMTAB)
+            .unwrap();
+        let (table, entsize) = (sh.sh_offset as usize, sh.sh_entsize as usize);
+        let st_info = Class::of(true).st_info;
+        for &i in local {
+            // Entry 0 is STN_UNDEF and entry 1 the `.text` section symbol.
+            let info = &mut bin.data[table + (i + 2) * entsize + st_info];
+            *info &= 0xf; // STB_LOCAL is 0
+        }
+        bin
+    }
+
+    /// A linked image has one global definition of a name at most but can
+    /// have a local one per source file that declares a `static` of that name,
+    /// and `.symtab` lists the locals first. A splice's `extern "C" fn helper`
+    /// means the global `helper`, which is what a linker would bind it to; it
+    /// used to get whichever local came first, and with two locals and no
+    /// global an arbitrary one of them -- a patched binary calling the wrong
+    /// function either way.
+    #[test]
+    fn target_symbols_prefer_a_global_and_refuse_ambiguous_locals() {
+        use goblin::elf::sym::STT_FUNC;
+        let bin = make_local(
+            craft_with_symtab(&[
+                ("helper", STT_FUNC, 0x0040_1100),
+                ("helper", STT_FUNC, 0x0040_1200),
+                ("helper", STT_FUNC, 0x0040_1300),
+                ("twice", STT_FUNC, 0x0040_1400),
+                ("twice", STT_FUNC, 0x0040_1500),
+                ("only", STT_FUNC, 0x0040_1600),
+                ("same", STT_FUNC, 0x0040_1700),
+                ("same", STT_FUNC, 0x0040_1700),
+            ]),
+            &[0, 1, 3, 4, 5, 6, 7],
+        );
+        let found = bin
+            .target_symbols(["helper", "twice", "only", "same"])
+            .unwrap();
+
+        // The global wins over both locals that precede it.
+        assert_eq!(found.resolve("helper").unwrap(), Some(0x0040_1300));
+        // Two locals at different addresses and no global: nothing says which.
+        let err = found.resolve("twice").unwrap_err().to_string();
+        assert!(err.contains("0x401400") && err.contains("0x401500"), "{err}");
+        assert!(err.contains("more than once"), "{err}");
+        // A lone local is still the only candidate, and so is one listed twice
+        // at the same address.
+        assert_eq!(found.resolve("only").unwrap(), Some(0x0040_1600));
+        assert_eq!(found.resolve("same").unwrap(), Some(0x0040_1700));
+    }
+
+    /// An import is the name's global binding too, so a `static` of the same
+    /// name in the target does not shadow the PLT stub.
+    #[test]
+    fn target_symbols_prefer_an_import_to_a_local() {
+        use goblin::elf::sym::STT_FUNC;
+        let bin = make_local(
+            craft_elf(
+                Architecture::X86_64,
+                Endian::Little,
+                &[("puts", STT_FUNC, 0x0040_1100)],
+                &["puts"],
+            ),
+            &[0],
+        );
+        let found = bin.target_symbols(["puts"]).unwrap();
+        assert_eq!(found.resolve("puts").unwrap(), Some(PLT_ADDR + 16));
     }
 
     /// Only the names asked for are searched for, so a name that was not is a
