@@ -94,9 +94,12 @@ pub fn Splice(args: TokenStream, input: TokenStream) -> TokenStream {
             // marked with `#[unsafe(naked)]`"), while `#[instruction_set]`,
             // `#[target_feature]`, `#[inline(never)]` and doc comments
             // compiled to a function without them.
+            let export = match export_attrs(&input_fn.attrs, &section) {
+                Ok(export) => export,
+                Err(e) => return e.to_compile_error().into(),
+            };
             quote! {
-                #[unsafe(no_mangle)]
-                #[unsafe(link_section = #section)]
+                #export
                 #input_fn
             }
         }
@@ -106,9 +109,12 @@ pub fn Splice(args: TokenStream, input: TokenStream) -> TokenStream {
             if matches!(input_static.vis, syn::Visibility::Inherited) {
                 input_static.vis = syn::parse_quote!(pub);
             }
+            let export = match export_attrs(&input_static.attrs, &section) {
+                Ok(export) => export,
+                Err(e) => return e.to_compile_error().into(),
+            };
             quote! {
-                #[unsafe(no_mangle)]
-                #[unsafe(link_section = #section)]
+                #export
                 #input_static
             }
         }
@@ -201,6 +207,52 @@ fn arg_position_impl_trait(sig: &syn::Signature) -> Option<&syn::TypeImplTrait> 
         }
     }
     find.0
+}
+
+/// The attributes that export a spliced item into its `.rspl` section, given
+/// the attributes the author already wrote on it.
+///
+/// `#[no_mangle]` is added only when the author has not written it. Adding it a
+/// second time made rustc warn "unused attribute" on the author's own line and
+/// suggest deleting it -- an error under `#![deny(warnings)]` -- for an item
+/// written exactly the way the README writes its `memcpy`.
+///
+/// A `#[link_section]` of the author's is refused. The tool finds a splice by
+/// its section name, so the item cannot live anywhere else; rustc kept the
+/// macro's section and dropped the author's without a word.
+fn export_attrs(attrs: &[syn::Attribute], section: &str) -> syn::Result<proc_macro2::TokenStream> {
+    let mut no_mangle = Some(quote!(#[unsafe(no_mangle)]));
+    for attr in attrs {
+        let meta = unwrap_unsafe(&attr.meta);
+        if meta.path().is_ident("no_mangle") {
+            no_mangle = None;
+        } else if meta.path().is_ident("link_section") {
+            return Err(syn::Error::new_spanned(
+                attr,
+                format!(
+                    "#[Splice] places this item in section `{section}`, which is how \
+                     `resplice` finds it and its target range, so it cannot also have a \
+                     `link_section` of its own. Remove this attribute"
+                ),
+            ));
+        }
+    }
+    Ok(quote! {
+        #no_mangle
+        #[unsafe(link_section = #section)]
+    })
+}
+
+/// The meta inside `unsafe(..)`, as edition 2024 spells `no_mangle` and
+/// `link_section`; any other meta as it is.
+fn unwrap_unsafe(meta: &Meta) -> Meta {
+    if let Meta::List(list) = meta
+        && list.path.is_ident("unsafe")
+        && let Ok(inner) = list.parse_args::<Meta>()
+    {
+        return inner;
+    }
+    meta.clone()
 }
 
 /// A compile error about the `#[Splice]` range, spanned on the annotated item.
@@ -338,6 +390,58 @@ mod tests {
         assert!(refused(parse_quote!(fn f<T>(x: T))).contains("generic"));
         assert!(refused(parse_quote!(fn f(x: impl Copy))).contains("`impl Trait`"));
         assert!(check_signature(&parse_quote!(const unsafe fn f<'a>(x: &'a i32) -> i32)).is_ok());
+    }
+
+    /// `#[no_mangle]` is added unless the author wrote it, in either spelling;
+    /// the section is always the splice's own.
+    #[test]
+    fn no_mangle_is_added_only_when_absent() {
+        let export = |item: syn::ItemFn| {
+            export_attrs(&item.attrs, ".rspl.10.20")
+                .unwrap()
+                .to_string()
+        };
+        let added = export(parse_quote!(
+            #[inline(never)]
+            fn f() {}
+        ));
+        assert_eq!(added.matches("no_mangle").count(), 1, "{added}");
+        assert!(added.contains("\".rspl.10.20\""), "{added}");
+        for item in [
+            parse_quote!(
+                #[unsafe(no_mangle)]
+                fn f() {}
+            ),
+            parse_quote!(
+                #[no_mangle]
+                fn f() {}
+            ),
+        ] {
+            let kept = export(item);
+            assert!(!kept.contains("no_mangle"), "{kept}");
+            assert!(kept.contains("\".rspl.10.20\""), "{kept}");
+        }
+    }
+
+    /// An author's `link_section` would be silently overridden by the splice's.
+    #[test]
+    fn own_link_section_is_refused() {
+        for item in [
+            parse_quote!(
+                #[unsafe(link_section = ".text.mine")]
+                static S: u8 = 0;
+            ),
+            parse_quote!(
+                #[link_section = ".text.mine"]
+                static S: u8 = 0;
+            ),
+        ] {
+            let item: syn::ItemStatic = item;
+            let msg = export_attrs(&item.attrs, ".rspl.10.20")
+                .unwrap_err()
+                .to_string();
+            assert!(msg.contains("cannot also have a `link_section`"), "{msg}");
+        }
     }
 
     #[test]
