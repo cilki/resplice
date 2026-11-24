@@ -224,7 +224,10 @@ fn my_replacement_function() -> i32 {
 
 `#[Splice]` adds `pub` and `extern "C"` when they are absent, so a plain `fn`
 works and the replacement still matches the calling convention the target's
-caller expects. An explicitly written visibility or ABI is left alone.
+caller expects. An explicitly written visibility or ABI is left alone. It also
+exports the item with `#[unsafe(no_mangle)]`, so writing that yourself is
+harmless, and places it in its own `.rspl` section, so a `link_section` of
+your own is refused.
 
 Build it to an rlib and apply it to the target binary:
 
