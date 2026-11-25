@@ -1256,9 +1256,13 @@ fn std_symbol_hint(name: &str) -> Option<&'static str> {
         "slice_start_index_len_fail",
         "slice_end_index_len_fail",
         "slice_index_order_fail",
+        "slice_error_fail",
+        "slice_error_fail_ct",
+        "slice_error_fail_rt",
     ]) {
         return Some(
-            "It is the panic of an index or range bounds check (`t[i]`, `t[a..b]`), which \
+            "It is the panic of an index or range bounds check (`t[i]`, `t[a..b]`, `s[a..b]` \
+             on a `str`, which also checks the bounds are on `char` boundaries), which \
              stays in a release build unless the index is provably in range. Index with \
              `get_unchecked`, or mask the index into range (`t[i & 3]` on a 4-element \
              array)",
@@ -1276,6 +1280,27 @@ fn std_symbol_hint(name: &str) -> Option<&'static str> {
              `unreachable!`, a checked operation, or a debug build's precondition check \
              compiles into. Write the splice without the check (`get_unchecked`, \
              `wrapping_*`, `unwrap_unchecked`), and build with `--release`",
+        );
+    }
+    // The panics `core` raises from its own modules rather than through
+    // `core::panicking`: `sort`'s check for an inconsistent comparator
+    // (`smallsort::panic_on_ord_violation`), `RefCell`'s borrow checks
+    // (`cell::panic_already_borrowed`), `strict_*` arithmetic
+    // (`num::overflow_panic::add`), `isqrt`/`ilog10` of a negative value. The
+    // generic code that calls them is inlined into a release build like any
+    // other, and the call stays, so the fallback below -- which tells the user
+    // to build with `--release` -- sent someone who already had back to the
+    // same error. The `core::panic` module (`Location`, `PanicInfo`) is the
+    // machinery rather than a panic, and is left to the fallback.
+    if name.contains("panic") && !has("panic") && !name.contains("..panic..") {
+        return Some(
+            "It is a panic the standard library raises from inside one of its own \
+             routines, which stays in a release build: a `sort`/`sort_unstable` that finds \
+             its comparator inconsistent, a `RefCell` borrowed twice, `strict_*` \
+             arithmetic that overflows, `isqrt`/`ilog` of a value out of range. The section \
+             the reference is in names the routine that makes the call; write the splice \
+             without that routine (a sort of its own, a `Cell` or raw pointer instead of \
+             a `RefCell`, `wrapping_*` arithmetic)",
         );
     }
     Some(
@@ -2672,6 +2697,30 @@ mod tests {
         }
         for name in [format!("{v0}5panic"), format!("{v0}18panic_nounwind_fmt")] {
             assert!(hint(&name).contains("`assert!`"), "{name}");
+        }
+        for name in [
+            "_RNvNtCsezJPv0cR1HF_4core3str16slice_error_fail",
+            "_ZN4core3str19slice_error_fail_rt17h0123456789abcdefE",
+        ] {
+            assert!(hint(name).contains("`char` boundaries"), "{name}");
+        }
+        // Panics core raises outside `core::panicking`, which a release build
+        // keeps: building with `--release` is not the fix for them.
+        for name in [
+            "_RNvNtNtNtNtCsezJPv0cR1HF_4core5slice4sort6shared9smallsort22panic_on_ord_violation",
+            "_ZN4core4cell22panic_already_borrowed17h0123456789abcdefE",
+            "_RNvNtNtCsezJPv0cR1HF_4core3num14overflow_panic3add",
+            "_RNvNtNtCsezJPv0cR1HF_4core3num8int_sqrt27panic_for_negative_argument",
+        ] {
+            assert!(hint(name).contains("stays in a release build"), "{name}");
+            assert!(!hint(name).contains("--release"), "{name}");
+        }
+        // `core::panic` is the panic machinery, not a panic.
+        for name in [
+            "_RNvMNtNtCsezJPv0cR1HF_4core5panic8locationNtB2_8Location6caller",
+            "_ZN60_$LT$core..panic..location..Location$u20$as$u20$core..fmt..Display$GT$3fmt17h0123456789abcdefE",
+        ] {
+            assert!(!hint(name).contains("stays in a release build"), "{name}");
         }
         for name in [
             "_ZN4core6option15Option$LT$T$GT$6expect17h407b4582d6c877cbE",
