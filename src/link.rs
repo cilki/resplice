@@ -168,9 +168,10 @@ struct Patch {
     begin: u64,
     end: u64,
     code: Vec<u8>,
-    /// True for a code splice (and its trampoline), whose region the target
-    /// executes and so must be mapped executable; false for a `static`.
-    exec: bool,
+    /// File offset of `begin`, checked to be file-backed for the whole region
+    /// (and mapped executable for a code splice) before the link resolved
+    /// anything. See [`link_objects`].
+    offset: usize,
     trampoline: bool,
 }
 
@@ -270,31 +271,17 @@ pub fn link_rlib(binary: &mut Binary, rlib_path: &Path) -> Result<Vec<Applied>> 
         }
     }
 
-    // Translate each region to a file offset before anything is written: the
-    // *whole* region has to be file-backed by one segment, not just `begin`.
-    // A region that runs off the end of the segment mapping it would otherwise
-    // be written over whatever the file holds past that segment -- see
-    // [`Binary::va_range_to_offset`]. Appending the injected segment only grows
-    // the image, so these offsets stay valid across the injection below.
-    //
-    // Translated as a batch, because the program-header table cannot be cached
-    // across a patch and reading it once per splice is most of what placing a
-    // few thousand of them costs. See [`Binary::va_range_to_offsets`].
-    let offsets = binary
-        .va_range_to_offsets(patches.iter().map(|p| (p.begin, p.end - p.begin, p.exec)))?
-        .into_iter()
-        .zip(&patches)
-        .map(|(off, p)| off.with_context(|| format!("splice {:#x}..{:#x}", p.begin, p.end)))
-        .collect::<Result<Vec<usize>>>()?;
-
+    // Every region was translated to a file offset by `link_objects`, before
+    // anything was resolved; appending the injected segment only grows the
+    // image, so those offsets stay valid across the injection.
     if !blob.is_empty() {
         binary.inject_segment(base, &blob)?;
     }
 
     let mut applied = Vec::new();
-    for (patch, offset) in patches.into_iter().zip(offsets) {
+    for patch in patches {
         let region = (patch.end - patch.begin) as usize;
-        binary.patch_bytes(offset, region, &patch.code)?;
+        binary.patch_bytes(patch.offset, region, &patch.code)?;
         applied.push(Applied {
             begin: patch.begin,
             end: patch.end,
@@ -1524,6 +1511,33 @@ fn link_objects<'d>(
         return Ok(());
     }
 
+    // Translate each region to a file offset before resolving anything: the
+    // *whole* region has to be file-backed by one segment, not just `begin`.
+    // A region that runs off the end of the segment mapping it would otherwise
+    // be written over whatever the file holds past that segment -- see
+    // [`Binary::va_range_to_offset`]. Appending the injected segment only grows
+    // the image, so these offsets stay valid across the injection.
+    //
+    // This comes first because everything after it assumes the splice sits in
+    // the target at all. A `begin` that is not -- typically a run-time address
+    // copied out of a debugger, `0xaaaaaaaa0900` for a PIE's `0x900` -- used to
+    // get as far as the relocations, which refused the call to the first helper
+    // as out of reach and suggested an `--inject-base`, which no base can fix.
+    //
+    // Translated as a batch, because the program-header table cannot be cached
+    // across a patch and reading it once per splice is most of what placing a
+    // few thousand of them costs. See [`Binary::va_range_to_offsets`].
+    let mut splice_off: IdTable<usize> = IdTable::new(&sec_lens);
+    let translated = target.va_range_to_offsets(splice_idxs.iter().map(|&si| {
+        let (begin, end) = secs[si].splice.unwrap();
+        (begin, end - begin, secs[si].code)
+    }))?;
+    for (&si, off) in splice_idxs.iter().zip(translated) {
+        let (begin, end) = secs[si].splice.unwrap();
+        let off = off.with_context(|| format!("splice {begin:#x}..{end:#x}"))?;
+        splice_off.insert(si, off)?;
+    }
+
     // Index of what the rlib's members define, for references that are
     // undefined in the member carrying them. See [`exports_for`].
     let mut exports: Option<HashMap<&str, Def>> = None;
@@ -2189,7 +2203,7 @@ fn link_objects<'d>(
                     begin,
                     end,
                     code: out,
-                    exec: sec.code,
+                    offset: splice_off[si],
                     trampoline: false,
                 });
             }
@@ -2212,9 +2226,7 @@ fn link_objects<'d>(
             begin,
             end,
             code: jump,
-            // Only a code splice is ever trampolined: an oversized data splice
-            // was refused when the splices were laid out.
-            exec: true,
+            offset: splice_off[si],
             trampoline: true,
         });
     }
@@ -3154,6 +3166,40 @@ mod tests {
             let msg = format!("{err:#}");
             assert!(msg.contains("instruction boundary"), "message was {msg:?}");
             assert!(msg.contains(&format!("{begin:#x}..{end:#x}")), "message was {msg:?}");
+            assert_eq!(bin.data(), &original[..], "{begin:#x}..{end:#x}: target was modified");
+        }
+    }
+
+    /// A splice whose range the target does not map at all is reported as
+    /// exactly that, however far away it is.
+    ///
+    /// The usual way to get there is a run-time address copied out of a
+    /// debugger, `0xaaaaaaaa0900` for what the image calls `0x900`. The range
+    /// was only translated once the relocations had been resolved, and a range
+    /// that far from the injected segment never got that far: the splice's
+    /// `bl` to its helper (or, for an oversized one, the trampoline) was refused
+    /// as out of reach, with advice to pick an `--inject-base` closer to it --
+    /// which no base can follow, since the range is not in the target.
+    #[test]
+    fn test_link_rlib_aarch64_reports_unmapped_range_before_reach() {
+        const FAR: u64 = 0xaaaa_aaaa_0000;
+        // `A64_SPLICE` is 16 bytes: fits the first range, is trampolined from
+        // the second.
+        for (begin, end) in [(FAR, FAR + 0x20), (FAR, FAR + 8)] {
+            let rlib_path = temp_path("rlib_a64_unmapped");
+            fs::write(&rlib_path, build_rlib_aarch64_at(begin, end)).unwrap();
+            let original = crafted_target_aarch64();
+            let mut bin = load(&original);
+            let err = link_rlib(&mut bin, &rlib_path).unwrap_err();
+            fs::remove_file(&rlib_path).ok();
+
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(&format!("splice {begin:#x}..{end:#x}")),
+                "message was {msg:?}"
+            );
+            assert!(msg.contains("not mapped by any PT_LOAD"), "message was {msg:?}");
+            assert!(!msg.contains("inject-base"), "message was {msg:?}");
             assert_eq!(bin.data(), &original[..], "{begin:#x}..{end:#x}: target was modified");
         }
     }
