@@ -60,7 +60,12 @@ data, or call libc. `resplice` resolves those relocations recursively:
   table is moved needs Linux 5.18 or later to run: older kernels tell the
   program its table is in the first segment, wherever it actually is. (A
   shared library's table is found by the dynamic loader, which has no such
-  assumption.)
+  assumption.) When the target has section headers, the injected code and
+  data also get one, `.resplice`, so `objdump -d` disassembles them and
+  `strip`/`objcopy` keep them. Without it, `strip` dropped the segment and the
+  stripped program crashed on its first spliced call. Stripping still breaks a
+  binary whose program-header table had to be moved, though: binutils expects
+  that table at the start of its segment, not behind the injected code.
 - Calls to symbols the target already **defines or imports** (e.g. a libc
   function reachable through the PLT) bind to the target's own addresses. Two
   kinds of definition are reported rather than bound, because their `st_value`

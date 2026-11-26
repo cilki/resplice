@@ -1815,9 +1815,130 @@ impl Binary {
             endian.write_uint(d, note_off + field, c.word, value);
         }
 
+        self.describe_injected_section(file_off, base, blob.len() as u64, align)
+    }
+
+    /// Give the `len`-byte blob [`inject_segment`](Self::inject_segment) just
+    /// appended a section header, [`INJECTED_SECTION`].
+    ///
+    /// The loader only reads program headers, so the patched program runs
+    /// without one. Nearly everything else that rewrites or reads an ELF goes
+    /// by its *sections*, though. `strip` and `objcopy` keep exactly the bytes
+    /// some section covers and rebuild the program headers around them, so
+    /// a segment that no section covers came out of `strip` with its
+    /// `PT_LOAD` and its bytes gone. Every trampoline in the stripped binary
+    /// then jumped into unmapped memory, and the program segfaulted on its
+    /// first spliced call. `objdump -d` likewise showed a trampoline's target
+    /// as an address in no section and had nothing there to disassemble.
+    ///
+    /// A target with no section headers (one that was already stripped of
+    /// them) gets none: there is no table to add to, and none of those tools
+    /// has a section to lose.
+    ///
+    /// The section covers the blob only, never a program-header table moved in
+    /// behind it, which is no section's content in any ELF. That does not make
+    /// such a binary safe to strip: `objcopy` insists a segment holding the
+    /// program-header table begin with it, and moves the blob along to make
+    /// room.
+    ///
+    /// The table is copied, one entry longer, to the end of the file, along
+    /// with the section-name table grown by the new name, and the ELF header
+    /// is pointed at the copies. As with a moved program-header table, the
+    /// originals' bytes stay where they are, so nothing behind them moves.
+    fn describe_injected_section(
+        &mut self,
+        file_off: u64,
+        base: u64,
+        len: u64,
+        align: u64,
+    ) -> Result<()> {
+        use goblin::elf::section_header::{
+            SHF_ALLOC, SHF_EXECINSTR, SHN_LORESERVE, SHN_XINDEX, SHT_PROGBITS,
+        };
+
+        let shdrs = self.section_headers()?;
+        if shdrs.is_empty() {
+            return Ok(());
+        }
+        let endian = self.endian;
+        let c = self.class();
+        let shentsize = c.shentsize;
+        let shoff = endian.read_uint(&self.data, c.e_shoff, c.word) as usize;
+        let shnum = shdrs.len();
+        let names_idx = match endian.read_uint(&self.data, c.e_shstrndx, 2) as u32 {
+            SHN_XINDEX => shdrs[0].sh_link as usize,
+            idx => idx as usize,
+        };
+
+        // The grown name table, when there is one to grow. Without it the
+        // section goes unnamed (`sh_name` 0 is the empty string), which still
+        // keeps its bytes through `strip`. An `e_shstrndx` of 0 (`SHN_UNDEF`)
+        // says there is none, and must not be taken for the null section:
+        // that entry is not a string table, and in an image with too many
+        // sections for `e_shnum` its `sh_size` is the section count.
+        let names = (names_idx != 0).then(|| self.section_names(&shdrs)).flatten();
+        let names = names.map(|names| {
+            let mut grown = names.to_vec();
+            let name_off = grown.len() as u64;
+            grown.extend_from_slice(INJECTED_SECTION.as_bytes());
+            grown.push(0);
+            (name_off, grown)
+        });
+        let names_at = self.data.len() as u64;
+        if let Some((_, grown)) = &names {
+            self.data.extend_from_slice(grown);
+        }
+
+        let new_shoff = align_up(self.data.len() as u64, c.word as u64) as usize;
+        self.data.resize(new_shoff, 0);
+        self.data.extend_from_within(shoff..shoff + shnum * shentsize);
+        let name_off = match names {
+            Some((name_off, grown)) => {
+                // Point the copied table's entry for the name table at the
+                // grown copy of it.
+                let entry = new_shoff + names_idx * shentsize;
+                endian.write_uint(&mut self.data, entry + c.sh_offset, c.word, names_at);
+                endian.write_uint(&mut self.data, entry + c.sh_size, c.word, grown.len() as u64);
+                name_off
+            }
+            None => 0,
+        };
+
+        let entry = self.data.len();
+        self.data.resize(entry + shentsize, 0);
+        let d = &mut self.data;
+        endian.write_uint(d, entry, 4, name_off);
+        endian.write_uint(d, entry + 4, 4, SHT_PROGBITS as u64);
+        for (field, value) in [
+            (c.sh_flags, (SHF_ALLOC | SHF_EXECINSTR) as u64),
+            (c.sh_addr, base),
+            (c.sh_offset, file_off),
+            (c.sh_size, len),
+            // `sh_addralign` follows `sh_link` and `sh_info`, both 4 bytes,
+            // in either class.
+            (c.sh_link + 8, align),
+        ] {
+            endian.write_uint(d, entry + field, c.word, value);
+        }
+
+        endian.write_uint(d, c.e_shoff, c.word, new_shoff as u64);
+        let new_shnum = shnum + 1;
+        let extended = endian.read_uint(d, c.e_shnum, 2) == 0;
+        if extended || new_shnum >= SHN_LORESERVE as usize {
+            // The count no longer fits `e_shnum` (or already did not): it
+            // lives in the null section header's `sh_size` instead.
+            endian.write_uint(d, c.e_shnum, 2, 0);
+            endian.write_uint(d, new_shoff + c.sh_size, c.word, new_shnum as u64);
+        } else {
+            endian.write_uint(d, c.e_shnum, 2, new_shnum as u64);
+        }
         Ok(())
     }
 }
+
+/// The name of the section header [`Binary::inject_segment`] gives the segment
+/// it injects. See [`Binary::describe_injected_section`].
+const INJECTED_SECTION: &str = ".resplice";
 
 #[cfg(test)]
 mod tests {
@@ -2266,6 +2387,74 @@ mod tests {
 
     const PAYLOAD: [u8; 7] = [0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03];
     const INJECT_AT: u64 = 0x600000;
+
+    /// The injected segment has to be described by a section, not only by its
+    /// `PT_LOAD`. `strip` and `objcopy` keep the bytes sections cover and
+    /// rebuild the program headers from them, so without one the segment came
+    /// out of `strip` dropped, and every trampoline into it jumped into
+    /// unmapped memory.
+    #[test]
+    fn test_inject_segment_describes_the_segment_as_a_section() {
+        use goblin::elf::program_header::{PT_LOAD, PT_NOTE};
+        use goblin::elf::section_header::{SHF_ALLOC, SHF_EXECINSTR, SHT_PROGBITS, SHT_STRTAB};
+
+        let phdrs: [Phdr; 2] = [
+            (PT_LOAD as u64, 0, 0x400000, 0x400, 5, 0x1000),
+            (PT_NOTE as u64, 0x100, 0x400100, 0x20, 4, 4),
+        ];
+        let mut bin = craft_injectable(Endian::Little, Architecture::X86_64, 0x400, &phdrs);
+        let names = b"\0.text\0.shstrtab\0";
+        bin.data[0x200..0x200 + names.len()].copy_from_slice(names);
+        craft_sections(
+            &mut bin,
+            0x300,
+            &[(1 /* SHT_PROGBITS */, 0x80, 0x80), (SHT_STRTAB, 0x200, names.len() as u64)],
+        );
+        let e = bin.endian;
+        e.write_uint(&mut bin.data, 0x300 + 64, 4, 1); // .text's sh_name
+        e.write_uint(&mut bin.data, 0x300 + 128, 4, 7); // .shstrtab's sh_name
+        e.write_uint(&mut bin.data, 0x3e, 2, 2); // e_shstrndx
+        let before = bin.data[0x200..0x400].to_vec();
+
+        bin.inject_segment(INJECT_AT, &PAYLOAD).unwrap();
+        let po = injected_phdr(&bin, INJECT_AT, &PAYLOAD);
+        let p_offset = e.read_uint(&bin.data, po + ELF64.p_offset, 8);
+
+        let shdrs = bin.section_headers().unwrap();
+        assert_eq!(shdrs.len(), 4, "one section added to the three");
+        let sh = bin
+            .section_by_name(&shdrs, INJECTED_SECTION)
+            .expect("the injected segment should be a named section");
+        assert_eq!(sh.sh_type, SHT_PROGBITS);
+        assert_eq!(sh.sh_flags, (SHF_ALLOC | SHF_EXECINSTR) as u64);
+        assert_eq!(sh.sh_addr, INJECT_AT);
+        assert_eq!(sh.sh_offset, p_offset, "the section is the segment's bytes");
+        assert_eq!(bin.section_bytes(&sh), Some(&PAYLOAD[..]));
+
+        // The sections that were there keep their names and bytes.
+        let text = bin.section_by_name(&shdrs, ".text").unwrap();
+        assert_eq!((text.sh_offset, text.sh_size), (0x80, 0x80));
+        assert!(bin.section_by_name(&shdrs, ".shstrtab").is_some());
+        // And the original name and section-header tables are left in place.
+        assert_eq!(&bin.data[0x200..0x400], &before[..]);
+
+        // A target whose `e_shstrndx` is `SHN_UNDEF` has no name table to
+        // grow: the section goes unnamed, and the null entry is left null.
+        let mut bin = craft_injectable(Endian::Little, Architecture::X86_64, 0x400, &phdrs);
+        craft_sections(&mut bin, 0x300, &[(1 /* SHT_PROGBITS */, 0x80, 0x80)]);
+        bin.inject_segment(INJECT_AT, &PAYLOAD).unwrap();
+        let shdrs = bin.section_headers().unwrap();
+        assert_eq!(shdrs.len(), 3);
+        assert_eq!((shdrs[0].sh_offset, shdrs[0].sh_size), (0, 0), "null entry");
+        assert_eq!((shdrs[2].sh_name, shdrs[2].sh_addr), (0, INJECT_AT));
+        assert_eq!(bin.section_bytes(&shdrs[2]), Some(&PAYLOAD[..]));
+
+        // A target with no section headers gets none.
+        let mut bin = craft_injectable(Endian::Little, Architecture::X86_64, 0x400, &phdrs);
+        bin.inject_segment(INJECT_AT, &PAYLOAD).unwrap();
+        assert_eq!(e.read_uint(&bin.data, ELF64.e_shoff, 8), 0);
+        assert_eq!(bin.data.len(), 0x1000 + PAYLOAD.len());
+    }
 
     #[test]
     fn test_inject_segment_all_classes_and_endians() {
