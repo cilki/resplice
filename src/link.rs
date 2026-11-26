@@ -1389,6 +1389,60 @@ fn std_symbol_hint(name: &str) -> Option<&'static str> {
     )
 }
 
+/// The crate a Rust-mangled `name` belongs to, read from the root of its path:
+/// `helper` in `_ZN6helper4mul317h0123456789abcdefE` (legacy) and in
+/// `_RNvCs1234_6helper4mul3` (v0).
+///
+/// Asked only of a name nothing could resolve and [`std_symbol_hint`] did not
+/// place in the standard library, which leaves a crate the replacement crate
+/// depends on: the rlib's own items are defined in its own members. Splitting
+/// shared code into a helper crate is an ordinary thing to do, and the error
+/// for it used to talk about `core::panicking` instead of the dependency.
+///
+/// `None` for anything not read with certainty -- a name that is not
+/// Rust-mangled, a v0 path rooted at an impl (`M`/`X`/`Y`) or with a
+/// Punycode identifier, a legacy path whose first component is not an
+/// identifier -- which leaves those to the generic message.
+fn rust_crate_of(name: &str) -> Option<&str> {
+    // A decimal length followed by that many bytes of identifier.
+    fn ident(s: &str) -> Option<&str> {
+        let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+        let len: usize = s[..digits].parse().ok()?;
+        let rest = &s[digits..];
+        // v0 separates an identifier that starts with a digit or `_` from its
+        // length with an `_`; legacy never starts an identifier with a digit.
+        let rest = rest
+            .strip_prefix('_')
+            .filter(|r| r.as_bytes().first().is_some_and(|b| b.is_ascii_digit() || *b == b'_'))
+            .unwrap_or(rest);
+        rest.get(..len)
+    }
+    let krate = if let Some(rest) = name.strip_prefix("_ZN") {
+        ident(rest)?
+    } else {
+        // `_R`, an optional decimal encoding version, then the path: one `N`
+        // and namespace tag per level of nesting, down to the `C` of the
+        // crate root and its optional `s<base62>_` disambiguator.
+        let rest = name.strip_prefix("_R")?.trim_start_matches(|c: char| c.is_ascii_digit());
+        let mut b = rest.as_bytes();
+        while let [b'N', ns, tail @ ..] = b {
+            if !ns.is_ascii_alphabetic() {
+                return None;
+            }
+            b = tail;
+        }
+        let mut rest = std::str::from_utf8(b).ok()?.strip_prefix('C')?;
+        if let Some(r) = rest.strip_prefix('s') {
+            rest = &r[r.find('_')? + 1..];
+        }
+        ident(rest)?
+    };
+    let is_ident = !krate.is_empty()
+        && !krate.as_bytes()[0].is_ascii_digit()
+        && krate.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    is_ident.then_some(krate)
+}
+
 /// Link every object member of the rlib into the shared injected blob + patch
 /// list.
 fn link_objects<'d>(
@@ -1834,6 +1888,21 @@ fn link_objects<'d>(
                          target itself provides, and the precompiled standard library \
                          is neither. {hint}",
                         s.name
+                    );
+                }
+                if let Some(krate) = rust_crate_of(s.name) {
+                    return anyhow!(
+                        "unresolved external symbol {name:?}: no member of the rlib \
+                         defines it, and the target neither defines nor imports it. It \
+                         is an item of the crate `{krate}`, which the replacement crate \
+                         depends on, and resplice reads only the replacement crate's own \
+                         rlib, never a dependency's. Move the item into the replacement \
+                         crate, or mark it `#[inline]` in `{krate}` and build with \
+                         `--release`: a release build compiles an `#[inline]` or \
+                         generic function into every crate that calls it, so the copy \
+                         lands in the replacement crate's rlib. A `static` has no such \
+                         copy and has to be moved",
+                        name = s.name,
                     );
                 }
                 anyhow!(
@@ -2831,6 +2900,48 @@ mod tests {
             "_RNvCs1234_7mycrate18panic_bounds_check",
         ] {
             assert!(std_symbol_hint(name).is_none(), "{name}");
+        }
+    }
+
+    /// A splice calling a function of a crate the replacement crate depends on
+    /// fails, because only the replacement crate's own rlib is read. The error
+    /// has to name that crate and the fix, not point at `core::panicking`.
+    #[test]
+    fn test_link_rlib_explains_unresolved_dependency_item() {
+        let sym = "_ZN6helper4mul317he1946cfaf462b006E";
+        let msg = unresolved_call_err("rlib_dep_item", sym);
+        assert!(msg.contains(&format!("unresolved external symbol \"{sym}\"")), "message was {msg:?}");
+        assert!(msg.contains(".rspl.401000.401020"), "message was {msg:?}");
+        assert!(msg.contains("the crate `helper`"), "message was {msg:?}");
+        assert!(msg.contains("`#[inline]`"), "message was {msg:?}");
+        assert!(!msg.contains("core::panicking"), "message was {msg:?}");
+    }
+
+    /// The crate is read from the root of the path in both manglings, and
+    /// anything not certainly a crate name is left to the generic message.
+    #[test]
+    fn rust_crate_is_read_from_the_mangled_path() {
+        for (name, krate) in [
+            ("_ZN6helper4mul317he1946cfaf462b006E", "helper"),
+            ("_ZN9my_helper5inner3run17h0123456789abcdefE", "my_helper"),
+            ("_RNvCs1234_6helper4mul3", "helper"),
+            ("_RNvNtCsezJPv0cR1HF_6helper5inner3run", "helper"),
+            ("_RNvC6helper4mul3", "helper"),
+            ("_R0NvCs1234_6helper4mul3", "helper"),
+        ] {
+            assert_eq!(rust_crate_of(name), Some(krate), "{name}");
+        }
+        for name in [
+            "printf",
+            "helper",
+            "_ZN",
+            "_ZN99short",
+            "_ZN50_$LT$helper..Foo$u20$as$u20$core..fmt..Debug$GT$3fmt17h0123456789abcdefE",
+            "_RNvMCs1234_6helperNtB2_3Foo3new",
+            "_RNvCs1234_u6helper4mul3",
+            "_R",
+        ] {
+            assert_eq!(rust_crate_of(name), None, "{name}");
         }
     }
 
