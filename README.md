@@ -82,6 +82,12 @@ along module boundaries, so a `#[Splice]` in one module and the helper it calls
 in another are in different members of the archive and reference each other by
 name — splitting replacements across modules is fine.
 
+The rlib is the replacement crate's alone, though: a helper moved into a
+crate of its own that the replacement crate depends on is not in it, and a call
+to it is refused naming that crate. Keep such helpers in the replacement crate,
+or mark them `#[inline]`, which a release build compiles into every crate that
+calls them.
+
 What is *not* reachable is anything the rlib was not compiled from. Generic and
 `#[inline]` code from `core` is instantiated into the rlib and works, but items
 that only exist in a precompiled `core`/`std` (or any other crate's) rlib are
