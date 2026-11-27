@@ -1,5 +1,5 @@
 use proc_macro::TokenStream;
-use quote::quote;
+use quote::{quote, quote_spanned};
 use syn::{parse_macro_input, Expr, Item, Lit, Meta};
 
 /// Marks a function or static as a replacement for a section of the binary.
@@ -80,11 +80,22 @@ pub fn Splice(args: TokenStream, input: TokenStream) -> TokenStream {
             if let Err(e) = check_signature(&input_fn.sig) {
                 return e.to_compile_error().into();
             }
+            // What the macro adds is spanned on the author's `fn`, not on the
+            // macro. rustc keeps quiet about an item that starts with a token
+            // from an external macro, and one of the lints it then dropped was
+            // `no_mangle_generic_items`. The macro sees only the function and
+            // not the `impl<T>` around it, so a splice written as a method of a
+            // generic type is generic in a way `check_signature` cannot catch.
+            // rustc emits no code for it, the rlib had no section for it, and
+            // `resplice` reported the other splices as applied without a word
+            // about the missing one. Denying the lint makes that a compile
+            // error, and the author's span is what lets rustc report it.
+            let span = input_fn.sig.fn_token.span;
             if matches!(input_fn.vis, syn::Visibility::Inherited) {
-                input_fn.vis = syn::parse_quote!(pub);
+                input_fn.vis = syn::parse_quote_spanned!(span=> pub);
             }
             if input_fn.sig.abi.is_none() {
-                input_fn.sig.abi = Some(syn::parse_quote!(extern "C"));
+                input_fn.sig.abi = Some(syn::parse_quote_spanned!(span=> extern "C"));
             }
 
             // The function's own attributes are kept, like a `static`'s are.
@@ -94,12 +105,13 @@ pub fn Splice(args: TokenStream, input: TokenStream) -> TokenStream {
             // marked with `#[unsafe(naked)]`"), while `#[instruction_set]`,
             // `#[target_feature]`, `#[inline(never)]` and doc comments
             // compiled to a function without them.
-            let export = match export_attrs(&input_fn.attrs, &section) {
+            let export = match export_attrs(&input_fn.attrs, &section, span) {
                 Ok(export) => export,
                 Err(e) => return e.to_compile_error().into(),
             };
-            quote! {
+            quote_spanned! {span=>
                 #export
+                #[deny(no_mangle_generic_items)]
                 #input_fn
             }
         }
@@ -109,7 +121,8 @@ pub fn Splice(args: TokenStream, input: TokenStream) -> TokenStream {
             if matches!(input_static.vis, syn::Visibility::Inherited) {
                 input_static.vis = syn::parse_quote!(pub);
             }
-            let export = match export_attrs(&input_static.attrs, &section) {
+            let span = input_static.static_token.span;
+            let export = match export_attrs(&input_static.attrs, &section, span) {
                 Ok(export) => export,
                 Err(e) => return e.to_compile_error().into(),
             };
@@ -220,8 +233,16 @@ fn arg_position_impl_trait(sig: &syn::Signature) -> Option<&syn::TypeImplTrait> 
 /// A `#[link_section]` of the author's is refused. The tool finds a splice by
 /// its section name, so the item cannot live anywhere else; rustc kept the
 /// macro's section and dropped the author's without a word.
-fn export_attrs(attrs: &[syn::Attribute], section: &str) -> syn::Result<proc_macro2::TokenStream> {
-    let mut no_mangle = Some(quote!(#[unsafe(no_mangle)]));
+///
+/// Both are spanned on `span`, the author's `fn` or `static` token, so that
+/// rustc reports what it finds wrong with them, as it does for attributes the
+/// author wrote, instead of discarding it as an external macro's problem.
+fn export_attrs(
+    attrs: &[syn::Attribute],
+    section: &str,
+    span: proc_macro2::Span,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let mut no_mangle = Some(quote_spanned!(span=> #[unsafe(no_mangle)]));
     for attr in attrs {
         let meta = unwrap_unsafe(&attr.meta);
         if meta.path().is_ident("no_mangle") {
@@ -237,7 +258,7 @@ fn export_attrs(attrs: &[syn::Attribute], section: &str) -> syn::Result<proc_mac
             ));
         }
     }
-    Ok(quote! {
+    Ok(quote_spanned! {span=>
         #no_mangle
         #[unsafe(link_section = #section)]
     })
@@ -397,7 +418,7 @@ mod tests {
     #[test]
     fn no_mangle_is_added_only_when_absent() {
         let export = |item: syn::ItemFn| {
-            export_attrs(&item.attrs, ".rspl.10.20")
+            export_attrs(&item.attrs, ".rspl.10.20", proc_macro2::Span::call_site())
                 .unwrap()
                 .to_string()
         };
@@ -437,7 +458,7 @@ mod tests {
             ),
         ] {
             let item: syn::ItemStatic = item;
-            let msg = export_attrs(&item.attrs, ".rspl.10.20")
+            let msg = export_attrs(&item.attrs, ".rspl.10.20", proc_macro2::Span::call_site())
                 .unwrap_err()
                 .to_string();
             assert!(msg.contains("cannot also have a `link_section`"), "{msg}");
