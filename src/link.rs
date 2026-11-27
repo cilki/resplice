@@ -124,13 +124,20 @@ fn map_rlib(path: &Path) -> Result<Rlib> {
 ///   damage reaches the magic at its start, and LLVM bitcode (a container
 ///   `object` does not read at all), which link-time optimization puts in a
 ///   `*.o` member in place of machine code.
-fn unparseable_member(name: &str, data: &[u8], err: object::Error) -> Result<()> {
+fn unparseable_member(name: &str, data: &[u8], err: object::Error, target: &Binary) -> Result<()> {
     /// Magic of a bare LLVM bitcode module, and of the wrapper form that
     /// carries one (`0x0b17c0de`, little-endian).
     const BITCODE: [&[u8]; 2] = [b"BC\xc0\xde", &[0xde, 0xc0, 0x17, 0x0b]];
 
     if !name.ends_with(".o") && object::FileKind::parse(data).is_err() {
         return Ok(());
+    }
+    // What a `wasm32` build puts in its members. `object` is built without
+    // its wasm reader, so this is not an object it can parse, and the refusal
+    // below would call it damaged -- with "rebuild" as the remedy, which only
+    // rebuilds the same wasm.
+    if data.starts_with(b"\0asm") {
+        return Err(foreign_object("WebAssembly", "wasm", target));
     }
     if BITCODE.iter().any(|magic| data.starts_with(magic)) {
         bail!(
@@ -215,7 +222,7 @@ pub fn link_rlib(binary: &mut Binary, rlib_path: &Path) -> Result<Vec<Applied>> 
             // [`unparseable_member`].
             Err(e) => {
                 let name = String::from_utf8_lossy(member.name()).into_owned();
-                unparseable_member(&name, member_data, e)?;
+                unparseable_member(&name, member_data, e, binary)?;
             }
         }
     }
@@ -657,12 +664,54 @@ fn check_one_item_per_splice(obj: &object::File, splices: &[bool]) -> Result<()>
     )
 }
 
+/// The refusal of an rlib whose members are `kind` objects rather than ELF:
+/// the replacement crate was compiled for a `platform` target, not for the
+/// one the binary being patched runs on.
+///
+/// More than the container differs. A Windows build follows the Win64 calling
+/// convention and an Apple one Apple's, so even a splice whose bytes could be
+/// copied over unchanged would take its arguments from the wrong registers.
+fn foreign_object(kind: &str, platform: &str, target: &Binary) -> anyhow::Error {
+    let triple = match (target.architecture(), target.endian()) {
+        (Architecture::X86_64, _) => "x86_64-unknown-linux-gnu",
+        (Architecture::X86, _) => "i686-unknown-linux-gnu",
+        (Architecture::Arm64, _) => "aarch64-unknown-linux-gnu",
+        (Architecture::Arm, _) => "armv7-unknown-linux-gnueabihf",
+        (Architecture::Mips, Endian::Big) => "mips-unknown-linux-gnu",
+        (Architecture::Mips, Endian::Little) => "mipsel-unknown-linux-gnu",
+        (Architecture::Mips64, Endian::Big) => "mips64-unknown-linux-gnuabi64",
+        (Architecture::Mips64, Endian::Little) => "mips64el-unknown-linux-gnuabi64",
+    };
+    anyhow!(
+        "the rlib holds {kind} objects, not ELF: the replacement crate was compiled for \
+         a {platform} target, but the binary being patched is an ELF file for {}. Its code \
+         follows that platform's object format and calling convention, not the \
+         target's, so it cannot be spliced in. Build the replacement crate for the \
+         target's own triple -- for a Linux target, `cargo build --release --target \
+         {triple}` (or `cross build`, as the README describes) -- and pass \
+         `target/{triple}/release/lib<crate>.rlib`",
+        arch::describe(target.architecture(), target.endian()),
+    )
+}
+
 /// Verify that an rlib object member targets the same architecture and byte
 /// order as the binary being patched (the architecture implies the pointer
 /// width). Splicing wrong-arch machine code in would silently corrupt the
 /// target, so this is a hard gate.
 fn verify_arch(obj: &object::File, target: &Binary) -> Result<()> {
     use object::Architecture as OA;
+    // Checked before the architecture, which a COFF or Mach-O object can share
+    // with the target: an x86-64 Windows build passed that gate, and its code
+    // -- compiled to the Win64 calling convention -- was patched in as if it
+    // were the System V code the target's callers expect.
+    match obj.format() {
+        object::BinaryFormat::Elf => {}
+        object::BinaryFormat::Coff | object::BinaryFormat::Pe => {
+            return Err(foreign_object("COFF", "Windows", target));
+        }
+        object::BinaryFormat::MachO => return Err(foreign_object("Mach-O", "Apple", target)),
+        other => return Err(foreign_object(&format!("{other:?}"), "non-ELF", target)),
+    }
     let obj_arch = match obj.architecture() {
         OA::I386 => Architecture::X86,
         OA::X86_64 => Architecture::X86_64,
@@ -4333,6 +4382,61 @@ mod tests {
         let (bin, applied) = run_link_on(&crafted_target(), "rlib_rmeta", &rlib);
         assert_eq!(applied.len(), 1);
         assert_eq!(lea_target(&bin), INJECT_BASE);
+    }
+
+    /// An rlib compiled for a platform whose objects are not ELF has to be
+    /// refused, even when its architecture matches the target's.
+    ///
+    /// A replacement crate built on Windows (or with a Windows `--target`) is
+    /// COFF, and `object` reads COFF as readily as ELF: an x86-64 one passed
+    /// the architecture gate, and a splice with no relocations in it was
+    /// patched into the ELF target and reported as applied. Its code follows the
+    /// Win64 calling convention -- arguments in `rcx`/`rdx`/`r8`/`r9` rather
+    /// than `rdi`/`rsi`/`rdx`/`rcx` -- so the patched function read garbage for
+    /// every argument, with nothing anywhere saying why. A splice that did have
+    /// relocations was refused only as a "non-ELF relocation", which names
+    /// neither the platform nor the remedy.
+    #[test]
+    fn test_link_rlib_refuses_a_non_elf_member() {
+        use object::write::Object;
+        use object::{Architecture, BinaryFormat, Endianness, SectionKind};
+
+        // Mach-O caps a section name at 16 bytes, which is too short for a
+        // range in the crafted target; the format is refused before any range
+        // is read, so a short one stands in for it.
+        let coff_name = format!(".rspl.{SPLICE_VA:x}.{:x}", SPLICE_VA + 0x20);
+        for (format, platform, name) in [
+            (BinaryFormat::Coff, "Windows", coff_name.as_str()),
+            (BinaryFormat::MachO, "Apple", ".rspl.0.20"),
+        ] {
+            let mut obj = Object::new(format, Architecture::X86_64, Endianness::Little);
+            let name = name.as_bytes().to_vec();
+            let rspl = obj.add_section(b"__TEXT".to_vec(), name, SectionKind::Text);
+            obj.append_section_data(rspl, &HELPER_CODE, 16);
+            let rlib = ar_wrap("splice.o", &obj.write().unwrap());
+
+            let msg = link_err(&format!("rlib_{format:?}"), &rlib);
+            assert!(msg.contains("not ELF"), "message was {msg:?}");
+            assert!(msg.contains(platform), "message was {msg:?}");
+            assert!(
+                msg.contains("x86_64-unknown-linux-gnu"),
+                "message was {msg:?}"
+            );
+        }
+
+        // A WebAssembly object, which is what a `wasm32` build puts in its
+        // members. `object` is built without its wasm reader, so the member is
+        // unparseable -- and used to be refused as damaged, with "Rebuild the
+        // rlib" as the remedy, which rebuilds the same wasm.
+        let mut wasm = Vec::from(&b"\0asm\x01\0\0\0"[..]);
+        wasm.extend_from_slice(&[0u8; 64]);
+        let msg = link_err("rlib_wasm", &ar_wrap("splice.o", &wasm));
+        assert!(msg.contains("WebAssembly"), "message was {msg:?}");
+        assert!(
+            msg.contains("x86_64-unknown-linux-gnu"),
+            "message was {msg:?}"
+        );
+        assert!(!msg.contains("Rebuild the rlib"), "message was {msg:?}");
     }
 
     /// An rlib with no `.rspl.*` section in any member has nothing to splice.
