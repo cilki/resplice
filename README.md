@@ -500,6 +500,18 @@ compile into a lookup table of addresses. That table is in a section named
 replacement crate with `RUSTFLAGS="-C jump-tables=no"` to keep the `match` as
 code.
 
+A `dyn Trait` is the same story. A call through a `&dyn Trait` or
+`Box<dyn Trait>` that LLVM cannot devirtualize loads the method from the type's
+vtable, and the vtable is a table of method addresses that rustc emits as an
+anonymous constant (`.data.rel.ro..Lanon.<hash>.<n>`). The refusal says when
+that constant is a vtable. Take the value as a generic parameter instead
+(`impl Trait` or `<T: Trait>`), which calls the method directly, or put the
+types in an `enum` and `match` on it:
+
+```rust
+fn run(op: impl Op, x: i32) -> i32 { op.apply(x) }  // not `op: &dyn Op`
+```
+
 ### Cross-compiling for another architecture
 
 The replacement crate must be compiled for the **same** architecture as the
