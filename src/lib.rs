@@ -1698,10 +1698,12 @@ impl Binary {
             let align = if ph.p_align == 8 { 8 } else { 4 };
             let up = |n: usize, a: usize| n.div_ceil(a) * a;
             let start = ph.p_offset as usize;
-            let end = start
+            let Some(end) = start
                 .checked_add(ph.p_filesz as usize)
                 .filter(|&e| e <= self.data.len())
-                .ok_or_else(|| anyhow!("PT_GNU_PROPERTY runs past the end of the image"))?;
+            else {
+                continue;
+            };
             let mut note = start;
             while note + 12 <= end {
                 let namesz = endian.read_uint(&self.data, note, 4) as usize;
