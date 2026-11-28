@@ -583,3 +583,51 @@ testSpliceKeepsFunctionAttributes() {
 	applySplices
 	[ "$("$fixture/prog.patched")" = "42" ]
 }
+
+## A splice written as a method has to be one rustc emits code for.
+##
+## `#[Splice]` sees only the `fn`, not the `impl` around it, so it cannot tell
+## that `impl<T> Table<T>` makes the method generic -- and a generic method,
+## like a generic function, is no code until something instantiates it. rustc
+## does refuse to give such a method an unmangled name (the
+## `no_mangle_generic_items` lint), but a lint on an item that starts with a
+## token from an external macro is not reported, and the `pub extern "C"` the
+## macro adds is that token. So the crate built, its rlib had no section for the
+## method, and `resplice` applied the crate's other splices and exited 0 without
+## a word about it; the patched program ran the original code.
+##
+## The same method in an `impl` that is not generic is a function like any
+## other, and splices.
+testSpliceInGenericImplIsACompileError() {
+	newFixture
+	writeComputeAsm 32
+	printf '%s\n' '#include <stdio.h>' 'int compute(void);' \
+		'int main(void){ printf("%d\n", compute()); return 0; }' > "$fixture/prog.c"
+	buildTarget "$fixture/compute.s"
+
+	symRange compute
+
+	{
+		printf 'use resplice_macros::Splice;\n'
+		printf 'pub struct Table;\n'
+		printf 'impl Table {\n'
+		printf '    #[Splice(begin = %d, end = %d)]\n' "$va" "$end"
+		printf '    fn compute() -> i32 { 42 }\n'
+		printf '}\n'
+	} > "$fixture/src/lib.rs"
+	buildFixture
+	applySplices
+	[ "$("$fixture/prog.patched")" = "42" ]
+
+	{
+		printf 'use resplice_macros::Splice;\n'
+		printf 'pub struct Table<T>(core::marker::PhantomData<T>);\n'
+		printf 'impl<T> Table<T> {\n'
+		printf '    #[Splice(begin = %d, end = %d)]\n' "$va" "$end"
+		printf '    fn compute() -> i32 { 42 }\n'
+		printf '}\n'
+	} > "$fixture/src/lib.rs"
+	! cargo build --release --manifest-path "$fixture/Cargo.toml" \
+		--target-dir target 2> "$fixture/err"
+	grep -q 'functions generic over types or consts must be mangled' "$fixture/err"
+}
