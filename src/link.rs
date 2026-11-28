@@ -1095,6 +1095,58 @@ fn panic_location<'s>(
     Some(format!("{file}:{line}:{col}"))
 }
 
+/// Whether `sec` is the vtable rustc emits for a `dyn Trait`, rather than data
+/// the source wrote.
+///
+/// Every call through a `&dyn Trait` or `Box<dyn Trait>` that LLVM cannot
+/// devirtualize loads the method out of one: an anonymous constant
+/// (`.data.rel.ro..Lanon.<hash>.<n>`) laid out as `drop_in_place` (null for a
+/// type without drop glue), the type's size and alignment, then one pointer
+/// per method. The pointers make it one more thing [`absolute_in_pie`] refuses
+/// in a position-independent target, and the generic advice -- find the
+/// `static`, `&str` or function pointer you stored -- sent the user looking
+/// for something no line of the crate wrote: on an aarch64 gcc shared library,
+/// a splice that only picked between two `&dyn Op` locals was refused naming
+/// nothing but `.data.rel.ro..Lanon...`.
+///
+/// Recognised by shape: a section of at least four whole words; size and
+/// alignment words that nothing relocates, with a power-of-two alignment the
+/// size is a multiple of; and every relocation a word-aligned one, outside
+/// those two words, into code. A table of function pointers the crate wrote
+/// has a relocation in every word, so it is not taken for one. `relocs` are
+/// `sec`'s own relocations; `is_code` says whether a symbol is defined in an
+/// executable section.
+fn is_vtable(
+    name: &str,
+    sec: &Sec,
+    relocs: &[Rel],
+    is_code: impl Fn(SymId) -> bool,
+    width: usize,
+    endian: Endian,
+) -> bool {
+    let w = width as u64;
+    let len = sec.bytes.len();
+    if !name.contains(".Lanon.") || len < 4 * width || len % width != 0 || relocs.is_empty() {
+        return false;
+    }
+    let size = endian.read_uint(sec.bytes, width, width);
+    let align = endian.read_uint(sec.bytes, 2 * width, width);
+    align.is_power_of_two()
+        && size % align == 0
+        && relocs.iter().all(|r| {
+            r.offset % w == 0 && r.offset != w && r.offset != 2 * w && is_code(r.sym)
+        })
+}
+
+/// The remedy [`absolute_in_pie`] gives for a reference out of a vtable
+/// [`is_vtable`] recognises.
+const VTABLE_REMEDY: &str = "keep `dyn Trait` calls out of the splice: the section \
+     is not a `static` the crate wrote, but the vtable rustc emits for a `&dyn` or \
+     `Box<dyn>` of some type, and it holds the addresses of that type's methods -- \
+     the relocation names the one refused. Take the value as a generic parameter \
+     (`impl Trait` or `<T: Trait>`), which calls the method directly, or put the \
+     types in an `enum` and `match` on it";
+
 /// The remedy [`absolute_in_pie`] gives for a reference out of the panic
 /// location [`panic_location`] recognises, at `at`.
 fn panic_location_remedy(at: &str) -> String {
@@ -2158,6 +2210,20 @@ fn link_objects<'d>(
                         SWITCH_TABLE_REMEDY.to_string()
                     } else if let Some(at) = location {
                         panic_location_remedy(&at)
+                    } else if is_vtable(
+                        name,
+                        sec,
+                        relocs,
+                        |sym| {
+                            syms[sym]
+                                .section
+                                .and_then(|id| secs.get(id))
+                                .is_some_and(|s| s.code)
+                        },
+                        if is_64 { 8 } else { 4 },
+                        endian,
+                    ) {
+                        VTABLE_REMEDY.to_string()
                     } else {
                         "keep addresses out of the data the splice reaches. What \
                          stores one is a `static` holding a reference, a `&str`, a \
@@ -3304,12 +3370,18 @@ mod tests {
     /// data), with a relocation at `ptr_reloc_off` for the pointer it contains
     /// (an offset past the end of the 8-byte static makes it malformed).
     fn build_rlib_relro(data_section: &str, ptr_reloc_off: u64) -> Vec<u8> {
-        build_rlib_relro_data(data_section, ptr_reloc_off, &[0u8; 8])
+        build_rlib_relro_data(data_section, ptr_reloc_off, &[0u8; 8], false)
     }
 
     /// [`build_rlib_relro`], with `data` as the contents of the section holding
-    /// the pointer.
-    fn build_rlib_relro_data(data_section: &str, ptr_reloc_off: u64, data: &[u8]) -> Vec<u8> {
+    /// the pointer, and the pointer aimed at a function (a one-byte `ret` in a
+    /// `.text` section of its own) rather than a string when `to_code` is set.
+    fn build_rlib_relro_data(
+        data_section: &str,
+        ptr_reloc_off: u64,
+        data: &[u8],
+        to_code: bool,
+    ) -> Vec<u8> {
         use object::write::{Object, Relocation, Symbol, SymbolSection as WSection};
         use object::{
             Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolFlags,
@@ -3318,9 +3390,16 @@ mod tests {
 
         let mut obj = Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
 
-        let strs = obj.add_section(vec![], b".rodata.str1.1".to_vec(), SectionKind::ReadOnlyData);
-        obj.append_section_data(strs, &STR_DATA, 1);
-        let str_sym = obj.section_symbol(strs);
+        let str_sym = if to_code {
+            let text = obj.add_section(vec![], b".text._ZN4play5apply".to_vec(), SectionKind::Text);
+            obj.append_section_data(text, &[0xc3], 16);
+            obj.section_symbol(text)
+        } else {
+            let strs =
+                obj.add_section(vec![], b".rodata.str1.1".to_vec(), SectionKind::ReadOnlyData);
+            obj.append_section_data(strs, &STR_DATA, 1);
+            obj.section_symbol(strs)
+        };
 
         // `static NAMES: &[u8; 4] = &STR;` — one pointer, relocated at link time.
         let names_sec =
@@ -3562,6 +3641,14 @@ mod tests {
             l[20] = 9;
             l
         };
+        // A vtable: null `drop_in_place`, size 4, align 4, then one method
+        // pointer left zero for the relocation to fill.
+        const VTABLE: [u8; 32] = {
+            let mut v = [0u8; 32];
+            v[8] = 4;
+            v[16] = 4;
+            v
+        };
         for (tag, rlib, cue) in [
             // `R_X86_64_64`: the pointer inside an injected RELRO `static`.
             (
@@ -3583,10 +3670,32 @@ mod tests {
             // line of the crate to change.
             (
                 "rlib_pie_location",
-                build_rlib_relro_data(ANON_SECTION, 0, &LOCATION),
+                build_rlib_relro_data(ANON_SECTION, 0, &LOCATION, false),
                 "panic at abc:12:9",
             ),
-            // An anonymous constant without that shape is not taken for one.
+            // The vtable of a `&dyn Trait`: no drop glue, size and alignment
+            // 4, then the one method. The refusal names `dyn Trait` and the
+            // generic parameter that calls the method directly.
+            (
+                "rlib_pie_vtable",
+                build_rlib_relro_data(ANON_SECTION, 0x18, &VTABLE, true),
+                "`impl Trait`",
+            ),
+            // A table of function pointers the crate wrote has a pointer where
+            // a vtable keeps its size, and is not taken for one.
+            (
+                "rlib_pie_fn_table",
+                build_rlib_relro_data(ANON_SECTION, 0x8, &[0u8; 32], true),
+                "`&str`",
+            ),
+            // Nor is a vtable-shaped constant pointing at data.
+            (
+                "rlib_pie_vtable_to_data",
+                build_rlib_relro_data(ANON_SECTION, 0x18, &VTABLE, false),
+                "`&str`",
+            ),
+            // An anonymous constant without any of those shapes is not taken
+            // for one.
             ("rlib_pie_anon", build_rlib_relro(ANON_SECTION, 0), "`&str`"),
             // A synthesized GOT slot, which holds an address just the same,
             // when the instruction under it is not one `arch::relax_got` can
@@ -3616,6 +3725,12 @@ mod tests {
             assert_eq!(
                 msg.contains("core::panic::Location"),
                 tag == "rlib_pie_location",
+                "message was {msg:?}"
+            );
+            // Only a vtable is blamed on `dyn Trait`.
+            assert_eq!(
+                msg.contains("dyn Trait"),
+                tag == "rlib_pie_vtable",
                 "message was {msg:?}"
             );
             // Refused before anything was written over the target's own bytes.
