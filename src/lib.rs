@@ -511,7 +511,9 @@ impl Binary {
     /// relocation sections that nothing then asked about; everything the rest
     /// of this file reads out of a target it reads (and bounds-checks) itself.
     fn detect_arch(data: &[u8]) -> Result<(Architecture, Endian)> {
-        use goblin::elf::header::{EM_386, EM_AARCH64, EM_ARM, EM_MIPS, EM_X86_64};
+        use goblin::elf::header::{
+            EM_386, EM_AARCH64, EM_ARM, EM_MIPS, EM_X86_64, ET_CORE, ET_DYN, ET_EXEC, ET_REL,
+        };
 
         // An `ar` archive in the target's place is almost always the rlib,
         // given first: the two inputs are both paths, and nothing else about
@@ -567,6 +569,27 @@ impl Binary {
         // make every subsequent header field be read at the wrong width.
         if arch.is_64() != is_64 {
             return Err(anyhow!("ELF class contradicts machine type {machine}"));
+        }
+        // Only a linked image has what a splice is placed with: virtual
+        // addresses in a program-header table the loader maps. A relocatable
+        // object has neither (its `e_phentsize` is 0, which the program-header
+        // reader would otherwise report as a malformed table), and a core dump
+        // has segments but is a snapshot of memory, not something to run.
+        match endian.read_uint(data, 0x10, 2) as u16 {
+            ET_EXEC | ET_DYN => {}
+            ET_REL => bail!(
+                "target is a relocatable object (`ET_REL`, a `.o`), not a linked executable \
+                 or shared library: it has no program headers and no virtual addresses for \
+                 `begin`/`end` to name. Link it first and splice the linked output"
+            ),
+            ET_CORE => bail!(
+                "target is a core dump (`ET_CORE`), not an executable or shared library; \
+                 splice the binary that produced it instead"
+            ),
+            other => bail!(
+                "target has ELF type {other}, not an executable (`ET_EXEC`) or a shared \
+                 object/PIE (`ET_DYN`)"
+            ),
         }
         Ok((arch, endian))
     }
@@ -1833,6 +1856,7 @@ mod tests {
         data[4] = 2; // 64-bit
         data[5] = 1; // Little endian
         data[6] = 1; // ELF version
+        data[16] = 2; // e_type = ET_EXEC
         data[18] = 0x3e; // e_machine = EM_X86_64 (little endian)
         data
     }
@@ -1889,6 +1913,21 @@ mod tests {
         data[4] = 1; // ELFCLASS32 alongside e_machine = EM_X86_64
         let err = Binary::detect_arch(&data).unwrap_err();
         assert!(err.to_string().contains("contradicts"), "{err}");
+    }
+
+    /// A `.o` or a core dump in the target's place has to be named as such,
+    /// not reported as a program-header table of the wrong entry size.
+    #[test]
+    fn detect_arch_rejects_images_that_are_not_linked() {
+        for (e_type, expected) in [(1u8, "relocatable object"), (4, "core dump"), (0, "ELF type 0")] {
+            let mut data = create_minimal_elf();
+            data[16] = e_type;
+            let msg = Binary::detect_arch(&data).unwrap_err().to_string();
+            assert!(msg.contains(expected), "{msg}");
+        }
+        let mut data = create_minimal_elf();
+        data[16] = 3; // ET_DYN
+        assert!(Binary::detect_arch(&data).is_ok());
     }
 
     /// The patched copy of an executable must itself be executable. A freshly
