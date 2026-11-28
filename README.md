@@ -76,6 +76,15 @@ data, or call libc. `resplice` resolves those relocations recursively:
   the reference would resolve to address 0), and a reserved or unresolvable
   `st_shndx`.
 
+A target built with indirect-branch protection — `-mbranch-protection=bti` or
+`=standard` on aarch64, `-fcf-protection` on x86 — says so in its
+`.note.gnu.property`, and the loader then faults any indirect call or jump that
+does not land on a `bti`/`endbr` instruction. Spliced code has none: a splice
+overwrites the one at `begin`, and rustc does not emit them. So whenever a run
+splices or injects code, the BTI (or IBT) bit of that note is cleared and the
+patched image is mapped without that protection. Pointer authentication and
+shadow stacks are left on; the replacement code needs nothing special for them.
+
 That closure spans the whole rlib, not just the object file the splice itself
 landed in. rustc compiles a crate into one object per codegen unit, partitioned
 along module boundaries, so a `#[Splice]` in one module and the helper it calls

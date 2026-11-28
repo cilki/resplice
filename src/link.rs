@@ -235,7 +235,7 @@ pub fn link_rlib(binary: &mut Binary, rlib_path: &Path) -> Result<Vec<Applied>> 
 
     let mut blob: Vec<u8> = Vec::new();
     let mut patches: Vec<Patch> = Vec::new();
-    link_objects(&objs, binary, base, &mut blob, &mut patches)?;
+    let has_code = link_objects(&objs, binary, base, &mut blob, &mut patches)?;
 
     // An rlib with nothing to splice used to go through: a warning on stderr,
     // `applied 0 splice(s)` on stdout, an unchanged copy of the target at the
@@ -283,6 +283,11 @@ pub fn link_rlib(binary: &mut Binary, rlib_path: &Path) -> Result<Vec<Applied>> 
     // image, so those offsets stay valid across the injection.
     if !blob.is_empty() {
         binary.inject_segment(base, &blob)?;
+    }
+    // Spliced code has no indirect-branch landing pads, so a BTI- or
+    // IBT-marked target would fault on the first indirect call into it.
+    if has_code {
+        binary.drop_branch_target_marking()?;
     }
 
     let mut applied = Vec::new();
@@ -1533,13 +1538,16 @@ fn rust_crate_of(name: &str) -> Option<&str> {
 
 /// Link every object member of the rlib into the shared injected blob + patch
 /// list.
+///
+/// Returns whether any of it is code -- a `fn` splice, or a section of code
+/// in the injected segment -- for [`Binary::drop_branch_target_marking`].
 fn link_objects<'d>(
     objs: &[object::File<'d>],
     target: &Binary,
     base: u64,
     blob: &mut Vec<u8>,
     patches: &mut Vec<Patch>,
-) -> Result<()> {
+) -> Result<bool> {
     let arch = target.architecture();
     let endian = target.endian();
     let is_64 = target.is_64();
@@ -1609,8 +1617,9 @@ fn link_objects<'d>(
     }
 
     if splice_idxs.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
+    let mut has_code = splice_idxs.iter().any(|&si| secs[si].code);
 
     // Translate each region to a file offset before resolving anything: the
     // *whole* region has to be file-backed by one segment, not just `begin`.
@@ -1830,6 +1839,7 @@ fn link_objects<'d>(
         sec_va.insert(si, va)?;
         inj_blob_off.insert(si, blob.len())?;
         blob.extend_from_slice(bytes);
+        has_code |= sec.code;
     }
 
     // Everything the closure leaves undefined has to come from the target
@@ -2346,7 +2356,7 @@ fn link_objects<'d>(
         });
     }
 
-    Ok(())
+    Ok(has_code)
 }
 
 /// Refuse an alignment the injected segment cannot give a section it holds.

@@ -1658,6 +1658,85 @@ impl Binary {
         Ok(())
     }
 
+    /// Withdraw the target's claim that all of its code has indirect-branch
+    /// landing pads, and report whether it made one.
+    ///
+    /// A target built with `-mbranch-protection=standard` (aarch64) or
+    /// `-fcf-protection` (x86) says so in its `PT_GNU_PROPERTY` note, and the
+    /// loader then maps every executable segment guarded: under aarch64 BTI an
+    /// indirect call or jump that lands on anything other than a `bti`/`paciasp`
+    /// faults with `SIGILL`. A splice breaks that promise twice over. Its code
+    /// replaces the landing pad at `begin` -- in place with whatever the
+    /// replacement starts with, or with the trampoline's `b` -- so a call through
+    /// a function pointer or vtable to the spliced function faults; and the
+    /// injected segment is rustc output built without branch protection, mapped
+    /// guarded like the rest, so its own indirect branches fault too. Clearing
+    /// the feature bit makes the loader map the image unguarded, which is what
+    /// the patched code needs. The other bits (PAC, shadow stack) are left
+    /// alone: those are honoured by ordinary calls and returns, which is all the
+    /// replacement code does.
+    ///
+    /// A target without the note, or with a note this does not understand, is
+    /// left as it is.
+    pub fn drop_branch_target_marking(&mut self) -> Result<bool> {
+        const PT_GNU_PROPERTY: u32 = 0x6474_e553;
+        const NT_GNU_PROPERTY_TYPE_0: u64 = 5;
+        // `GNU_PROPERTY_{AARCH64,X86}_FEATURE_1_AND` and their BTI/IBT bit.
+        let (feature, bit) = match self.arch {
+            Architecture::Arm64 => (0xc000_0000u64, 1u64 << 0),
+            Architecture::X86 | Architecture::X86_64 => (0xc000_0002, 1 << 0),
+            _ => return Ok(false),
+        };
+        let endian = self.endian;
+        // Property data is padded to the ELF class's word, as glibc reads it.
+        let word = self.class().word;
+        let mut cleared = false;
+        for ph in self.program_headers()? {
+            if ph.p_type != PT_GNU_PROPERTY {
+                continue;
+            }
+            let align = if ph.p_align == 8 { 8 } else { 4 };
+            let up = |n: usize, a: usize| n.div_ceil(a) * a;
+            let start = ph.p_offset as usize;
+            let end = start
+                .checked_add(ph.p_filesz as usize)
+                .filter(|&e| e <= self.data.len())
+                .ok_or_else(|| anyhow!("PT_GNU_PROPERTY runs past the end of the image"))?;
+            let mut note = start;
+            while note + 12 <= end {
+                let namesz = endian.read_uint(&self.data, note, 4) as usize;
+                let descsz = endian.read_uint(&self.data, note + 4, 4) as usize;
+                let n_type = endian.read_uint(&self.data, note + 8, 4);
+                let desc = note + up(12 + namesz, align);
+                let next = up(desc + descsz, align);
+                if desc + descsz > end {
+                    break;
+                }
+                if n_type == NT_GNU_PROPERTY_TYPE_0 && self.data[note + 12..desc].starts_with(b"GNU\0")
+                {
+                    let mut pr = desc;
+                    while pr + 8 <= desc + descsz {
+                        let pr_type = endian.read_uint(&self.data, pr, 4);
+                        let datasz = endian.read_uint(&self.data, pr + 4, 4) as usize;
+                        if pr + 8 + datasz > desc + descsz {
+                            break;
+                        }
+                        if pr_type == feature && datasz == 4 {
+                            let flags = endian.read_uint(&self.data, pr + 8, 4);
+                            if flags & bit != 0 {
+                                endian.write_uint(&mut self.data, pr + 8, 4, flags & !bit);
+                                cleared = true;
+                            }
+                        }
+                        pr += 8 + up(datasz, word);
+                    }
+                }
+                note = next;
+            }
+        }
+        Ok(cleared)
+    }
+
     /// Inject `blob` as a new read+execute segment mapped at virtual address
     /// `base`.
     ///
@@ -2712,6 +2791,72 @@ mod tests {
 
         let off = bin.va_to_offset(INJECT_AT).unwrap();
         assert_eq!(&bin.data()[off..off + PAYLOAD.len()], &PAYLOAD);
+    }
+
+    /// A target whose `PT_GNU_PROPERTY` note at 0x200 carries one
+    /// `FEATURE_1_AND` property with `flags`, laid out the way ld writes it
+    /// (8-aligned for ELF64, 4-aligned for ELF32).
+    fn craft_property_note(endian: Endian, arch: Architecture, pr_type: u64, flags: u64) -> Binary {
+        use goblin::elf::program_header::PT_LOAD;
+        let align = if arch.is_64() { 8 } else { 4 };
+        // pr_type, pr_datasz, flags, then padding to `align`.
+        let descsz = 8 + align.max(4);
+        let size = 16 + descsz as u64;
+        let phdrs: [Phdr; 2] = [
+            (PT_LOAD as u64, 0, 0x400000, 0x400, 5, 0x1000),
+            (0x6474_e553, 0x200, 0x400200, size, 4, align as u64),
+        ];
+        let mut bin = craft_injectable(endian, arch, 0x400, &phdrs);
+        let d = &mut bin.data;
+        endian.write_uint(d, 0x200, 4, 4); // namesz
+        endian.write_uint(d, 0x204, 4, descsz as u64);
+        endian.write_uint(d, 0x208, 4, 5); // NT_GNU_PROPERTY_TYPE_0
+        d[0x20c..0x210].copy_from_slice(b"GNU\0");
+        endian.write_uint(d, 0x210, 4, pr_type);
+        endian.write_uint(d, 0x214, 4, 4); // pr_datasz
+        endian.write_uint(d, 0x218, 4, flags);
+        bin
+    }
+
+    /// Spliced code carries no `bti c`, so a BTI-marked aarch64 target has to
+    /// stop claiming it does or the loader maps it guarded and the first
+    /// indirect call into a splice raises `SIGILL`. The PAC bit next to it is
+    /// kept: replacement code needs nothing of the loader for that one.
+    #[test]
+    fn drop_branch_target_marking_clears_only_bti() {
+        const AARCH64_FEATURE_1_AND: u64 = 0xc000_0000;
+        for endian in [Endian::Little, Endian::Big] {
+            // BTI | PAC
+            let mut bin = craft_property_note(endian, Architecture::Arm64, AARCH64_FEATURE_1_AND, 0b11);
+            assert!(bin.drop_branch_target_marking().unwrap());
+            assert_eq!(endian.read_uint(bin.data(), 0x218, 4), 0b10, "{endian:?}");
+            // Nothing left to clear the second time.
+            assert!(!bin.drop_branch_target_marking().unwrap());
+        }
+    }
+
+    /// The x86 counterpart: IBT goes, the shadow-stack bit stays. A property
+    /// of another type, and a target without the note at all, are untouched.
+    #[test]
+    fn drop_branch_target_marking_x86_and_unrelated() {
+        const X86_FEATURE_1_AND: u64 = 0xc000_0002;
+        let mut bin = craft_property_note(Endian::Little, Architecture::X86_64, X86_FEATURE_1_AND, 0b11);
+        assert!(bin.drop_branch_target_marking().unwrap());
+        assert_eq!(Endian::Little.read_uint(bin.data(), 0x218, 4), 0b10);
+
+        let mut bin = craft_property_note(Endian::Little, Architecture::X86, X86_FEATURE_1_AND, 0b01);
+        assert!(bin.drop_branch_target_marking().unwrap());
+        assert_eq!(Endian::Little.read_uint(bin.data(), 0x218, 4), 0);
+
+        // An x86 property on an aarch64 target is not BTI.
+        let mut bin = craft_property_note(Endian::Little, Architecture::Arm64, X86_FEATURE_1_AND, 0b11);
+        let before = bin.data().to_vec();
+        assert!(!bin.drop_branch_target_marking().unwrap());
+        assert_eq!(bin.data(), &before[..]);
+
+        let phdrs = phdr_and_load(2);
+        let mut bin = craft_injectable(Endian::Little, Architecture::Arm64, 0x400, &phdrs);
+        assert!(!bin.drop_branch_target_marking().unwrap());
     }
 
     #[test]
